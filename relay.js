@@ -22,7 +22,17 @@ if (!RELAY_SECRET) {
 const realtimeCache = {
   index: {}, // { "001": {price, rate, time, updatedAt}, "101": {...} }
   stock: {}, // { "005930": {price, rate, volume, cntrStr, time, updatedAt}, ... }
+  // 조건검색: 현재 조건을 만족하는 종목 집합 (실시간 편입/이탈로 갱신됨)
+  condition: {
+    seq: null,
+    codes: [], // 현재 조건 만족 종목코드 목록
+    lastEventAt: null,
+    events: [], // 최근 편입/이탈 이벤트 (최대 50개, 디버깅/확인용)
+  },
 };
+
+// 감시할 조건식 번호. 환경변수로 지정 (미설정이면 조건검색 기능 비활성화)
+const CONDITION_SEQ = process.env.KIWOOM_CONDITION_SEQ || "";
 
 // 현재 구독 중인 종목코드 목록. Worker가 /realtime/subscribe 로 갱신하면 웹소켓에 재등록함.
 // 키움 제한: 그룹번호당 200종목까지 등록 가능(실측 확인). 그래서 용도별로 그룹을 나눔.
@@ -100,6 +110,30 @@ function handleRealtimeMessage(msg) {
         time: entry.values["20"] || "",
         updatedAt: new Date().toISOString(),
       };
+    } else if (entry.type === "02" && entry.values) {
+      // 조건검색 실시간: 9001=종목코드, 843=편입(D)/이탈(I), 20=시각
+      // 조건에 새로 들어오거나 빠지는 순간 즉시 통보되므로, 2분 폴링 없이 실시간 포착 가능
+      const rawCode = String(entry.values["9001"] || entry.item || "");
+      const code = rawCode.replace(/^A/, ""); // 응답에 A가 붙어오는 경우가 있어 제거
+      const inOut = entry.values["843"];
+      if (!code) continue;
+
+      const isInsert = inOut === "D" || inOut === "I" ? inOut === "D" : true;
+      const idx = realtimeCache.condition.codes.indexOf(code);
+      if (isInsert) {
+        if (idx === -1) realtimeCache.condition.codes.push(code);
+      } else {
+        if (idx !== -1) realtimeCache.condition.codes.splice(idx, 1);
+      }
+
+      realtimeCache.condition.lastEventAt = new Date().toISOString();
+      realtimeCache.condition.events.unshift({
+        code: code,
+        action: isInsert ? "편입" : "이탈",
+        time: entry.values["20"] || "",
+        at: realtimeCache.condition.lastEventAt,
+      });
+      if (realtimeCache.condition.events.length > 50) realtimeCache.condition.events.length = 50;
     }
   }
 }
@@ -142,6 +176,20 @@ function registerSubscriptions() {
       })
     );
     console.log("실시간 리스트종목 구독 등록 요청:", subscribedListStocks.length + "종목");
+  }
+
+  // 조건검색 실시간 등록 - 조건에 편입/이탈하는 순간 즉시 통보받음
+  if (CONDITION_SEQ) {
+    ws.send(
+      JSON.stringify({
+        trnm: "CNSRREQ",
+        seq: String(CONDITION_SEQ),
+        search_type: "1", // 1 = 실시간 등록
+        stex_tp: "K",
+      })
+    );
+    realtimeCache.condition.seq = CONDITION_SEQ;
+    console.log("조건검색 실시간 등록 요청: seq=" + CONDITION_SEQ);
   }
 }
 
@@ -200,6 +248,21 @@ async function connectWebSocket() {
 
     if (msg.trnm === "REAL") {
       handleRealtimeMessage(msg);
+      return;
+    }
+
+    // 조건검색 등록 응답 - 현재 조건을 만족하는 종목 목록이 한 번에 옴
+    if (msg.trnm === "CNSRREQ") {
+      if (msg.return_code !== 0) {
+        console.error("조건검색 등록 실패:", msg.return_msg);
+        return;
+      }
+      const codes = (msg.data || [])
+        .map((d) => String(d.jmcode || "").replace(/^A/, ""))
+        .filter(Boolean);
+      realtimeCache.condition.codes = codes;
+      realtimeCache.condition.lastEventAt = new Date().toISOString();
+      console.log("조건검색 초기 종목:", codes.length + "종목");
       return;
     }
   });
@@ -339,6 +402,24 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // 조건검색 실시간 결과 조회 - 현재 조건을 만족하는 종목 목록 + 최근 편입/이탈 이벤트
+  if (req.url === "/realtime/condition") {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        ok: true,
+        wsConnected: wsConnected,
+        wsLoggedIn: wsLoggedIn,
+        seq: realtimeCache.condition.seq,
+        codes: realtimeCache.condition.codes,
+        count: realtimeCache.condition.codes.length,
+        lastEventAt: realtimeCache.condition.lastEventAt,
+        events: realtimeCache.condition.events.slice(0, 20),
+      })
+    );
+    return;
+  }
+
   // 웹소켓 상태 확인용 (헬스체크에서 씀)
   if (req.url === "/realtime/status") {
     res.writeHead(200, { "content-type": "application/json" });
@@ -352,6 +433,8 @@ const server = http.createServer((req, res) => {
         subscribedStockCount: subscribedStocks.length,
         subscribedListCount: subscribedListStocks.length,
         cachedStockCount: Object.keys(realtimeCache.stock).length,
+        conditionSeq: realtimeCache.condition.seq,
+        conditionCount: realtimeCache.condition.codes.length,
       })
     );
     return;
