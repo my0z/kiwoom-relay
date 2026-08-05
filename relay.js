@@ -28,6 +28,7 @@ const realtimeCache = {
     codes: [], // 현재 조건 만족 종목코드 목록
     lastEventAt: null,
     events: [], // 최근 편입/이탈 이벤트 (최대 50개, 디버깅/확인용)
+    history: [], // 편입 이력 (최대 60개) - 조건에서 빠져나가도 유지되어 놓치지 않게 함
   },
 };
 
@@ -91,6 +92,85 @@ function issueToken() {
   });
 }
 
+// 종목명 캐시 { code: name } - 조건검색은 종목코드만 주기 때문에 이름을 따로 조회해서 보관.
+// 한 번 조회하면 계속 재사용(종목명은 바뀌지 않음).
+const stockNameCache = {};
+let nameFetchQueue = [];
+let nameFetchRunning = false;
+
+function queueNameFetch(codes) {
+  for (const c of codes) {
+    if (!stockNameCache[c] && !nameFetchQueue.includes(c)) nameFetchQueue.push(c);
+  }
+  runNameFetch();
+}
+
+function runNameFetch() {
+  if (nameFetchRunning || !nameFetchQueue.length) return;
+  nameFetchRunning = true;
+  const code = nameFetchQueue.shift();
+
+  issueTokenCached()
+    .then((token) => kiwoomRest("/api/dostk/stkinfo", "ka10001", { stk_cd: code }, token))
+    .then((data) => {
+      const name = data && (data.stk_nm || data.stk_name);
+      if (name) stockNameCache[code] = String(name).trim();
+    })
+    .catch(() => {})
+    .finally(() => {
+      nameFetchRunning = false;
+      // 키움 TR 초당1건 제한 준수
+      setTimeout(runNameFetch, 1100);
+    });
+}
+
+// relay 내부에서 키움 REST를 직접 호출할 때 쓰는 헬퍼 (종목명 조회용)
+function kiwoomRest(path, apiId, body, token) {
+  return new Promise((resolve, reject) => {
+    const payload = JSON.stringify(body);
+    const req = https.request(
+      {
+        hostname: KIWOOM_REAL_HOST,
+        path: path,
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json;charset=UTF-8",
+          authorization: "Bearer " + token,
+          "cont-yn": "N",
+          "next-key": "",
+          "api-id": apiId,
+          "Content-Length": Buffer.byteLength(payload),
+        },
+      },
+      (res) => {
+        let raw = "";
+        res.on("data", (c) => (raw += c));
+        res.on("end", () => {
+          try {
+            resolve(JSON.parse(raw));
+          } catch (e) {
+            reject(new Error("파싱 실패"));
+          }
+        });
+      }
+    );
+    req.on("error", reject);
+    req.end(payload);
+  });
+}
+
+// 토큰 캐시 (종목명 조회에 재사용 - 매번 발급하면 낭비)
+let restToken = null;
+let restTokenAt = 0;
+function issueTokenCached() {
+  if (restToken && Date.now() - restTokenAt < 3 * 60 * 60 * 1000) return Promise.resolve(restToken);
+  return issueToken().then((t) => {
+    restToken = t;
+    restTokenAt = Date.now();
+    return t;
+  });
+}
+
 function handleRealtimeMessage(msg) {
   if (!Array.isArray(msg.data)) return;
   for (const entry of msg.data) {
@@ -136,6 +216,21 @@ function handleRealtimeMessage(msg) {
         at: realtimeCache.condition.lastEventAt,
       });
       if (realtimeCache.condition.events.length > 50) realtimeCache.condition.events.length = 50;
+
+      // 편입 이력은 따로 보관: 조건에서 금방 빠져나가도 "방금 이런 게 있었다"를 놓치지 않게 함.
+      // (현재 조건 만족 목록만 보여주면, 잠깐 스쳐간 종목은 화면에서 그냥 사라져버림)
+      if (isInsert) {
+        const hist = realtimeCache.condition.history;
+        const existing = hist.findIndex((h) => h.code === code);
+        if (existing !== -1) hist.splice(existing, 1); // 재편입이면 맨 위로 올림
+        hist.unshift({
+          code: code,
+          time: entry.values["20"] || "",
+          at: realtimeCache.condition.lastEventAt,
+        });
+        if (hist.length > 60) hist.length = 60;
+        queueNameFetch([code]);
+      }
     }
   }
 }
@@ -283,13 +378,31 @@ async function connectWebSocket() {
         .filter(Boolean);
       realtimeCache.condition.codes = codes;
       realtimeCache.condition.lastEventAt = new Date().toISOString();
+
+      // 초기 목록도 이력에 넣어둠. 안 그러면 relay 재시작 직후 화면이 텅 비어 보임
+      // (이력은 편입 이벤트로만 쌓이는데, 재시작 시점엔 이미 조건에 들어와 있던 종목은 이벤트가 안 옴)
+      const nowIso = realtimeCache.condition.lastEventAt;
+      const nowHHMMSS = new Date(Date.now() + 9 * 3600 * 1000)
+        .toISOString()
+        .slice(11, 19)
+        .replace(/:/g, "");
+      realtimeCache.condition.history = codes.slice(0, 60).map((c) => ({
+        code: c,
+        time: nowHHMMSS,
+        at: nowIso,
+        initial: true, // 실시간 편입이 아니라 시작 시점 스냅샷임을 표시
+      }));
+
+      queueNameFetch(codes.slice(0, 40)); // 초기 목록도 이름을 미리 받아둠(초당1건이라 상위 일부만)
       console.log("조건검색 초기 종목:", codes.length + "종목 (seq=" + msg.seq + ")");
       return;
     }
 
-    // 위에서 처리 안 된 메시지는 로그로 남겨서, 예상 못한 응답 형태를 놓치지 않게 함
+    // 예상 못한 응답만 로그로 남김. REG/REMOVE 정상응답(0)은 너무 잦아서 제외하되,
+    // 실패는 반드시 남겨서 200 초과 같은 문제를 놓치지 않게 함.
     if (msg.trnm && msg.trnm !== "REAL") {
-      console.log("미처리 메시지:", JSON.stringify(msg).slice(0, 300));
+      const isRoutineOk = (msg.trnm === "REG" || msg.trnm === "REMOVE") && msg.return_code === 0;
+      if (!isRoutineOk) console.log("미처리 메시지:", JSON.stringify(msg).slice(0, 300));
     }
   });
 
@@ -463,17 +576,34 @@ const server = http.createServer((req, res) => {
 
   // 조건검색 실시간 결과 조회 - 현재 조건을 만족하는 종목 목록 + 최근 편입/이탈 이벤트
   if (req.url === "/realtime/condition") {
+    const cond = realtimeCache.condition;
+    // 편입 이력에 이름/현재가를 붙여서 내려줌 (화면이 코드만 보고 헤매지 않게)
+    const history = cond.history.map((h) => {
+      const q = realtimeCache.stock[h.code];
+      return {
+        code: h.code,
+        name: stockNameCache[h.code] || null,
+        time: h.time,
+        at: h.at,
+        initial: !!h.initial,
+        price: q ? q.price : null,
+        rate: q ? q.rate : null,
+        stillIn: cond.codes.indexOf(h.code) !== -1, // 아직 조건을 만족 중인지
+      };
+    });
     res.writeHead(200, { "content-type": "application/json" });
     res.end(
       JSON.stringify({
         ok: true,
         wsConnected: wsConnected,
         wsLoggedIn: wsLoggedIn,
-        seq: realtimeCache.condition.seq,
-        codes: realtimeCache.condition.codes,
-        count: realtimeCache.condition.codes.length,
-        lastEventAt: realtimeCache.condition.lastEventAt,
-        events: realtimeCache.condition.events.slice(0, 20),
+        seq: cond.seq,
+        codes: cond.codes,
+        count: cond.codes.length,
+        lastEventAt: cond.lastEventAt,
+        names: stockNameCache,
+        history: history,
+        events: cond.events.slice(0, 20),
       })
     );
     return;
