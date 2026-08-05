@@ -35,9 +35,10 @@ const realtimeCache = {
 const CONDITION_SEQ = process.env.KIWOOM_CONDITION_SEQ || "";
 
 // 현재 구독 중인 종목코드 목록. Worker가 /realtime/subscribe 로 갱신하면 웹소켓에 재등록함.
-// 키움 제한: 그룹번호당 200종목까지 등록 가능(실측 확인). 그래서 용도별로 그룹을 나눔.
-//   grp_no 1 = 지수, 2 = 관심종목, 3 = 화면 리스트 종목
-const MAX_PER_GROUP = 200;
+// 키움 제한: 한 연결에서 등록 가능한 실시간 종목이 총 200개(실측 확인 - 그룹 합산 기준).
+// 지수 2개 + 여유분을 빼고, 관심종목을 우선 배정한 뒤 남는 만큼만 리스트 종목에 씀.
+const TOTAL_STOCK_LIMIT = 180; // 지수(2) + 조건검색 등 여유를 빼고 종목에 쓸 총량
+const WATCH_RESERVED = 40; // 관심종목에 우선 배정할 최대 수
 let subscribedStocks = []; // 관심종목 (그룹2)
 let subscribedListStocks = []; // 화면 리스트 종목 (그룹3)
 
@@ -338,21 +339,27 @@ const server = http.createServer((req, res) => {
       let listCodes = [];
       try {
         const parsed = JSON.parse(Buffer.concat(chunks).toString() || "{}");
-        const valid = (arr) =>
-          Array.isArray(arr) ? arr.filter((c) => /^[0-9A-Za-z]{6}$/.test(c)).slice(0, MAX_PER_GROUP) : [];
-        codes = valid(parsed.codes);
-        listCodes = valid(parsed.listCodes);
+        const valid = (arr) => (Array.isArray(arr) ? arr.filter((c) => /^[0-9A-Za-z]{6}$/.test(c)) : []);
+        codes = valid(parsed.codes).slice(0, WATCH_RESERVED); // 관심종목 우선
+        // 리스트는 총량에서 관심종목을 뺀 만큼만. 중복 종목은 제외(같은 종목 두 번 등록 방지)
+        const remain = Math.max(0, TOTAL_STOCK_LIMIT - codes.length);
+        listCodes = valid(parsed.listCodes)
+          .filter((c) => !codes.includes(c))
+          .slice(0, remain);
       } catch (e) {
         res.writeHead(400, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: false, error: "invalid json" }));
         return;
       }
 
-      const changedWatch =
-        codes.length !== subscribedStocks.length || codes.some((c) => !subscribedStocks.includes(c));
-      const changedList =
-        listCodes.length !== subscribedListStocks.length ||
-        listCodes.some((c) => !subscribedListStocks.includes(c));
+      // 순서만 바뀐 경우는 재등록 불필요 - 정렬해서 내용이 실제로 달라졌을 때만 갱신
+      const sameSet = (a, b) => {
+        if (a.length !== b.length) return false;
+        const sa = [...a].sort(), sb = [...b].sort();
+        return sa.every((v, i) => v === sb[i]);
+      };
+      const changedWatch = !sameSet(codes, subscribedStocks);
+      const changedList = !sameSet(listCodes, subscribedListStocks);
 
       subscribedStocks = codes;
       subscribedListStocks = listCodes;
