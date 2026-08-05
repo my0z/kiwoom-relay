@@ -157,13 +157,11 @@ function registerSubscriptions() {
     setTimeout(fn, delay);
   };
 
-  // 1) 조건검색 실시간 등록 - 조건에 편입/이탈하는 순간 즉시 통보받음
+  // 1) 조건검색: 목록조회(CNSRLST)를 먼저 보냄.
+  //    CNSRLST 없이 바로 CNSRREQ를 보내면 응답이 오지 않는 현상이 있어(실측),
+  //    CNSRLST 응답을 받은 뒤에 CNSRREQ를 보내도록 함(아래 message 핸들러에서 처리).
   if (CONDITION_SEQ) {
-    send(
-      { trnm: "CNSRREQ", seq: String(CONDITION_SEQ), search_type: "1", stex_tp: "K" },
-      "조건검색 실시간 등록 요청: seq=" + CONDITION_SEQ
-    );
-    realtimeCache.condition.seq = CONDITION_SEQ;
+    send({ trnm: "CNSRLST" }, "조건검색 목록조회 요청 (seq=" + CONDITION_SEQ + " 등록 준비)");
   }
 
   // 2) 지수
@@ -251,6 +249,26 @@ async function connectWebSocket() {
 
     if (msg.trnm === "REAL") {
       handleRealtimeMessage(msg);
+      return;
+    }
+
+    // 조건검색 목록조회 응답 -> 이어서 실시간 등록(CNSRREQ) 요청
+    if (msg.trnm === "CNSRLST") {
+      const list = msg.data || [];
+      const found = list.find((x) => String(Array.isArray(x) ? x[0] : x.seq) === String(CONDITION_SEQ));
+      if (!found) {
+        console.error("조건식 seq=" + CONDITION_SEQ + " 을(를) 목록에서 찾지 못했습니다. 등록된 조건식:", list.length + "개");
+        return;
+      }
+      const name = Array.isArray(found) ? found[1] : found.name;
+      console.log("조건식 확인: seq=" + CONDITION_SEQ + " name=" + name + " -> 실시간 등록 요청");
+      ws.send(JSON.stringify({
+        trnm: "CNSRREQ",
+        seq: String(CONDITION_SEQ),
+        search_type: "1",
+        stex_tp: "K",
+      }));
+      realtimeCache.condition.seq = CONDITION_SEQ;
       return;
     }
 
@@ -372,6 +390,8 @@ const server = http.createServer((req, res) => {
       const settling = wsLoginAt && Date.now() - wsLoginAt < 3000;
 
       if (canSend && !settling && changedWatch && codes.length) {
+        // refresh:"1"만으로는 기존 등록이 남아 누적되는 현상이 있어(200 초과 에러), 먼저 명시적으로 해제
+        ws.send(JSON.stringify({ trnm: "REMOVE", grp_no: "2" }));
         ws.send(JSON.stringify({
           trnm: "REG", grp_no: "2", refresh: "1",
           data: [{ item: codes, type: ["0B"] }],
@@ -379,6 +399,7 @@ const server = http.createServer((req, res) => {
         console.log("관심종목 구독 갱신:", codes.length + "종목");
       }
       if (canSend && !settling && changedList && listCodes.length) {
+        ws.send(JSON.stringify({ trnm: "REMOVE", grp_no: "3" }));
         ws.send(JSON.stringify({
           trnm: "REG", grp_no: "3", refresh: "1",
           data: [{ item: listCodes, type: ["0B"] }],
