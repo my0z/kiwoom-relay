@@ -111,14 +111,14 @@ function handleRealtimeMessage(msg) {
         updatedAt: new Date().toISOString(),
       };
     } else if (entry.type === "02" && entry.values) {
-      // 조건검색 실시간: 9001=종목코드, 843=편입(D)/이탈(I), 20=시각
+      // 조건검색 실시간: 9001=종목코드, 843=편입(I)/이탈(D), 20=시각
       // 조건에 새로 들어오거나 빠지는 순간 즉시 통보되므로, 2분 폴링 없이 실시간 포착 가능
       const rawCode = String(entry.values["9001"] || entry.item || "");
       const code = rawCode.replace(/^A/, ""); // 응답에 A가 붙어오는 경우가 있어 제거
       const inOut = entry.values["843"];
       if (!code) continue;
 
-      const isInsert = inOut === "D" || inOut === "I" ? inOut === "D" : true;
+      const isInsert = inOut === "I"; // I=Insert(편입), D=Delete(이탈)
       const idx = realtimeCache.condition.codes.indexOf(code);
       if (isInsert) {
         if (idx === -1) realtimeCache.condition.codes.push(code);
@@ -254,7 +254,7 @@ async function connectWebSocket() {
     // 조건검색 등록 응답 - 현재 조건을 만족하는 종목 목록이 한 번에 옴
     if (msg.trnm === "CNSRREQ") {
       if (msg.return_code !== 0) {
-        console.error("조건검색 등록 실패:", msg.return_msg);
+        console.error("조건검색 등록 실패:", msg.return_code, msg.return_msg);
         return;
       }
       const codes = (msg.data || [])
@@ -262,8 +262,13 @@ async function connectWebSocket() {
         .filter(Boolean);
       realtimeCache.condition.codes = codes;
       realtimeCache.condition.lastEventAt = new Date().toISOString();
-      console.log("조건검색 초기 종목:", codes.length + "종목");
+      console.log("조건검색 초기 종목:", codes.length + "종목 (seq=" + msg.seq + ")");
       return;
+    }
+
+    // 위에서 처리 안 된 메시지는 로그로 남겨서, 예상 못한 응답 형태를 놓치지 않게 함
+    if (msg.trnm && msg.trnm !== "REAL") {
+      console.log("미처리 메시지:", JSON.stringify(msg).slice(0, 300));
     }
   });
 
