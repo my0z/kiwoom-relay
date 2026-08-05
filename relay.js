@@ -25,7 +25,11 @@ const realtimeCache = {
 };
 
 // 현재 구독 중인 종목코드 목록. Worker가 /realtime/subscribe 로 갱신하면 웹소켓에 재등록함.
-let subscribedStocks = [];
+// 키움 제한: 그룹번호당 200종목까지 등록 가능(실측 확인). 그래서 용도별로 그룹을 나눔.
+//   grp_no 1 = 지수, 2 = 관심종목, 3 = 화면 리스트 종목
+const MAX_PER_GROUP = 200;
+let subscribedStocks = []; // 관심종목 (그룹2)
+let subscribedListStocks = []; // 화면 리스트 종목 (그룹3)
 
 let ws = null;
 let wsConnected = false;
@@ -124,7 +128,20 @@ function registerSubscriptions() {
         data: [{ item: subscribedStocks, type: ["0B"] }],
       })
     );
-    console.log("실시간 종목 구독 등록 요청:", subscribedStocks.length + "종목");
+    console.log("실시간 관심종목 구독 등록 요청:", subscribedStocks.length + "종목");
+  }
+
+  // 화면 리스트 종목 (추천/눌림목/연속상승/TOP20 등) - 관심종목과 별도 그룹
+  if (subscribedListStocks.length) {
+    ws.send(
+      JSON.stringify({
+        trnm: "REG",
+        grp_no: "3",
+        refresh: "1",
+        data: [{ item: subscribedListStocks, type: ["0B"] }],
+      })
+    );
+    console.log("실시간 리스트종목 구독 등록 요청:", subscribedListStocks.length + "종목");
   }
 }
 
@@ -241,47 +258,67 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // 실시간 종목 구독 목록 갱신 - Worker가 관심종목 목록을 보내면 그걸로 교체
-  // POST body: {"codes":["005930","000660"]}
+  // 실시간 종목 구독 목록 갱신 - Worker가 종목 목록을 보내면 그걸로 교체
+  // POST body: {"codes":[...], "listCodes":[...]}
+  //   codes     -> 관심종목 (그룹2)
+  //   listCodes -> 화면 리스트 종목 (그룹3)
   if (req.url === "/realtime/subscribe" && req.method === "POST") {
     const chunks = [];
     req.on("data", (c) => chunks.push(c));
     req.on("end", () => {
       let codes = [];
+      let listCodes = [];
       try {
         const parsed = JSON.parse(Buffer.concat(chunks).toString() || "{}");
-        codes = Array.isArray(parsed.codes) ? parsed.codes.filter((c) => /^[0-9A-Za-z]{6}$/.test(c)) : [];
+        const valid = (arr) =>
+          Array.isArray(arr) ? arr.filter((c) => /^[0-9A-Za-z]{6}$/.test(c)).slice(0, MAX_PER_GROUP) : [];
+        codes = valid(parsed.codes);
+        listCodes = valid(parsed.listCodes);
       } catch (e) {
         res.writeHead(400, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: false, error: "invalid json" }));
         return;
       }
 
-      // 목록이 실제로 바뀐 경우에만 재등록 (매번 REG를 쏘면 불필요한 트래픽)
-      const changed =
+      const changedWatch =
         codes.length !== subscribedStocks.length || codes.some((c) => !subscribedStocks.includes(c));
-      subscribedStocks = codes;
+      const changedList =
+        listCodes.length !== subscribedListStocks.length ||
+        listCodes.some((c) => !subscribedListStocks.includes(c));
 
-      if (changed && ws && ws.readyState === WebSocket.OPEN && wsLoggedIn) {
-        if (codes.length) {
-          ws.send(
-            JSON.stringify({
-              trnm: "REG",
-              grp_no: "2",
-              refresh: "1",
-              data: [{ item: codes, type: ["0B"] }],
-            })
-          );
-        }
-        // 구독 목록에서 빠진 종목의 캐시는 정리 (오래된 값이 남아 오해를 주지 않도록)
+      subscribedStocks = codes;
+      subscribedListStocks = listCodes;
+
+      const canSend = ws && ws.readyState === WebSocket.OPEN && wsLoggedIn;
+      if (canSend && changedWatch && codes.length) {
+        ws.send(JSON.stringify({
+          trnm: "REG", grp_no: "2", refresh: "1",
+          data: [{ item: codes, type: ["0B"] }],
+        }));
+        console.log("관심종목 구독 갱신:", codes.length + "종목");
+      }
+      if (canSend && changedList && listCodes.length) {
+        ws.send(JSON.stringify({
+          trnm: "REG", grp_no: "3", refresh: "1",
+          data: [{ item: listCodes, type: ["0B"] }],
+        }));
+        console.log("리스트종목 구독 갱신:", listCodes.length + "종목");
+      }
+
+      // 두 그룹 어디에도 없는 종목의 캐시는 정리 (오래된 값이 남아 오해를 주지 않도록)
+      if (changedWatch || changedList) {
+        const keep = new Set([...codes, ...listCodes]);
         for (const cached of Object.keys(realtimeCache.stock)) {
-          if (!codes.includes(cached)) delete realtimeCache.stock[cached];
+          if (!keep.has(cached)) delete realtimeCache.stock[cached];
         }
-        console.log("종목 구독 갱신:", codes.length + "종목");
       }
 
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ok: true, subscribed: subscribedStocks.length, changed: changed }));
+      res.end(JSON.stringify({
+        ok: true,
+        subscribedWatch: subscribedStocks.length,
+        subscribedList: subscribedListStocks.length,
+      }));
     });
     return;
   }
@@ -295,6 +332,7 @@ const server = http.createServer((req, res) => {
         wsConnected: wsConnected,
         wsLoggedIn: wsLoggedIn,
         subscribed: subscribedStocks.length,
+        subscribedList: subscribedListStocks.length,
         stocks: realtimeCache.stock,
       })
     );
@@ -312,6 +350,7 @@ const server = http.createServer((req, res) => {
         lastMessageAt: wsLastMessageAt ? new Date(wsLastMessageAt).toISOString() : null,
         cachedIndexCount: Object.keys(realtimeCache.index).length,
         subscribedStockCount: subscribedStocks.length,
+        subscribedListCount: subscribedListStocks.length,
         cachedStockCount: Object.keys(realtimeCache.stock).length,
       })
     );
