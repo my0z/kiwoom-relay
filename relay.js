@@ -21,7 +21,11 @@ if (!RELAY_SECRET) {
 // Worker가 조회하면 이 캐시를 즉시 반환 -> 키움 TR 호출 없이 실시간에 가까운 값 제공
 const realtimeCache = {
   index: {}, // { "001": {price, rate, time, updatedAt}, "101": {...} }
+  stock: {}, // { "005930": {price, rate, volume, cntrStr, time, updatedAt}, ... }
 };
+
+// 현재 구독 중인 종목코드 목록. Worker가 /realtime/subscribe 로 갱신하면 웹소켓에 재등록함.
+let subscribedStocks = [];
 
 let ws = null;
 let wsConnected = false;
@@ -82,6 +86,16 @@ function handleRealtimeMessage(msg) {
         time: entry.values["20"] || "",
         updatedAt: new Date().toISOString(),
       };
+    } else if (entry.type === "0B" && entry.values) {
+      // 주식체결: 10=현재가, 12=등락률, 13=누적거래량, 228=체결강도, 20=체결시각
+      realtimeCache.stock[entry.item] = {
+        price: parseSignedNumber(entry.values["10"]),
+        rate: parseSignedNumber(entry.values["12"]),
+        volume: parseSignedNumber(entry.values["13"]),
+        cntrStr: parseSignedNumber(entry.values["228"]),
+        time: entry.values["20"] || "",
+        updatedAt: new Date().toISOString(),
+      };
     }
   }
 }
@@ -98,6 +112,20 @@ function registerSubscriptions() {
     })
   );
   console.log("실시간 지수 구독 등록 요청");
+
+  // 관심종목 등 Worker가 요청한 종목들의 체결 실시간 등록
+  // grp_no를 지수(1)와 분리해서, 종목 목록이 바뀌어도 지수 구독은 안 건드리게 함
+  if (subscribedStocks.length) {
+    ws.send(
+      JSON.stringify({
+        trnm: "REG",
+        grp_no: "2",
+        refresh: "1", // 1 = 기존 등록을 이 목록으로 교체
+        data: [{ item: subscribedStocks, type: ["0B"] }],
+      })
+    );
+    console.log("실시간 종목 구독 등록 요청:", subscribedStocks.length + "종목");
+  }
 }
 
 async function connectWebSocket() {
@@ -213,6 +241,66 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // 실시간 종목 구독 목록 갱신 - Worker가 관심종목 목록을 보내면 그걸로 교체
+  // POST body: {"codes":["005930","000660"]}
+  if (req.url === "/realtime/subscribe" && req.method === "POST") {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      let codes = [];
+      try {
+        const parsed = JSON.parse(Buffer.concat(chunks).toString() || "{}");
+        codes = Array.isArray(parsed.codes) ? parsed.codes.filter((c) => /^[0-9A-Za-z]{6}$/.test(c)) : [];
+      } catch (e) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "invalid json" }));
+        return;
+      }
+
+      // 목록이 실제로 바뀐 경우에만 재등록 (매번 REG를 쏘면 불필요한 트래픽)
+      const changed =
+        codes.length !== subscribedStocks.length || codes.some((c) => !subscribedStocks.includes(c));
+      subscribedStocks = codes;
+
+      if (changed && ws && ws.readyState === WebSocket.OPEN && wsLoggedIn) {
+        if (codes.length) {
+          ws.send(
+            JSON.stringify({
+              trnm: "REG",
+              grp_no: "2",
+              refresh: "1",
+              data: [{ item: codes, type: ["0B"] }],
+            })
+          );
+        }
+        // 구독 목록에서 빠진 종목의 캐시는 정리 (오래된 값이 남아 오해를 주지 않도록)
+        for (const cached of Object.keys(realtimeCache.stock)) {
+          if (!codes.includes(cached)) delete realtimeCache.stock[cached];
+        }
+        console.log("종목 구독 갱신:", codes.length + "종목");
+      }
+
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, subscribed: subscribedStocks.length, changed: changed }));
+    });
+    return;
+  }
+
+  // 실시간 종목 시세 조회 - 웹소켓으로 받아둔 최신 체결값 반환
+  if (req.url === "/realtime/stocks") {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        ok: true,
+        wsConnected: wsConnected,
+        wsLoggedIn: wsLoggedIn,
+        subscribed: subscribedStocks.length,
+        stocks: realtimeCache.stock,
+      })
+    );
+    return;
+  }
+
   // 웹소켓 상태 확인용 (헬스체크에서 씀)
   if (req.url === "/realtime/status") {
     res.writeHead(200, { "content-type": "application/json" });
@@ -223,6 +311,8 @@ const server = http.createServer((req, res) => {
         wsLoggedIn: wsLoggedIn,
         lastMessageAt: wsLastMessageAt ? new Date(wsLastMessageAt).toISOString() : null,
         cachedIndexCount: Object.keys(realtimeCache.index).length,
+        subscribedStockCount: subscribedStocks.length,
+        cachedStockCount: Object.keys(realtimeCache.stock).length,
       })
     );
     return;
