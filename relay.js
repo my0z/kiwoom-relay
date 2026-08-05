@@ -438,6 +438,24 @@ setInterval(() => {
 connectWebSocket();
 
 // ---------- HTTP 서버 (기존 REST 중계 + 신규 실시간 캐시 조회) ----------
+// 조건검색 편입 이력에 이름/현재가를 붙여서 반환 - /realtime/all과 /realtime/condition 둘 다에서 씀
+function buildConditionHistory() {
+  const cond = realtimeCache.condition;
+  return cond.history.map((h) => {
+    const q = realtimeCache.stock[h.code];
+    return {
+      code: h.code,
+      name: stockNameCache[h.code] || null,
+      time: h.time,
+      at: h.at,
+      initial: !!h.initial,
+      price: q ? q.price : null,
+      rate: q ? q.rate : null,
+      stillIn: cond.codes.indexOf(h.code) !== -1, // 아직 조건을 만족 중인지
+    };
+  });
+}
+
 const server = http.createServer((req, res) => {
   if (req.headers["x-relay-secret"] !== RELAY_SECRET) {
     res.writeHead(401, { "content-type": "application/json" });
@@ -446,6 +464,25 @@ const server = http.createServer((req, res) => {
   }
 
   // 실시간 지수 조회 - 웹소켓으로 받아둔 최신값을 즉시 반환 (키움 TR 호출 없음)
+  // 지수+종목시세+조건검색을 한 번에 반환 - Worker가 이전엔 3개 엔드포인트를 따로 호출했는데,
+  // 다 relay 메모리에서 읽는 거라 굳이 나눌 이유가 없어서 하나로 합침 (Worker<->relay 왕복 3번 -> 1번)
+  if (req.url === "/realtime/all") {
+    const cond = realtimeCache.condition;
+    const history = buildConditionHistory();
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        ok: true,
+        wsConnected: wsConnected,
+        wsLoggedIn: wsLoggedIn,
+        index: { kospi: realtimeCache.index["001"] || null, kosdaq: realtimeCache.index["101"] || null },
+        stocks: realtimeCache.stock,
+        condition: { seq: cond.seq, codes: cond.codes, count: cond.codes.length, lastEventAt: cond.lastEventAt, history },
+      })
+    );
+    return;
+  }
+
   if (req.url === "/realtime/index") {
     res.writeHead(200, { "content-type": "application/json" });
     res.end(
@@ -577,20 +614,7 @@ const server = http.createServer((req, res) => {
   // 조건검색 실시간 결과 조회 - 현재 조건을 만족하는 종목 목록 + 최근 편입/이탈 이벤트
   if (req.url === "/realtime/condition") {
     const cond = realtimeCache.condition;
-    // 편입 이력에 이름/현재가를 붙여서 내려줌 (화면이 코드만 보고 헤매지 않게)
-    const history = cond.history.map((h) => {
-      const q = realtimeCache.stock[h.code];
-      return {
-        code: h.code,
-        name: stockNameCache[h.code] || null,
-        time: h.time,
-        at: h.at,
-        initial: !!h.initial,
-        price: q ? q.price : null,
-        rate: q ? q.rate : null,
-        stillIn: cond.codes.indexOf(h.code) !== -1, // 아직 조건을 만족 중인지
-      };
-    });
+    const history = buildConditionHistory();
     res.writeHead(200, { "content-type": "application/json" });
     res.end(
       JSON.stringify({
