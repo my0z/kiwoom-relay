@@ -611,6 +611,7 @@ const server = http.createServer((req, res) => {
 
   // 웹소켓 상태 확인용 (헬스체크에서 씀)
   if (req.url === "/realtime/status") {
+    const mem = process.memoryUsage();
     res.writeHead(200, { "content-type": "application/json" });
     res.end(
       JSON.stringify({
@@ -624,6 +625,8 @@ const server = http.createServer((req, res) => {
         cachedStockCount: Object.keys(realtimeCache.stock).length,
         conditionSeq: realtimeCache.condition.seq,
         conditionCount: realtimeCache.condition.codes.length,
+        memoryRssMb: Math.round(mem.rss / 1024 / 1024),
+        memoryHeapUsedMb: Math.round(mem.heapUsed / 1024 / 1024),
       })
     );
     return;
