@@ -47,6 +47,7 @@ let wsConnected = false;
 let wsLoggedIn = false;
 let wsReconnectDelay = 5000; // 재연결 대기 (실패 누적 시 늘어남, 최대 60초)
 let wsLastMessageAt = 0;
+let wsLoginAt = 0; // 로그인 완료 시각 - 직후 구독 요청이 몰리는 것을 막는 데 씀
 
 function parseSignedNumber(v) {
   // 키움 실시간 값은 "+6629.24" / "-118077" 형태로 부호가 붙어서 옴
@@ -141,56 +142,56 @@ function handleRealtimeMessage(msg) {
 
 function registerSubscriptions() {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  // 코스피(001)/코스닥(101) 업종지수 실시간 등록
-  ws.send(
-    JSON.stringify({
-      trnm: "REG",
-      grp_no: "1",
-      refresh: "1",
-      data: [{ item: ["001", "101"], type: ["0J"] }],
-    })
-  );
-  console.log("실시간 지수 구독 등록 요청");
 
-  // 관심종목 등 Worker가 요청한 종목들의 체결 실시간 등록
-  // grp_no를 지수(1)와 분리해서, 종목 목록이 바뀌어도 지수 구독은 안 건드리게 함
-  if (subscribedStocks.length) {
-    ws.send(
-      JSON.stringify({
-        trnm: "REG",
-        grp_no: "2",
-        refresh: "1", // 1 = 기존 등록을 이 목록으로 교체
-        data: [{ item: subscribedStocks, type: ["0B"] }],
-      })
-    );
-    console.log("실시간 관심종목 구독 등록 요청:", subscribedStocks.length + "종목");
-  }
+  // 요청을 한꺼번에 몰아 보내면 키움이 일부(특히 CNSRREQ)를 처리하지 못하는 현상이 있어,
+  // 조건검색을 가장 먼저 보내고 나머지는 간격을 두고 순차 전송함.
+  const send = (payload, label) => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify(payload));
+    if (label) console.log(label);
+  };
 
-  // 화면 리스트 종목 (추천/눌림목/연속상승/TOP20 등) - 관심종목과 별도 그룹
-  if (subscribedListStocks.length) {
-    ws.send(
-      JSON.stringify({
-        trnm: "REG",
-        grp_no: "3",
-        refresh: "1",
-        data: [{ item: subscribedListStocks, type: ["0B"] }],
-      })
-    );
-    console.log("실시간 리스트종목 구독 등록 요청:", subscribedListStocks.length + "종목");
-  }
+  let delay = 0;
+  const later = (fn) => {
+    delay += 400;
+    setTimeout(fn, delay);
+  };
 
-  // 조건검색 실시간 등록 - 조건에 편입/이탈하는 순간 즉시 통보받음
+  // 1) 조건검색 실시간 등록 - 조건에 편입/이탈하는 순간 즉시 통보받음
   if (CONDITION_SEQ) {
-    ws.send(
-      JSON.stringify({
-        trnm: "CNSRREQ",
-        seq: String(CONDITION_SEQ),
-        search_type: "1", // 1 = 실시간 등록
-        stex_tp: "K",
-      })
+    send(
+      { trnm: "CNSRREQ", seq: String(CONDITION_SEQ), search_type: "1", stex_tp: "K" },
+      "조건검색 실시간 등록 요청: seq=" + CONDITION_SEQ
     );
     realtimeCache.condition.seq = CONDITION_SEQ;
-    console.log("조건검색 실시간 등록 요청: seq=" + CONDITION_SEQ);
+  }
+
+  // 2) 지수
+  later(() =>
+    send(
+      { trnm: "REG", grp_no: "1", refresh: "1", data: [{ item: ["001", "101"], type: ["0J"] }] },
+      "실시간 지수 구독 등록 요청"
+    )
+  );
+
+  // 3) 관심종목
+  if (subscribedStocks.length) {
+    later(() =>
+      send(
+        { trnm: "REG", grp_no: "2", refresh: "1", data: [{ item: subscribedStocks, type: ["0B"] }] },
+        "실시간 관심종목 구독 등록 요청: " + subscribedStocks.length + "종목"
+      )
+    );
+  }
+
+  // 4) 화면 리스트 종목
+  if (subscribedListStocks.length) {
+    later(() =>
+      send(
+        { trnm: "REG", grp_no: "3", refresh: "1", data: [{ item: subscribedListStocks, type: ["0B"] }] },
+        "실시간 리스트종목 구독 등록 요청: " + subscribedListStocks.length + "종목"
+      )
+    );
   }
 }
 
@@ -241,6 +242,7 @@ async function connectWebSocket() {
         return;
       }
       wsLoggedIn = true;
+      wsLoginAt = Date.now();
       wsReconnectDelay = 5000; // 성공했으니 백오프 초기화
       console.log("웹소켓 로그인 성공");
       registerSubscriptions();
@@ -365,14 +367,18 @@ const server = http.createServer((req, res) => {
       subscribedListStocks = listCodes;
 
       const canSend = ws && ws.readyState === WebSocket.OPEN && wsLoggedIn;
-      if (canSend && changedWatch && codes.length) {
+      // 로그인 직후 3초는 registerSubscriptions()가 순차 전송 중이라, 여기서 끼어들면
+      // 조건검색(CNSRREQ) 응답을 못 받는 경우가 있어 잠시 미룸 (목록은 이미 저장됐으니 다음 요청 때 반영됨)
+      const settling = wsLoginAt && Date.now() - wsLoginAt < 3000;
+
+      if (canSend && !settling && changedWatch && codes.length) {
         ws.send(JSON.stringify({
           trnm: "REG", grp_no: "2", refresh: "1",
           data: [{ item: codes, type: ["0B"] }],
         }));
         console.log("관심종목 구독 갱신:", codes.length + "종목");
       }
-      if (canSend && changedList && listCodes.length) {
+      if (canSend && !settling && changedList && listCodes.length) {
         ws.send(JSON.stringify({
           trnm: "REG", grp_no: "3", refresh: "1",
           data: [{ item: listCodes, type: ["0B"] }],
@@ -386,6 +392,26 @@ const server = http.createServer((req, res) => {
         for (const cached of Object.keys(realtimeCache.stock)) {
           if (!keep.has(cached)) delete realtimeCache.stock[cached];
         }
+      }
+
+      // 로그인 직후라 미뤘던 경우, 안정화된 뒤 한 번 자동으로 등록해줌
+      if (canSend && settling && (changedWatch || changedList)) {
+        setTimeout(() => {
+          if (!ws || ws.readyState !== WebSocket.OPEN || !wsLoggedIn) return;
+          if (subscribedStocks.length) {
+            ws.send(JSON.stringify({
+              trnm: "REG", grp_no: "2", refresh: "1",
+              data: [{ item: subscribedStocks, type: ["0B"] }],
+            }));
+          }
+          if (subscribedListStocks.length) {
+            ws.send(JSON.stringify({
+              trnm: "REG", grp_no: "3", refresh: "1",
+              data: [{ item: subscribedListStocks, type: ["0B"] }],
+            }));
+          }
+          console.log("지연 구독 등록 완료 (관심 " + subscribedStocks.length + " / 리스트 " + subscribedListStocks.length + ")");
+        }, 3500);
       }
 
       res.writeHead(200, { "content-type": "application/json" });
