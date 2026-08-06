@@ -35,6 +35,8 @@ const realtimeCache = {
 
 // 감시할 조건식 번호. 환경변수로 지정 (미설정이면 조건검색 기능 비활성화)
 const CONDITION_SEQ = process.env.KIWOOM_CONDITION_SEQ || "";
+const WORKER_URL = process.env.WORKER_URL || "https://kiwoomapi.usbkr.workers.dev";
+const ADMIN_KEY = process.env.ADMIN_KEY || "";
 
 // 현재 구독 중인 종목코드 목록. Worker가 /realtime/subscribe 로 갱신하면 웹소켓에 재등록함.
 // 키움 제한: 한 연결에서 등록 가능한 실시간 종목이 총 200개(실측 확인 - 그룹 합산 기준).
@@ -442,6 +444,68 @@ setInterval(() => {
 }, 60000);
 
 connectWebSocket();
+
+// ---------- 관심종목 손절 자동체크 (10초 주기) ----------
+// Worker의 2분 cron(checkWatchlistRiskLevels)보다 훨씬 빠르게 -1.5% 손절 트리거.
+// relay는 이미 웹소켓으로 실시간가를 들고 있으므로 키움 TR 호출 없이 즉시 계산 가능.
+const AUTO_REMOVE_PNL_PCT = -1.5;
+function workerRequest(path, method, body) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(WORKER_URL + path);
+    const data = body ? JSON.stringify(body) : null;
+    const req = https.request(
+      {
+        hostname: url.hostname,
+        path: url.pathname + url.search,
+        method,
+        headers: Object.assign(
+          { "X-Admin-Key": ADMIN_KEY },
+          data ? { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data) } : {}
+        ),
+        timeout: 8000,
+      },
+      (res) => {
+        let chunks = "";
+        res.on("data", (c) => (chunks += c));
+        res.on("end", () => {
+          try {
+            resolve(JSON.parse(chunks));
+          } catch (e) {
+            reject(e);
+          }
+        });
+      }
+    );
+    req.on("error", reject);
+    req.on("timeout", () => req.destroy(new Error("timeout")));
+    if (data) req.write(data);
+    req.end();
+  });
+}
+
+async function checkWatchlistStopLoss() {
+  if (!ADMIN_KEY) return; // 키 미설정이면 조용히 스킵 (fail closed)
+  try {
+    const entries = await workerRequest("/api/watchlist-entries", "GET");
+    if (!entries.ok || !entries.items.length) return;
+    for (const item of entries.items) {
+      const q = realtimeCache.stock[item.code];
+      if (!q || !q.price) continue; // 아직 실시간가 미수신 - 다음 틱에 재시도
+      const pnlPct = ((q.price - item.entry_price) / item.entry_price) * 100;
+      if (pnlPct <= AUTO_REMOVE_PNL_PCT) {
+        try {
+          await workerRequest("/api/watchlist/auto-remove", "POST", { code: item.code, pnlPct, name: stockNameCache[item.code] });
+          console.log(`손절 자동삭제: ${item.code} (${pnlPct.toFixed(2)}%)`);
+        } catch (e) {
+          console.log(`손절 자동삭제 요청 실패: ${item.code} - ${e.message}`);
+        }
+      }
+    }
+  } catch (e) {
+    console.log("관심종목 손절체크 실패: " + e.message);
+  }
+}
+setInterval(checkWatchlistStopLoss, 10000);
 
 // ---------- HTTP 서버 (기존 REST 중계 + 신규 실시간 캐시 조회) ----------
 // 조건검색 편입 이력에 이름/현재가를 붙여서 반환 - /realtime/all과 /realtime/condition 둘 다에서 씀
