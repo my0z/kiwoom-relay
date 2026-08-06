@@ -25,6 +25,7 @@ const realtimeCache = {
   // 조건검색: 현재 조건을 만족하는 종목 집합 (실시간 편입/이탈로 갱신됨)
   condition: {
     seq: null,
+    name: null, // 조건식 이름 (CNSRLST 응답에서 확보) - 자동편입 라벨 등에 표시용
     codes: [], // 현재 조건 만족 종목코드 목록
     lastEventAt: null,
     events: [], // 최근 편입/이탈 이벤트 (최대 50개, 디버깅/확인용)
@@ -361,6 +362,7 @@ async function connectWebSocket() {
       }
       const name = Array.isArray(found) ? found[1] : found.name;
       console.log("조건식 확인: seq=" + CONDITION_SEQ + " name=" + name + " -> 실시간 등록 요청");
+      realtimeCache.condition.name = name || null;
       ws.send(JSON.stringify({
         trnm: "CNSRREQ",
         seq: String(CONDITION_SEQ),
@@ -481,7 +483,7 @@ const server = http.createServer((req, res) => {
         wsLoggedIn: wsLoggedIn,
         index: { kospi: realtimeCache.index["001"] || null, kosdaq: realtimeCache.index["101"] || null },
         stocks: realtimeCache.stock,
-        condition: { seq: cond.seq, codes: cond.codes, count: cond.codes.length, lastEventAt: cond.lastEventAt, history },
+        condition: { seq: cond.seq, name: cond.name, codes: cond.codes, count: cond.codes.length, lastEventAt: cond.lastEventAt, history },
       })
     );
     return;
@@ -626,6 +628,7 @@ const server = http.createServer((req, res) => {
         wsConnected: wsConnected,
         wsLoggedIn: wsLoggedIn,
         seq: cond.seq,
+        name: cond.name,
         codes: cond.codes,
         count: cond.codes.length,
         lastEventAt: cond.lastEventAt,
