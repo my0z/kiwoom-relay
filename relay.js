@@ -176,16 +176,20 @@ function handleRealtimeMessage(msg) {
   for (const entry of msg.data) {
     if (entry.type === "0J" && entry.values) {
       // 업종지수: 10=현재가, 12=등락률, 20=체결시각
+      // 주의: 키움 실시간 "현재가"는 부호가 붙어 오지만(-71400 등) 이건 가격이 마이너스라는 뜻이 아니라
+      // "기준가 대비 하락중"이라는 방향 표시임. 가격 자체는 항상 절댓값으로 처리해야 함(그대로 두면 하락일에
+      // 가격이 음수로 계산되는 버그가 생김 - 실측으로 확인됨). 등락률(12)은 방향이 의미 있으니 부호 유지.
       realtimeCache.index[entry.item] = {
-        price: parseSignedNumber(entry.values["10"]),
+        price: Math.abs(parseSignedNumber(entry.values["10"])),
         rate: parseSignedNumber(entry.values["12"]),
         time: entry.values["20"] || "",
         updatedAt: new Date().toISOString(),
       };
     } else if (entry.type === "0B" && entry.values) {
       // 주식체결: 10=현재가, 12=등락률, 13=누적거래량, 228=체결강도, 20=체결시각
+      // 현재가는 위와 동일한 이유로 절댓값 처리
       realtimeCache.stock[entry.item] = {
-        price: parseSignedNumber(entry.values["10"]),
+        price: Math.abs(parseSignedNumber(entry.values["10"])),
         rate: parseSignedNumber(entry.values["12"]),
         volume: parseSignedNumber(entry.values["13"]),
         cntrStr: parseSignedNumber(entry.values["228"]),
