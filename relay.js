@@ -314,6 +314,69 @@ async function collectAndForwardSnapshots() {
 setInterval(collectAndForwardSnapshots, 120000);
 setTimeout(collectAndForwardSnapshots, 5000); // 재시작 직후 2분 공백 방지용 1회 즉시 실행(5초 뒤, 토큰발급 여유)
 
+// ---------- 15:36 최종 종가 재조회 (Worker collectFinalAccurateQuotes/retryFinalQuotePending 완전 이전) ----------
+// Worker는 호출당 서브리퀘스트 한도(약 50개)가 있어서 종목이 많으면 여러 틱(15:36/38/40/42/44)에
+// 나눠 재시도해야 했음. relay는 그런 한도가 없어서 한 번에 전종목 순차조회(1.1초 간격) 가능.
+function kiwoomQuoteRelay(code, token) {
+  return kiwoomRest("/api/dostk/mrkcond", "ka10007", { stk_cd: code }, token);
+}
+function parseKiwoomQuoteRelay(json) {
+  const abs = (v) => Math.abs(parseInt(String(v ?? "0").replace(/[^\d-]/g, ""), 10)) || 0;
+  return {
+    price: abs(json.cur_prc),
+    rate: parseFloat(json.flu_rt ?? "0") || 0,
+    volume: abs(json.trde_qty ?? json.now_trde_qty),
+  };
+}
+
+let finalQuoteDoneToday = null; // "YYYY-MM-DD" - 하루 한 번만 실행되게 (같은 날 재시작돼도 중복 방지)
+async function runFinalQuoteReconcile() {
+  const kst = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Seoul" }));
+  const dateKey = `${kst.getFullYear()}-${String(kst.getMonth() + 1).padStart(2, "0")}-${String(kst.getDate()).padStart(2, "0")}`;
+  if (finalQuoteDoneToday === dateKey) return;
+  if (!ADMIN_KEY) return;
+  try {
+    const targetsRes = await workerRequest("/api/final-quote-targets", "GET");
+    if (!targetsRes.ok || !targetsRes.targets.length) return;
+    const targets = targetsRes.targets;
+    const token = await issueTokenCached();
+    const rows = [];
+    const failedCodes = [];
+    for (const t of targets) {
+      try {
+        const raw = await kiwoomQuoteRelay(t.code, token);
+        const q = parseKiwoomQuoteRelay(raw);
+        rows.push({ code: t.code, name: t.name, price: q.price, rate: q.rate, volume: q.volume, market: t.market });
+      } catch (e) {
+        failedCodes.push(t.code);
+      }
+      await new Promise((r) => setTimeout(r, 1100)); // 키움 TR 초당1건 제한
+    }
+    if (rows.length) {
+      const result = await workerRequest("/api/ingest/final-quotes", "POST", {
+        rows, capturedAt: new Date().toISOString(), failedCodes,
+      });
+      if (result.ok) {
+        console.log(`최종 종가 재조회 완료: ${result.saved}/${targets.length}종목 (실패 ${failedCodes.length}종목)`);
+        finalQuoteDoneToday = dateKey;
+      } else {
+        console.log("최종 종가 재조회 전송 실패: " + (result.error || "unknown"));
+      }
+    }
+  } catch (e) {
+    console.log("최종 종가 재조회 실패: " + e.message);
+  }
+}
+// 15:36 KST 정각을 정확히 맞추기보다, 15:35~15:40 사이 1분 간격으로 체크해서 그 구간에 한 번만 실행.
+// (분 단위 트리거를 setInterval로 대충 맞추는 방식 - cron 없는 Node 프로세스라 이렇게 처리)
+setInterval(() => {
+  const kst = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Seoul" }));
+  const minutes = kst.getHours() * 60 + kst.getMinutes();
+  if (minutes >= 15 * 60 + 36 && minutes <= 15 * 60 + 40) {
+    runFinalQuoteReconcile();
+  }
+}, 60000);
+
 function handleRealtimeMessage(msg) {
   if (!Array.isArray(msg.data)) return;
   for (const entry of msg.data) {
