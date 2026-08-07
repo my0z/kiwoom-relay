@@ -48,6 +48,8 @@ const SNAPSHOT_INTERVAL_MS = 15000;
 
 function saveRealtimeSnapshot() {
   try {
+    const stockCount = Object.keys(realtimeCache.stock).length;
+    if (stockCount === 0) return; // 빈 값으로 덮어쓰면 마지막 유효 스냅샷이 소실됨 - 값 있을 때만 저장
     const data = {
       savedAt: new Date().toISOString(),
       index: realtimeCache.index,
@@ -1214,6 +1216,35 @@ const server = http.createServer((req, res) => {
         events: cond.events.slice(0, 20),
       })
     );
+    return;
+  }
+
+  // 관심종목 현재가 즉시조회 - realtimeCache.stock에 값이 없는 종목(웹소켓 구독 전, 장마감 후
+  // 재시작 등)을 Worker가 요청하면 그 자리에서 키움 개별시세(ka10007)를 조회해서 바로 채워줌.
+  // 조회 결과는 realtimeCache.stock에도 반영해서 다음 요청부턴 캐시로 즉시 응답됨.
+  if (req.url.startsWith("/realtime/quote-now")) {
+    const q = new URL(req.url, "http://localhost").searchParams;
+    const code = q.get("code");
+    if (!code) {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: false, error: "code 누락" }));
+      return;
+    }
+    (async () => {
+      try {
+        const token = await issueTokenCached();
+        const raw = await kiwoomQuoteRelay(code, token);
+        const parsed = parseKiwoomQuoteRelay(raw);
+        if (parsed.price > 0) {
+          realtimeCache.stock[code] = { ...parsed, cntrStr: 0, time: "", updatedAt: new Date().toISOString() };
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: parsed.price > 0, price: parsed.price, rate: parsed.rate, volume: parsed.volume }));
+      } catch (e) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: e.message }));
+      }
+    })();
     return;
   }
 
