@@ -449,7 +449,7 @@ connectWebSocket();
 // Worker의 2분 cron(checkWatchlistRiskLevels)보다 훨씬 빠르게 -1.5%/+1.5% 트리거.
 // relay는 이미 웹소켓으로 실시간가를 들고 있으므로 키움 TR 호출 없이 즉시 계산 가능.
 const AUTO_REMOVE_PNL_PCT = -1.5; // 손절
-const AUTO_TAKE_PROFIT_PNL_PCT = 1.5; // 익절
+const AUTO_TAKE_PROFIT_PNL_PCT = 2.5; // 익절
 function workerRequest(path, method, body) {
   return new Promise((resolve, reject) => {
     const url = new URL(WORKER_URL + path);
