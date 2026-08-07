@@ -1271,6 +1271,15 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // 관심종목 미니차트 전체 일괄조회 - Worker의 /api/latest가 페이지 로드 시 이걸 한 번에 받아가서
+  // 응답에 포함시킴. 종목별로 /api/mini-candles를 따로따로 부르던 왕복(브라우저<->Worker<->relay)을
+  // 아예 없애서 첫 로드 시 차트가 별도 요청 없이 즉시 뜨게 함(가장 빠른 경로).
+  if (req.url === "/realtime/mini-candles-all") {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true, cache: miniCandleCache }));
+    return;
+  }
+
   // 웹소켓 상태 확인용 (헬스체크에서 씀)
   if (req.url === "/realtime/status") {
     const mem = process.memoryUsage();
