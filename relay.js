@@ -337,73 +337,11 @@ async function collectAndForwardSnapshots() {
 setInterval(collectAndForwardSnapshots, 120000);
 setTimeout(collectAndForwardSnapshots, 5000); // 재시작 직후 2분 공백 방지용 1회 즉시 실행(5초 뒤, 토큰발급 여유)
 
-// ---------- 해외지수(다우/나스닥/S&P500) + 원달러 환율 ----------
-// 키움 국내주식 API 권한으로는 해외지수/환율을 못 받아옴(별도 해외파생 API 권한 필요) - 대신
-// 네이버 모바일증권의 공개 JSON API(인증 불필요, 비공식이지만 안정적으로 널리 쓰임)를 사용.
-// 국내 장 시간과 무관하게(미국 장은 밤에 열림) 24시간 갱신 - 장중 게이트 없음.
-function fetchNaverIndex(code) {
-  return new Promise((resolve, reject) => {
-    https
-      .get(
-        `https://m.stock.naver.com/api/index/${encodeURIComponent(code)}/basic`,
-        { headers: { "User-Agent": "Mozilla/5.0" }, timeout: 8000 },
-        (res) => {
-          let body = "";
-          res.on("data", (c) => (body += c));
-          res.on("end", () => {
-            try {
-              resolve(JSON.parse(body));
-            } catch (e) {
-              reject(new Error("파싱 실패: " + body.slice(0, 200)));
-            }
-          });
-        }
-      )
-      .on("error", reject)
-      .on("timeout", function () {
-        this.destroy(new Error("타임아웃"));
-      });
-  });
-}
-
-const globalIndexCache = { dji: null, ixic: null, spx: null, usdkrw: null, updatedAt: null };
-async function refreshGlobalIndices() {
-  const targets = [
-    ["dji", ".DJI"], // 다우존스
-    ["ixic", ".IXIC"], // 나스닥종합
-    ["spx", ".SPX"], // S&P500
-    ["usdkrw", "FX_USDKRW"], // 원달러 환율
-  ];
-  for (const [key, code] of targets) {
-    try {
-      const json = await fetchNaverIndex(code);
-      // 네이버 응답 필드명은 지수/환율 종류에 따라 조금씩 다를 수 있어 여러 후보를 순서대로 확인
-      const price = parseFloat(json.closePrice ?? json.now ?? json.tradePrice ?? json.closePriceStr ?? "0");
-      const rate = parseFloat(
-        String(json.fluctuationsRatio ?? json.changeRate ?? json.fluctuationsRatioStr ?? "0").replace(/[^0-9.-]/g, "")
-      );
-      if (price > 0) {
-        globalIndexCache[key] = { price, rate };
-      }
-    } catch (e) {
-      console.log(`해외지수(${code}) 조회 실패: ${e.message}`);
-    }
-  }
-  globalIndexCache.updatedAt = new Date().toISOString();
-}
-setInterval(refreshGlobalIndices, 5000); // 5초마다 - 너무 짧으면(3초 이하) 네이버 차단 위험, 5초가 안전권에서 최대한 당긴 값
-setTimeout(refreshGlobalIndices, 3000);
-
-// 국내(웹소켓 실시간)+해외(네이버 폴링) 지수를 한 번에 묶어서 반환 - SSE/realtime-all 등 여러
-// 응답 지점에서 공통으로 재사용.
+// 국내(웹소켓 실시간) 지수 - SSE/realtime-all 등 여러 응답 지점에서 공통으로 재사용.
 function buildIndexPayload() {
   return {
     kospi: realtimeCache.index["001"] || null,
     kosdaq: realtimeCache.index["101"] || null,
-    dji: globalIndexCache.dji,
-    ixic: globalIndexCache.ixic,
-    spx: globalIndexCache.spx,
-    usdkrw: globalIndexCache.usdkrw,
   };
 }
 
