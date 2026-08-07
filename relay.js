@@ -64,7 +64,9 @@ function loadRealtimeSnapshot() {
     if (!fs.existsSync(SNAPSHOT_PATH)) return;
     const raw = JSON.parse(fs.readFileSync(SNAPSHOT_PATH, "utf8"));
     const ageMs = Date.now() - new Date(raw.savedAt).getTime();
-    if (ageMs > 10 * 60 * 1000) return; // 10분 넘게 지난 스냅샷은 의미 없어서 버림 (장 상황이 바뀌었을 것)
+    // 장중엔 10분 넘게 지난 값은 버림(그 사이 장 상황이 바뀌었을 것). 장마감 후엔 마지막 장중 값이
+    // 여전히 유효한 "현재가"이므로 신선도 제한 없이 그대로 복구(다음 장 시작 전까지 안 바뀌는 데이터).
+    if (isMarketHoursKST() && ageMs > 10 * 60 * 1000) return;
     if (raw.index) Object.assign(realtimeCache.index, raw.index);
     if (raw.stock) Object.assign(realtimeCache.stock, raw.stock);
     console.log(`실시간가 스냅샷 복구: 종목 ${Object.keys(raw.stock || {}).length}개 (${Math.round(ageMs / 1000)}초 전 값)`);
@@ -764,7 +766,30 @@ setInterval(() => {
 // 원래 Worker가 화면 로드 때마다 종목당 1.1초씩 순차조회(ka10080)했던 게 관심종목 수만큼
 // 누적되어 체감 로딩이 느렸음(10종목이면 11초+). relay가 백그라운드에서 미리 갱신해두고
 // Worker는 그 캐시를 즉시 반환하게 바꿔 - 화면에서는 사실상 즉시(0.1초 이내) 뜨게 됨.
+// 파일로도 영속화해서 relay 재시작(배포 등)에도 캐시가 날아가지 않게 함 - 장마감 후에도
+// 마지막 장중 데이터를 그대로 즉시 서빙 가능(어차피 그 시점 이후로 안 바뀌는 데이터라 유효함).
 const miniCandleCache = {}; // { code: { candles: [...], tradingDate, updatedAt } }
+const MINI_CANDLE_CACHE_PATH = path.join(__dirname, "mini-candle-cache.json");
+function saveMiniCandleCache() {
+  try {
+    fs.writeFileSync(MINI_CANDLE_CACHE_PATH, JSON.stringify(miniCandleCache));
+  } catch (e) {
+    console.log("미니차트 캐시 저장 실패: " + e.message);
+  }
+}
+function loadMiniCandleCache() {
+  try {
+    if (!fs.existsSync(MINI_CANDLE_CACHE_PATH)) return;
+    const raw = JSON.parse(fs.readFileSync(MINI_CANDLE_CACHE_PATH, "utf8"));
+    Object.assign(miniCandleCache, raw);
+    console.log(`미니차트 캐시 복구: 종목 ${Object.keys(raw).length}개`);
+  } catch (e) {
+    console.log("미니차트 캐시 복구 실패: " + e.message);
+  }
+}
+loadMiniCandleCache();
+setInterval(saveMiniCandleCache, 60000); // 갱신 주기와 맞춰 1분마다 저장
+
 function todayYYYYMMDDRelay() {
   const kst = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Seoul" }));
   const y = kst.getFullYear();
@@ -817,9 +842,85 @@ async function refreshMiniCandlesForWatchlist() {
     console.log("미니차트 캐시 갱신 실패: " + e.message);
   }
 }
+
+// ---------- 관심종목 추가/삭제 즉시 반영 ----------
+// 새로 추가된 종목은 다음 60초 정기갱신을 기다리지 않고 바로(장시작~현재까지 전체 1분봉을) 채워서
+// 화면에서 "아직 캐시 안 됨" 공백이 최소화되게 함. 삭제된 종목은 캐시에서 즉시 제거해서
+// 메모리가 무한정 쌓이지 않게 함(관심종목 아닌 종목의 낡은 데이터가 계속 파일에 남는 것 방지).
+let prevWatchlistCodes = new Set();
+let newCodeFetchRunning = false;
+const newCodeFetchQueue = [];
+async function processNewCodeFetchQueue() {
+  if (newCodeFetchRunning) return;
+  newCodeFetchRunning = true;
+  while (newCodeFetchQueue.length) {
+    const code = newCodeFetchQueue.shift();
+    try {
+      const token = await issueTokenCached();
+      const raw = await kiwoomRest("/api/dostk/chart", "ka10080", { stk_cd: code, tic_scope: "1", upd_stkpc_tp: "1" }, token);
+      const parsed = parseKiwoomChartOHLCRelay(raw);
+      const todayStr = todayYYYYMMDDRelay();
+      const hasToday = parsed.some((c) => c.time.slice(0, 8) === todayStr);
+      const targetDate = hasToday ? todayStr : parsed.reduce((max, c) => (c.time.slice(0, 8) > max ? c.time.slice(0, 8) : max), "");
+      const candles = parsed.filter((c) => c.time.slice(0, 8) === targetDate && c.time.slice(8, 12) >= "0900");
+      miniCandleCache[code] = { candles, tradingDate: targetDate || null, updatedAt: Date.now() };
+      console.log(`신규 관심종목 차트 즉시조회 완료: ${code} (${candles.length}봉)`);
+    } catch (e) {
+      console.log(`신규 관심종목 차트 즉시조회 실패: ${code} - ${e.message}`);
+    }
+    await new Promise((r) => setTimeout(r, 1100)); // 키움 TR 초당1건 제한
+  }
+  newCodeFetchRunning = false;
+}
+async function checkWatchlistMembershipChanges() {
+  if (!ADMIN_KEY) return;
+  try {
+    const entries = await getWatchlistEntriesCached();
+    const currentCodes = new Set(entries.map((e) => e.code));
+
+    // 삭제된 종목: 캐시에서 즉시 제거
+    for (const code of prevWatchlistCodes) {
+      if (!currentCodes.has(code)) {
+        delete miniCandleCache[code];
+        console.log(`관심종목 삭제 감지 - 캐시 제거: ${code}`);
+      }
+    }
+
+    // 신규 종목: 장중이면 즉시조회 큐에 추가(60초 정기갱신을 기다리지 않음)
+    if (isMarketHoursKST()) {
+      for (const code of currentCodes) {
+        if (!prevWatchlistCodes.has(code) && !miniCandleCache[code] && !newCodeFetchQueue.includes(code)) {
+          newCodeFetchQueue.push(code);
+        }
+      }
+      if (newCodeFetchQueue.length) processNewCodeFetchQueue();
+    }
+
+    prevWatchlistCodes = currentCodes;
+  } catch (e) {
+    // entries 조회 실패는 다음 틱에 재시도
+  }
+}
+setInterval(checkWatchlistMembershipChanges, 3000); // entries 자체는 5초 캐시라 3초 체크해도 실제 호출은 그만큼 안 늘어남
+
 // 1분마다 갱신 - 1분봉 데이터라 이보다 자주 갱신해도 의미 없음
 setInterval(refreshMiniCandlesForWatchlist, 60000);
 setTimeout(refreshMiniCandlesForWatchlist, 8000); // 재시작 직후 워밍업 (토큰발급/entries조회 여유)
+
+// 매일 장 시작 전(09:00 KST) 캐시 초기화 - 어제 데이터가 오늘 장중에도 잠깐 보이는 걸 방지.
+// 09:01부터 refreshMiniCandlesForWatchlist가 새 거래일 데이터로 다시 채움.
+let miniCandleCacheClearedDate = null;
+setInterval(() => {
+  const kst = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Seoul" }));
+  const dateKey = `${kst.getFullYear()}-${String(kst.getMonth() + 1).padStart(2, "0")}-${String(kst.getDate()).padStart(2, "0")}`;
+  const minutes = kst.getHours() * 60 + kst.getMinutes();
+  if (minutes >= 9 * 60 && minutes < 9 * 60 + 1 && miniCandleCacheClearedDate !== dateKey) {
+    Object.keys(miniCandleCache).forEach((k) => delete miniCandleCache[k]);
+    saveMiniCandleCache();
+    miniCandleCacheClearedDate = dateKey;
+    console.log("미니차트 캐시 초기화 (새 거래일 시작)");
+  }
+}, 30000);
 
 async function checkWatchlistStopLoss() {
   if (!ADMIN_KEY) return; // 키 미설정이면 조용히 스킵 (fail closed)
