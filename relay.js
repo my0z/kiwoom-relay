@@ -445,10 +445,11 @@ setInterval(() => {
 
 connectWebSocket();
 
-// ---------- 관심종목 손절 자동체크 (10초 주기) ----------
-// Worker의 2분 cron(checkWatchlistRiskLevels)보다 훨씬 빠르게 -1.5% 손절 트리거.
+// ---------- 관심종목 손절/익절 자동체크 (10초 주기) ----------
+// Worker의 2분 cron(checkWatchlistRiskLevels)보다 훨씬 빠르게 -1.5%/+1.5% 트리거.
 // relay는 이미 웹소켓으로 실시간가를 들고 있으므로 키움 TR 호출 없이 즉시 계산 가능.
-const AUTO_REMOVE_PNL_PCT = -1.5;
+const AUTO_REMOVE_PNL_PCT = -1.5; // 손절
+const AUTO_TAKE_PROFIT_PNL_PCT = 1.5; // 익절
 function workerRequest(path, method, body) {
   return new Promise((resolve, reject) => {
     const url = new URL(WORKER_URL + path);
@@ -492,12 +493,13 @@ async function checkWatchlistStopLoss() {
       const q = realtimeCache.stock[item.code];
       if (!q || !q.price) continue; // 아직 실시간가 미수신 - 다음 틱에 재시도
       const pnlPct = ((q.price - item.entry_price) / item.entry_price) * 100;
-      if (pnlPct <= AUTO_REMOVE_PNL_PCT) {
+      if (pnlPct <= AUTO_REMOVE_PNL_PCT || pnlPct >= AUTO_TAKE_PROFIT_PNL_PCT) {
+        const reason = pnlPct >= AUTO_TAKE_PROFIT_PNL_PCT ? "익절" : "손절";
         try {
           await workerRequest("/api/watchlist/auto-remove", "POST", { code: item.code, pnlPct, name: stockNameCache[item.code] });
-          console.log(`손절 자동삭제: ${item.code} (${pnlPct.toFixed(2)}%)`);
+          console.log(`${reason} 자동삭제: ${item.code} (${pnlPct.toFixed(2)}%)`);
         } catch (e) {
-          console.log(`손절 자동삭제 요청 실패: ${item.code} - ${e.message}`);
+          console.log(`${reason} 자동삭제 요청 실패: ${item.code} - ${e.message}`);
         }
       }
     }
