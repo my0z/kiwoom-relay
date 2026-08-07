@@ -752,6 +752,51 @@ async function checkWatchlistStopLoss() {
 }
 setInterval(checkWatchlistStopLoss, 2000);
 
+// ---------- 15:50 일괄정리 (하루 1회) ----------
+// 15:50부터는 신규 매매/자동삭제가 전부 중지되는데, 그 직전 시점 기준으로 조건(+2.5%/-1.5%)에
+// 걸려있는 종목들은 중지되기 전에 한 번 정리해줌. 이후(15:50~장마감)엔 다시 매매중지 유지.
+let finalSweepDoneToday = null;
+async function runFinalSweep() {
+  const kst = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Seoul" }));
+  const dateKey = `${kst.getFullYear()}-${String(kst.getMonth() + 1).padStart(2, "0")}-${String(kst.getDate()).padStart(2, "0")}`;
+  if (finalSweepDoneToday === dateKey) return;
+  if (!ADMIN_KEY) return;
+  try {
+    const entries = await workerRequest("/api/watchlist-entries", "GET");
+    if (!entries.ok || !entries.items.length) {
+      finalSweepDoneToday = dateKey;
+      return;
+    }
+    const items = [];
+    for (const item of entries.items) {
+      const q = realtimeCache.stock[item.code];
+      if (!q || !q.price) continue;
+      const pnlPct = ((q.price - item.entry_price) / item.entry_price) * 100;
+      if (pnlPct >= AUTO_TAKE_PROFIT_PNL_PCT || pnlPct <= AUTO_REMOVE_PNL_PCT) {
+        items.push({ code: item.code, pnlPct });
+      }
+    }
+    const result = await workerRequest("/api/watchlist/final-sweep", "POST", { items });
+    if (result.ok) {
+      console.log(`15:50 일괄정리 완료: ${result.removed}종목 삭제 (대상 ${items.length}건 중)`);
+      finalSweepDoneToday = dateKey;
+    } else {
+      console.log("15:50 일괄정리 실패: " + (result.error || "unknown"));
+    }
+  } catch (e) {
+    console.log("15:50 일괄정리 실패: " + e.message);
+  }
+}
+// 15:50 정각을 정확히 맞추기보다 15:50~15:52 구간에서 1분 간격 체크 (매매중지 게이트가 15:50부터
+// 걸리므로, 이 구간이 지나기 전에 반드시 한 번은 실행되어야 함).
+setInterval(() => {
+  const kst = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Seoul" }));
+  const minutes = kst.getHours() * 60 + kst.getMinutes();
+  if (minutes >= 15 * 60 + 50 && minutes <= 15 * 60 + 52) {
+    runFinalSweep();
+  }
+}, 30000);
+
 // ---------- HTTP 서버 (기존 REST 중계 + 신규 실시간 캐시 조회) ----------
 // 조건검색 편입 이력에 이름/현재가를 붙여서 반환 - /realtime/all과 /realtime/condition 둘 다에서 씀
 function buildConditionHistory() {
