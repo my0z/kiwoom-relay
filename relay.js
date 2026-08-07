@@ -898,6 +898,17 @@ async function checkWatchlistMembershipChanges() {
       if (newCodeFetchQueue.length) processNewCodeFetchQueue();
     }
 
+    // 웹소켓 실시간가 구독도 관심종목 변경에 맞춰 자체 갱신 - 브라우저가 페이지를 안 열어놔도
+    // (아무도 /realtime/subscribe를 호출 안 해도) 관심종목은 항상 최신 상태로 구독 유지됨.
+    // 구독 등록은 웹소켓 메시지라 키움 REST 초당1건 제한과 무관 - 걸릴 일 없음.
+    const codesArr = [...currentCodes];
+    const changed = codesArr.length !== subscribedStocks.length || codesArr.some((c) => !subscribedStocks.includes(c));
+    if (changed && ws && ws.readyState === WebSocket.OPEN && wsLoggedIn) {
+      subscribedStocks = codesArr;
+      ws.send(JSON.stringify({ trnm: "REG", grp_no: "2", refresh: "1", data: [{ item: subscribedStocks, type: ["0B"] }] }));
+      console.log("관심종목 변경 감지 - 웹소켓 구독 자체 갱신: " + subscribedStocks.length + "종목");
+    }
+
     prevWatchlistCodes = currentCodes;
   } catch (e) {
     // entries 조회 실패는 다음 틱에 재시도
