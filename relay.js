@@ -450,6 +450,16 @@ connectWebSocket();
 // relay는 이미 웹소켓으로 실시간가를 들고 있으므로 키움 TR 호출 없이 즉시 계산 가능.
 const AUTO_REMOVE_PNL_PCT = -1.5; // 손절
 const AUTO_TAKE_PROFIT_PNL_PCT = 2.5; // 익절
+
+// 15:50 이후 자동매매(익절/손절) 중지 - Worker도 동일 기준으로 403 처리하지만
+// relay 쪽에서 먼저 걸러서 불필요한 요청/로그 방지.
+function isTradingActiveKST() {
+  const kst = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Seoul" }));
+  const day = kst.getDay();
+  if (day === 0 || day === 6) return false;
+  const minutes = kst.getHours() * 60 + kst.getMinutes();
+  return minutes >= 9 * 60 + 1 && minutes < 15 * 60 + 50;
+}
 function workerRequest(path, method, body) {
   return new Promise((resolve, reject) => {
     const url = new URL(WORKER_URL + path);
@@ -486,6 +496,7 @@ function workerRequest(path, method, body) {
 
 async function checkWatchlistStopLoss() {
   if (!ADMIN_KEY) return; // 키 미설정이면 조용히 스킵 (fail closed)
+  if (!isTradingActiveKST()) return; // 15:50 이후 자동매매 중지
   try {
     const entries = await workerRequest("/api/watchlist-entries", "GET");
     if (!entries.ok || !entries.items.length) return;
