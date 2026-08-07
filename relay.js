@@ -835,7 +835,20 @@ function loadMiniCandleCache() {
   }
 }
 loadMiniCandleCache();
-setInterval(saveMiniCandleCache, 60000); // 갱신 주기와 맞춰 1분마다 저장
+setInterval(saveMiniCandleCache, 60000); // 안전망 - 아래 디바운스 저장이 놓쳐도 최대 1분 내 저장 보장
+
+// 캐시가 바뀔 때마다(종목 하나 채워질 때마다) 즉시 저장 트리거하되, 매번 동기 파일쓰기는 부담이니
+// 2초 안에 여러 번 바뀌면 묶어서 한 번만 씀. 예전엔 1분 고정주기로만 저장해서, relay가 그 사이에
+// 재시작되면(배포 등) 방금 채운 캐시가 파일에 반영되기도 전에 날아가는 문제가 있었음 - 이게 매번
+// "복구: 종목 0개"로 이어져서 재시작할 때마다 첫 로딩이 느려지던 근본 원인.
+let saveDebounceTimer = null;
+function scheduleSaveMiniCandleCache() {
+  if (saveDebounceTimer) return;
+  saveDebounceTimer = setTimeout(() => {
+    saveDebounceTimer = null;
+    saveMiniCandleCache();
+  }, 2000);
+}
 
 function todayYYYYMMDDRelay() {
   const kst = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Seoul" }));
@@ -881,6 +894,7 @@ async function refreshMiniCandlesForWatchlist() {
         const targetDate = hasToday ? todayStr : parsed.reduce((max, c) => (c.time.slice(0, 8) > max ? c.time.slice(0, 8) : max), "");
         const candles = parsed.filter((c) => c.time.slice(0, 8) === targetDate && c.time.slice(8, 12) >= "0900");
         miniCandleCache[item.code] = { candles, tradingDate: targetDate || null, updatedAt: Date.now() };
+        scheduleSaveMiniCandleCache();
       } catch (e) {
         // 개별 종목 실패는 건너뜀 - 다음 갱신 주기에 재시도
       }
@@ -912,6 +926,7 @@ async function processNewCodeFetchQueue() {
       const targetDate = hasToday ? todayStr : parsed.reduce((max, c) => (c.time.slice(0, 8) > max ? c.time.slice(0, 8) : max), "");
       const candles = parsed.filter((c) => c.time.slice(0, 8) === targetDate && c.time.slice(8, 12) >= "0900");
       miniCandleCache[code] = { candles, tradingDate: targetDate || null, updatedAt: Date.now() };
+      scheduleSaveMiniCandleCache();
       console.log(`신규 관심종목 차트 즉시조회 완료: ${code} (${candles.length}봉)`);
     } catch (e) {
       console.log(`신규 관심종목 차트 즉시조회 실패: ${code} - ${e.message}`);
@@ -967,18 +982,18 @@ setInterval(checkWatchlistMembershipChanges, 3000); // entries 자체는 5초 �
 setInterval(refreshMiniCandlesForWatchlist, 60000);
 setTimeout(refreshMiniCandlesForWatchlist, 8000); // 재시작 직후 워밍업 (토큰발급/entries조회 여유)
 
-// 매일 장 시작 전(09:00 KST) 캐시 초기화 - 어제 데이터가 오늘 장중에도 잠깐 보이는 걸 방지.
-// 09:01부터 refreshMiniCandlesForWatchlist가 새 거래일 데이터로 다시 채움.
+// 매일 장 시작(09:01 KST) 로그만 남김 - 캐시를 미리 비우지 않음. refreshMiniCandlesForWatchlist가
+// 09:01부터 각 종목을 오늘자 데이터로 하나씩 자연스럽게 덮어쓰므로, 굳이 먼저 비워서 공백을
+// 만들 필요가 없음(비우면 09:00~막 채워지기 전 사이에 접속한 사용자는 차트가 완전히 빔 -
+// 안 비우면 최소 어제 마지막 데이터라도 보이다가 몇 초~몇 분 내 오늘 데이터로 자동 교체됨).
 let miniCandleCacheClearedDate = null;
 setInterval(() => {
   const kst = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Seoul" }));
   const dateKey = `${kst.getFullYear()}-${String(kst.getMonth() + 1).padStart(2, "0")}-${String(kst.getDate()).padStart(2, "0")}`;
   const minutes = kst.getHours() * 60 + kst.getMinutes();
-  if (minutes >= 9 * 60 && minutes < 9 * 60 + 1 && miniCandleCacheClearedDate !== dateKey) {
-    Object.keys(miniCandleCache).forEach((k) => delete miniCandleCache[k]);
-    saveMiniCandleCache();
+  if (minutes >= 9 * 60 + 1 && minutes < 9 * 60 + 2 && miniCandleCacheClearedDate !== dateKey) {
     miniCandleCacheClearedDate = dateKey;
-    console.log("미니차트 캐시 초기화 (새 거래일 시작)");
+    console.log("새 거래일 시작 - 미니차트 캐시는 유지한 채 오늘자 데이터로 순차 교체 시작");
   }
 }, 30000);
 
