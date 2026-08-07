@@ -702,14 +702,28 @@ function workerRequest(path, method, body) {
 // 반영되지만 손익 판단 정확도에는 영향 없음(가격은 항상 최신 realtimeCache 사용).
 let entriesCache = { items: [], fetchedAt: 0 };
 const ENTRIES_TTL_MS = 5000;
+let entriesCacheHits = 0;
+let entriesCacheMisses = 0;
 async function getWatchlistEntriesCached() {
-  if (Date.now() - entriesCache.fetchedAt < ENTRIES_TTL_MS) return entriesCache.items;
+  if (Date.now() - entriesCache.fetchedAt < ENTRIES_TTL_MS) {
+    entriesCacheHits++;
+    return entriesCache.items;
+  }
+  entriesCacheMisses++;
   const entries = await workerRequest("/api/watchlist-entries", "GET");
   if (entries.ok) {
     entriesCache = { items: entries.items, fetchedAt: Date.now() };
   }
   return entriesCache.items;
 }
+// 10분마다 캐시 히트율 로그 - watchlist-entries 실제 호출 빈도 확인용
+setInterval(() => {
+  const total = entriesCacheHits + entriesCacheMisses;
+  if (total === 0) return;
+  console.log(`entries 캐시 통계(10분): 히트 ${entriesCacheHits} / 미스(실제호출) ${entriesCacheMisses} / 히트율 ${((entriesCacheHits / total) * 100).toFixed(1)}%`);
+  entriesCacheHits = 0;
+  entriesCacheMisses = 0;
+}, 600000);
 
 async function checkWatchlistStopLoss() {
   if (!ADMIN_KEY) return; // 키 미설정이면 조용히 스킵 (fail closed)
