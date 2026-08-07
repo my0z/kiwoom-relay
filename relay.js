@@ -1222,12 +1222,20 @@ const server = http.createServer((req, res) => {
   // 관심종목 현재가 즉시조회 - realtimeCache.stock에 값이 없는 종목(웹소켓 구독 전, 장마감 후
   // 재시작 등)을 Worker가 요청하면 그 자리에서 키움 개별시세(ka10007)를 조회해서 바로 채워줌.
   // 조회 결과는 realtimeCache.stock에도 반영해서 다음 요청부턴 캐시로 즉시 응답됨.
+  // 이미 최근(30초 이내) 조회한 값이 있으면 재조회하지 않고 그대로 반환 - /api/latest가 반복
+  // 호출될 때마다 매번 키움을 다시 두드리는 낭비 방지.
   if (req.url.startsWith("/realtime/quote-now")) {
     const q = new URL(req.url, "http://localhost").searchParams;
     const code = q.get("code");
     if (!code) {
       res.writeHead(400, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: false, error: "code 누락" }));
+      return;
+    }
+    const existing = realtimeCache.stock[code];
+    if (existing && existing.updatedAt && Date.now() - new Date(existing.updatedAt).getTime() < 30000) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, price: existing.price, rate: existing.rate, volume: existing.volume || 0 }));
       return;
     }
     (async () => {
@@ -1279,6 +1287,7 @@ const server = http.createServer((req, res) => {
         cachedStockCount: Object.keys(realtimeCache.stock).length,
         conditionSeq: realtimeCache.condition.seq,
         conditionCount: realtimeCache.condition.codes.length,
+        sseClientCount: sseClients.size,
         memoryRssMb: Math.round(mem.rss / 1024 / 1024),
         memoryHeapUsedMb: Math.round(mem.heapUsed / 1024 / 1024),
       })
