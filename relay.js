@@ -934,15 +934,16 @@ async function checkWatchlistMembershipChanges() {
       }
     }
 
-    // 신규 종목: 장중이면 즉시조회 큐에 추가(60초 정기갱신을 기다리지 않음)
-    if (isMarketHoursKST()) {
-      for (const code of currentCodes) {
-        if (!prevWatchlistCodes.has(code) && !miniCandleCache[code] && !newCodeFetchQueue.includes(code)) {
-          newCodeFetchQueue.push(code);
-        }
+    // 캐시가 없는 종목은 즉시조회 큐에 추가 - 신규 등록이든, relay 재시작으로 캐시가 날아갔든
+    // 상관없이 채움. 예전엔 장중일 때만 채웠는데, 그러면 relay가 장마감 후 재시작된 경우
+    // (배포 등) 캐시가 텅 빈 채로 다음 장 시작 전까지 계속 비어있어서 첫 로딩이 매번 느려지는
+    // 문제가 있었음 - 장마감 후엔 데이터가 안 바뀌니 한 번 채워두면 계속 유효함.
+    for (const code of currentCodes) {
+      if (!miniCandleCache[code] && !newCodeFetchQueue.includes(code)) {
+        newCodeFetchQueue.push(code);
       }
-      if (newCodeFetchQueue.length) processNewCodeFetchQueue();
     }
+    if (newCodeFetchQueue.length) processNewCodeFetchQueue();
 
     // 웹소켓 실시간가 구독도 관심종목 변경에 맞춰 자체 갱신 - 브라우저가 페이지를 안 열어놔도
     // (아무도 /realtime/subscribe를 호출 안 해도) 관심종목은 항상 최신 상태로 구독 유지됨.
