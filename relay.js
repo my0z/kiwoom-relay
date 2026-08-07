@@ -377,6 +377,40 @@ setInterval(() => {
   }
 }, 60000);
 
+// ---------- SSE(Server-Sent Events) 실시간 스트리밍 ----------
+// Worker가 2초마다 폴링하며 relay를 두드리던 구조 대신, relay가 웹소켓으로 값을 받는
+// 즉시 연결된 모든 SSE 클라이언트(Worker 경유)에 바로 push. 폴링 지연이 사라지고
+// 키움->relay->Worker->브라우저 전 구간이 이벤트 기반이 됨(진짜 실시간에 가까워짐).
+const sseClients = new Set(); // Set<http.ServerResponse>
+function sseBroadcast(payload) {
+  if (!sseClients.size) return;
+  const line = `data: ${JSON.stringify(payload)}\n\n`;
+  for (const res of sseClients) {
+    try {
+      res.write(line);
+    } catch (e) {
+      sseClients.delete(res);
+    }
+  }
+}
+// 매 웹소켓 메시지마다 브로드캐스트하면 너무 잦을 수 있어(체결이 빈번한 종목은 초당 여러 번) 200ms
+// 간격으로 묶어서 전송 - 그래도 기존 2초 폴링보다 10배 빠르고, 브라우저 렌더링 부하도 줄어듦.
+let sseBroadcastPending = false;
+function scheduleSseBroadcast() {
+  if (sseBroadcastPending || !sseClients.size) return;
+  sseBroadcastPending = true;
+  setTimeout(() => {
+    sseBroadcastPending = false;
+    const cond = realtimeCache.condition;
+    const history = buildConditionHistory();
+    sseBroadcast({
+      index: { kospi: realtimeCache.index["001"] || null, kosdaq: realtimeCache.index["101"] || null },
+      stocks: realtimeCache.stock,
+      condition: { seq: cond.seq, name: cond.name, codes: cond.codes, count: cond.codes.length, lastEventAt: cond.lastEventAt, history },
+    });
+  }, 200);
+}
+
 function handleRealtimeMessage(msg) {
   if (!Array.isArray(msg.data)) return;
   for (const entry of msg.data) {
@@ -443,6 +477,7 @@ function handleRealtimeMessage(msg) {
       }
     }
   }
+  scheduleSseBroadcast();
 }
 
 function registerSubscriptions() {
@@ -725,6 +760,67 @@ setInterval(() => {
   entriesCacheMisses = 0;
 }, 600000);
 
+// ---------- 관심종목 미니차트(1분봉) 백그라운드 캐시 ----------
+// 원래 Worker가 화면 로드 때마다 종목당 1.1초씩 순차조회(ka10080)했던 게 관심종목 수만큼
+// 누적되어 체감 로딩이 느렸음(10종목이면 11초+). relay가 백그라운드에서 미리 갱신해두고
+// Worker는 그 캐시를 즉시 반환하게 바꿔 - 화면에서는 사실상 즉시(0.1초 이내) 뜨게 됨.
+const miniCandleCache = {}; // { code: { candles: [...], tradingDate, updatedAt } }
+function todayYYYYMMDDRelay() {
+  const kst = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Seoul" }));
+  const y = kst.getFullYear();
+  const m = String(kst.getMonth() + 1).padStart(2, "0");
+  const d = String(kst.getDate()).padStart(2, "0");
+  return `${y}${m}${d}`;
+}
+function parseKiwoomChartOHLCRelay(json) {
+  let rows = [];
+  for (const key of Object.keys(json)) {
+    if (Array.isArray(json[key])) {
+      rows = json[key];
+      break;
+    }
+  }
+  const abs = (v) => Math.abs(parseInt(String(v ?? "0").replace(/[^\d-]/g, ""), 10)) || 0;
+  return rows
+    .map((row) => ({
+      open: abs(row.open_pric),
+      high: abs(row.high_pric),
+      low: abs(row.low_pric),
+      close: abs(row.cur_prc ?? row.close_pric),
+      time: row.cntr_tm || "",
+    }))
+    .filter((r) => r.close > 0 && r.high > 0 && r.low > 0)
+    .reverse();
+}
+async function refreshMiniCandlesForWatchlist() {
+  if (!ADMIN_KEY) return;
+  if (!isMarketHoursKST()) return; // 장시간 외엔 갱신 불필요(어차피 안 바뀜)
+  try {
+    const entries = await getWatchlistEntriesCached();
+    if (!entries.length) return;
+    const token = await issueTokenCached();
+    for (const item of entries) {
+      try {
+        const raw = await kiwoomRest("/api/dostk/chart", "ka10080", { stk_cd: item.code, tic_scope: "1", upd_stkpc_tp: "1" }, token);
+        const parsed = parseKiwoomChartOHLCRelay(raw);
+        const todayStr = todayYYYYMMDDRelay();
+        const hasToday = parsed.some((c) => c.time.slice(0, 8) === todayStr);
+        const targetDate = hasToday ? todayStr : parsed.reduce((max, c) => (c.time.slice(0, 8) > max ? c.time.slice(0, 8) : max), "");
+        const candles = parsed.filter((c) => c.time.slice(0, 8) === targetDate && c.time.slice(8, 12) >= "0900");
+        miniCandleCache[item.code] = { candles, tradingDate: targetDate || null, updatedAt: Date.now() };
+      } catch (e) {
+        // 개별 종목 실패는 건너뜀 - 다음 갱신 주기에 재시도
+      }
+      await new Promise((r) => setTimeout(r, 1100)); // 키움 TR 초당1건 제한
+    }
+  } catch (e) {
+    console.log("미니차트 캐시 갱신 실패: " + e.message);
+  }
+}
+// 1분마다 갱신 - 1분봉 데이터라 이보다 자주 갱신해도 의미 없음
+setInterval(refreshMiniCandlesForWatchlist, 60000);
+setTimeout(refreshMiniCandlesForWatchlist, 8000); // 재시작 직후 워밍업 (토큰발급/entries조회 여유)
+
 async function checkWatchlistStopLoss() {
   if (!ADMIN_KEY) return; // 키 미설정이면 조용히 스킵 (fail closed)
   if (!isTradingActiveKST()) return; // 15:50 이후 자동매매 중지
@@ -820,6 +916,32 @@ const server = http.createServer((req, res) => {
   if (req.headers["x-relay-secret"] !== RELAY_SECRET) {
     res.writeHead(401, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: false, error: "relay secret mismatch" }));
+    return;
+  }
+
+  // SSE 스트리밍 - Worker가 이 연결을 열어두고 받는 대로 브라우저에 그대로 릴레이함.
+  // 연결 직후 현재 스냅샷을 1회 즉시 보내고, 이후엔 값이 바뀔 때마다(최대 200ms 간격) push.
+  if (req.url === "/realtime/stream") {
+    res.writeHead(200, {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache",
+      "connection": "keep-alive",
+    });
+    const cond = realtimeCache.condition;
+    const initHistory = buildConditionHistory();
+    res.write(`data: ${JSON.stringify({
+      index: { kospi: realtimeCache.index["001"] || null, kosdaq: realtimeCache.index["101"] || null },
+      stocks: realtimeCache.stock,
+      condition: { seq: cond.seq, name: cond.name, codes: cond.codes, count: cond.codes.length, lastEventAt: cond.lastEventAt, history: initHistory },
+    })}\n\n`);
+    sseClients.add(res);
+    const keepAlive = setInterval(() => {
+      try { res.write(": ping\n\n"); } catch (e) { clearInterval(keepAlive); sseClients.delete(res); }
+    }, 20000); // 중간 프록시/타임아웃 방지용 주기적 코멘트 핑
+    req.on("close", () => {
+      clearInterval(keepAlive);
+      sseClients.delete(res);
+    });
     return;
   }
 
@@ -991,6 +1113,21 @@ const server = http.createServer((req, res) => {
         events: cond.events.slice(0, 20),
       })
     );
+    return;
+  }
+
+  // 관심종목 미니차트(1분봉) 캐시 조회 - Worker의 /api/mini-candles가 이걸 우선 사용해서
+  // 매번 종목당 1.1초 순차조회하던 걸 즉시 응답으로 바꿈 (relay가 백그라운드로 미리 갱신해둠).
+  if (req.url.startsWith("/realtime/mini-candles")) {
+    const q = new URL(req.url, "http://localhost").searchParams;
+    const code = q.get("code");
+    const cached = code && miniCandleCache[code];
+    res.writeHead(200, { "content-type": "application/json" });
+    if (cached) {
+      res.end(JSON.stringify({ ok: true, candles: cached.candles, tradingDate: cached.tradingDate, updatedAt: cached.updatedAt }));
+    } else {
+      res.end(JSON.stringify({ ok: false, error: "캐시 없음(관심종목이 아니거나 아직 미갱신)" }));
+    }
     return;
   }
 
