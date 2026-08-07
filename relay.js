@@ -1,6 +1,8 @@
 const http = require("http");
 const https = require("https");
 const WebSocket = require("ws");
+const fs = require("fs");
+const path = require("path");
 
 const PORT = process.env.PORT || 8787;
 const RELAY_SECRET = process.env.RELAY_SECRET;
@@ -37,6 +39,42 @@ const realtimeCache = {
 const CONDITION_SEQ = process.env.KIWOOM_CONDITION_SEQ || "";
 const WORKER_URL = process.env.WORKER_URL || "https://kiwoomapi.usbkr.workers.dev";
 const ADMIN_KEY = process.env.ADMIN_KEY || "";
+
+// ---------- 실시간가 로컬 파일 스냅샷 (VM 재시작 시 즉시 복구용) ----------
+// 웹소켓 재연결 전까지는 값이 비어서 손익판단/화면이 잠깐 비는데, 재시작 직전 스냅샷을
+// 먼저 메모리에 올려두면 재연결될 때까지의 공백을 직전 값으로 메꿀 수 있음(참고용, 신선도는 낮음).
+const SNAPSHOT_PATH = path.join(__dirname, "realtime-snapshot.json");
+const SNAPSHOT_INTERVAL_MS = 15000;
+
+function saveRealtimeSnapshot() {
+  try {
+    const data = {
+      savedAt: new Date().toISOString(),
+      index: realtimeCache.index,
+      stock: realtimeCache.stock,
+    };
+    fs.writeFileSync(SNAPSHOT_PATH, JSON.stringify(data));
+  } catch (e) {
+    console.log("스냅샷 저장 실패: " + e.message);
+  }
+}
+
+function loadRealtimeSnapshot() {
+  try {
+    if (!fs.existsSync(SNAPSHOT_PATH)) return;
+    const raw = JSON.parse(fs.readFileSync(SNAPSHOT_PATH, "utf8"));
+    const ageMs = Date.now() - new Date(raw.savedAt).getTime();
+    if (ageMs > 10 * 60 * 1000) return; // 10분 넘게 지난 스냅샷은 의미 없어서 버림 (장 상황이 바뀌었을 것)
+    if (raw.index) Object.assign(realtimeCache.index, raw.index);
+    if (raw.stock) Object.assign(realtimeCache.stock, raw.stock);
+    console.log(`실시간가 스냅샷 복구: 종목 ${Object.keys(raw.stock || {}).length}개 (${Math.round(ageMs / 1000)}초 전 값)`);
+  } catch (e) {
+    console.log("스냅샷 복구 실패: " + e.message);
+  }
+}
+
+loadRealtimeSnapshot();
+setInterval(saveRealtimeSnapshot, SNAPSHOT_INTERVAL_MS);
 
 // 현재 구독 중인 종목코드 목록. Worker가 /realtime/subscribe 로 갱신하면 웹소켓에 재등록함.
 // 키움 제한: 한 연결에서 등록 가능한 실시간 종목이 총 200개(실측 확인 - 그룹 합산 기준).
@@ -173,6 +211,108 @@ function issueTokenCached() {
     return t;
   });
 }
+
+// ---------- 등락률 상위 종목 수집 (ka10027) - Worker collectAndStore 이전 ----------
+// 원래 Worker의 2분 cron이 CPU시간 안에서 KOSPI/KOSDAQ 순차조회(1.1초 대기 포함)를 했는데,
+// relay는 상시구동이라 이 대기가 부담 없음. relay가 수집+파싱까지 끝내고 결과 배열만
+// Worker(/api/ingest/snapshots)로 POST -> Worker는 D1 insert만 수행(가벼움).
+function kiwoomRankingUp(mrktTp, token) {
+  const body = {
+    mrkt_tp: mrktTp,
+    sort_tp: "1",
+    trde_qty_cnd: "0000",
+    updown_incls: "1",
+    stk_cnd: "0",
+    crd_cnd: "0",
+    pric_cnd: "0",
+    trde_prica_cnd: "0",
+    flu_cnd: "1",
+    stex_tp: "3",
+  };
+  return kiwoomRest("/api/dostk/rkinfo", "ka10027", body, token).then((data) => {
+    if (data.return_code !== 0) throw new Error(`ka10027 실패(mrkt_tp=${mrktTp}): ${JSON.stringify(data).slice(0, 200)}`);
+    return data;
+  });
+}
+
+function parseKiwoomRankingRows(json) {
+  let rows = [];
+  for (const key of Object.keys(json)) {
+    if (Array.isArray(json[key])) {
+      rows = json[key];
+      break;
+    }
+  }
+  return rows
+    .map((row) => {
+      const code = (row.stk_cd || row.stk_no || "").split("_")[0];
+      const name = row.stk_nm || row.stk_name || "";
+      const price = Math.abs(parseInt(String(row.cur_prc ?? "0").replace(/[^\d-]/g, ""), 10)) || 0;
+      const rate = parseFloat(row.flu_rt ?? row.updn_rt ?? "0") || 0;
+      const volume = Math.abs(parseInt(String(row.now_trde_qty ?? row.trde_qty ?? "0").replace(/[^\d-]/g, ""), 10)) || 0;
+      const cntrStr = parseFloat(row.cntr_str ?? "0") || 0;
+      const buyReq = Math.abs(parseInt(String(row.buy_req ?? "0").replace(/[^\d-]/g, ""), 10)) || 0;
+      const selReq = Math.abs(parseInt(String(row.sel_req ?? "0").replace(/[^\d-]/g, ""), 10)) || 0;
+      return { code, name, price, rate, volume, cntrStr, buyReq, selReq };
+    })
+    .filter((r) => r.code);
+}
+
+const MIN_RATE = 5;
+const MAX_RATE = 15;
+// Worker의 isRegularStock/NON_STOCK_KEYWORD/ETF_BRAND_PREFIX와 완전히 동일한 기준으로 유지해야
+// 두 경로(구버전 Worker 직접수집 vs relay 이전수집) 사이에 필터링 결과가 어긋나지 않음.
+const NON_STOCK_KEYWORD = /(ETN|ETF|인버스|레버리지|선물|커버드콜|합성|파생결합|TDF|액티브|스팩|리츠|맥쿼리인프라)/i;
+const ETF_BRAND_PREFIX =
+  /^(KODEX|TIGER|KBSTAR|KIWOOM|ACE|SOL|RISE|PLUS|HANARO|KOSEF|KINDEX|TIMEFOLIO|마이다스|파워|WOORI|히어로즈|신한|대신|KTOP|FOCUS|네비게이터|파빌리온|우리|코세프|VITA|1Q|삼성|미래에셋|한투|마이티|WON|IBK|메리츠)\s?[0-9A-Za-z가-힣]*(200|100|150|300|배당|채권|국고채|MSCI|합성)/i;
+function isRegularStockName(name) {
+  if (!name) return false;
+  if (NON_STOCK_KEYWORD.test(name)) return false;
+  if (ETF_BRAND_PREFIX.test(name)) return false;
+  return true;
+}
+
+async function fetchRiseListForMarket(mrktTp, market, token) {
+  const json = await kiwoomRankingUp(mrktTp, token);
+  const rows = parseKiwoomRankingRows(json);
+  return rows
+    .filter((r) => r.rate >= MIN_RATE && r.rate <= MAX_RATE && isRegularStockName(r.name))
+    .map((r) => ({ ...r, market }));
+}
+
+// 데이터 수집용 장시간 판단 - 매매중지(isTradingActiveKST, 15:50컷)와는 별개.
+// Worker의 isMarketHoursKST(09:01~15:46)와 동일 기준으로 맞춰야 수집 공백/시간대 불일치가 안 생김.
+function isMarketHoursKST() {
+  const kst = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Seoul" }));
+  const day = kst.getDay();
+  if (day === 0 || day === 6) return false;
+  const minutes = kst.getHours() * 60 + kst.getMinutes();
+  return minutes >= 9 * 60 + 1 && minutes <= 15 * 60 + 46;
+}
+
+async function collectAndForwardSnapshots() {
+  if (!ADMIN_KEY) return; // 인증 없으면 Worker가 받아주지 않으므로 스킵
+  if (!isMarketHoursKST()) return;
+  try {
+    const token = await issueTokenCached();
+    const kospi = await fetchRiseListForMarket("001", "KOSPI", token);
+    await new Promise((r) => setTimeout(r, 1100)); // ka10027 초당 1건 제한
+    const kosdaq = await fetchRiseListForMarket("101", "KOSDAQ", token);
+    const all = [...kospi, ...kosdaq];
+    if (!all.length) return;
+    const result = await workerRequest("/api/ingest/snapshots", "POST", { items: all, capturedAt: new Date().toISOString() });
+    if (result.ok) {
+      console.log(`스냅샷 전송 완료: ${result.saved}건 (${result.capturedAt})`);
+    } else {
+      console.log("스냅샷 전송 실패: " + (result.error || "unknown"));
+    }
+  } catch (e) {
+    console.log("스냅샷 수집 실패: " + e.message);
+  }
+}
+// Worker cron의 collectAndStore를 완전히 대체 - 2분 주기로 relay가 직접 수집.
+setInterval(collectAndForwardSnapshots, 120000);
+setTimeout(collectAndForwardSnapshots, 5000); // 재시작 직후 2분 공백 방지용 1회 즉시 실행(5초 뒤, 토큰발급 여유)
 
 function handleRealtimeMessage(msg) {
   if (!Array.isArray(msg.data)) return;
@@ -494,13 +634,27 @@ function workerRequest(path, method, body) {
   });
 }
 
+// entries(코드+진입가) 자체는 자주 안 바뀌므로 5초 TTL로 캐싱 -> 2초 틱마다 Worker를
+// 두드리지 않고, 실시간가 비교(로컬 연산)만 매 틱 수행. 관심종목 추가/삭제는 몇 초 지연되어
+// 반영되지만 손익 판단 정확도에는 영향 없음(가격은 항상 최신 realtimeCache 사용).
+let entriesCache = { items: [], fetchedAt: 0 };
+const ENTRIES_TTL_MS = 5000;
+async function getWatchlistEntriesCached() {
+  if (Date.now() - entriesCache.fetchedAt < ENTRIES_TTL_MS) return entriesCache.items;
+  const entries = await workerRequest("/api/watchlist-entries", "GET");
+  if (entries.ok) {
+    entriesCache = { items: entries.items, fetchedAt: Date.now() };
+  }
+  return entriesCache.items;
+}
+
 async function checkWatchlistStopLoss() {
   if (!ADMIN_KEY) return; // 키 미설정이면 조용히 스킵 (fail closed)
   if (!isTradingActiveKST()) return; // 15:50 이후 자동매매 중지
   try {
-    const entries = await workerRequest("/api/watchlist-entries", "GET");
-    if (!entries.ok || !entries.items.length) return;
-    for (const item of entries.items) {
+    const items = await getWatchlistEntriesCached();
+    if (!items.length) return;
+    for (const item of items) {
       const q = realtimeCache.stock[item.code];
       if (!q || !q.price) continue; // 아직 실시간가 미수신 - 다음 틱에 재시도
       const pnlPct = ((q.price - item.entry_price) / item.entry_price) * 100;
@@ -508,6 +662,7 @@ async function checkWatchlistStopLoss() {
         const reason = pnlPct >= AUTO_TAKE_PROFIT_PNL_PCT ? "익절" : "손절";
         try {
           await workerRequest("/api/watchlist/auto-remove", "POST", { code: item.code, pnlPct, name: stockNameCache[item.code] });
+          entriesCache.items = entriesCache.items.filter((x) => x.code !== item.code); // 즉시 캐시에서도 제거(중복삭제 요청 방지)
           console.log(`${reason} 자동삭제: ${item.code} (${pnlPct.toFixed(2)}%)`);
         } catch (e) {
           console.log(`${reason} 자동삭제 요청 실패: ${item.code} - ${e.message}`);
@@ -518,7 +673,7 @@ async function checkWatchlistStopLoss() {
     console.log("관심종목 손절체크 실패: " + e.message);
   }
 }
-setInterval(checkWatchlistStopLoss, 10000);
+setInterval(checkWatchlistStopLoss, 2000);
 
 // ---------- HTTP 서버 (기존 REST 중계 + 신규 실시간 캐시 조회) ----------
 // 조건검색 편입 이력에 이름/현재가를 붙여서 반환 - /realtime/all과 /realtime/condition 둘 다에서 씀
