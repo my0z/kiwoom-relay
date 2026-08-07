@@ -164,13 +164,13 @@ function runNameFetch() {
     .catch(() => {})
     .finally(() => {
       nameFetchRunning = false;
-      // 키움 TR 초당1건 제한 준수
-      setTimeout(runNameFetch, 1100);
+      // 실제 API 간격은 kiwoomRest 내부 전역 큐가 보장하므로 여기선 바로 다음 항목을 큐에 밀어넣기만 함
+      runNameFetch();
     });
 }
 
 // relay 내부에서 키움 REST를 직접 호출할 때 쓰는 헬퍼 (종목명 조회용)
-function kiwoomRest(path, apiId, body, token) {
+function kiwoomRestRaw(path, apiId, body, token) {
   return new Promise((resolve, reject) => {
     const payload = JSON.stringify(body);
     const req = https.request(
@@ -202,6 +202,25 @@ function kiwoomRest(path, apiId, body, token) {
     req.on("error", reject);
     req.end(payload);
   });
+}
+
+// ---------- 전역 키움 REST 요청 큐 (초당1건 제한을 실제로 보장) ----------
+// collectAndForwardSnapshots(2분), refreshMiniCandlesForWatchlist(1분), processNewCodeFetchQueue(즉시),
+// runFinalQuoteReconcile(15:36) 등 서로 독립적인 setInterval/setTimeout이 각자 내부에서만
+// "await sleep(1100)"으로 순차 대기했었음 - 이 함수들이 우연히 겹쳐서 동시에 트리거되면
+// 실제로는 같은 순간에 여러 키움 TR 요청이 나가서 초당1건 제한을 어길 수 있었음(개별 함수 관점에선
+// 각자 지키고 있다고 착각하기 쉬운 함정). 이제 모든 kiwoomRest 호출이 이 큐 하나를 거치게 해서,
+// 호출 주체가 몇 개든 실제 키움 서버로 나가는 요청은 항상 최소 1.1초 간격으로 직렬화되게 만듦.
+let kiwoomQueueTail = Promise.resolve();
+function kiwoomRest(path, apiId, body, token) {
+  const run = () => kiwoomRestRaw(path, apiId, body, token);
+  const scheduled = kiwoomQueueTail.then(
+    () => run().finally(() => new Promise((r) => setTimeout(r, 1100))),
+    () => run().finally(() => new Promise((r) => setTimeout(r, 1100))) // 이전 요청이 실패했어도 큐는 계속 진행
+  );
+  // 큐의 다음 항목이 기다릴 대상은 "이번 요청+대기"가 끝나는 시점 - 결과(resolve/reject)와는 별개로 체이닝만 이어감
+  kiwoomQueueTail = scheduled.then(() => {}, () => {});
+  return scheduled;
 }
 
 // 토큰 캐시 (종목명 조회에 재사용 - 매번 발급하면 낭비)
@@ -300,7 +319,7 @@ async function collectAndForwardSnapshots() {
   try {
     const token = await issueTokenCached();
     const kospi = await fetchRiseListForMarket("001", "KOSPI", token);
-    await new Promise((r) => setTimeout(r, 1100)); // ka10027 초당 1건 제한
+    // ka10027 초당1건 제한은 이제 kiwoomRest 내부 전역 큐가 보장하므로 여기서 별도 대기 불필요
     const kosdaq = await fetchRiseListForMarket("101", "KOSDAQ", token);
     const all = [...kospi, ...kosdaq];
     if (!all.length) return;
@@ -403,7 +422,25 @@ function parseKiwoomQuoteRelay(json) {
   };
 }
 
-let finalQuoteDoneToday = null; // "YYYY-MM-DD" - 하루 한 번만 실행되게 (같은 날 재시작돼도 중복 방지)
+// 파일로 영속화 - relay가 15:36~40 사이에 재시작되면 메모리 변수만으론 "오늘 이미 했음"을
+// 잊어버려서 D1에 같은 captured_at으로 중복 insert될 위험이 있었음(발견 즉시 수정).
+const FINAL_QUOTE_STATE_PATH = path.join(__dirname, "final-quote-done.json");
+let finalQuoteDoneToday = null; // "YYYY-MM-DD" - 하루 한 번만 실행되게
+try {
+  if (fs.existsSync(FINAL_QUOTE_STATE_PATH)) {
+    finalQuoteDoneToday = JSON.parse(fs.readFileSync(FINAL_QUOTE_STATE_PATH, "utf8")).dateKey || null;
+  }
+} catch (e) {
+  // 읽기 실패해도 null로 시작 - 최악의 경우 하루 1번 중복 실행되는 정도라 서비스에 치명적이지 않음
+}
+function markFinalQuoteDone(dateKey) {
+  finalQuoteDoneToday = dateKey;
+  try {
+    fs.writeFileSync(FINAL_QUOTE_STATE_PATH, JSON.stringify({ dateKey }));
+  } catch (e) {
+    console.log("종가재조회 완료상태 저장 실패: " + e.message);
+  }
+}
 async function runFinalQuoteReconcile() {
   const kst = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Seoul" }));
   const dateKey = `${kst.getFullYear()}-${String(kst.getMonth() + 1).padStart(2, "0")}-${String(kst.getDate()).padStart(2, "0")}`;
@@ -424,7 +461,7 @@ async function runFinalQuoteReconcile() {
       } catch (e) {
         failedCodes.push(t.code);
       }
-      await new Promise((r) => setTimeout(r, 1100)); // 키움 TR 초당1건 제한
+      // 키움 TR 초당1건 제한은 kiwoomRest 내부 전역 큐가 보장 - 별도 대기 불필요
     }
     if (rows.length) {
       const result = await workerRequest("/api/ingest/final-quotes", "POST", {
@@ -432,7 +469,7 @@ async function runFinalQuoteReconcile() {
       });
       if (result.ok) {
         console.log(`최종 종가 재조회 완료: ${result.saved}/${targets.length}종목 (실패 ${failedCodes.length}종목)`);
-        finalQuoteDoneToday = dateKey;
+        markFinalQuoteDone(dateKey);
       } else {
         console.log("최종 종가 재조회 전송 실패: " + (result.error || "unknown"));
       }
@@ -909,7 +946,7 @@ async function refreshMiniCandlesForWatchlist() {
       } catch (e) {
         // 개별 종목 실패는 건너뜀 - 다음 갱신 주기에 재시도
       }
-      await new Promise((r) => setTimeout(r, 1100)); // 키움 TR 초당1건 제한
+      // 키움 TR 초당1건 제한은 kiwoomRest 내부 전역 큐가 보장 - 별도 대기 불필요
     }
   } catch (e) {
     console.log("미니차트 캐시 갱신 실패: " + e.message);
@@ -941,7 +978,7 @@ async function processNewCodeFetchQueue() {
     } catch (e) {
       console.log(`신규 관심종목 차트 즉시조회 실패: ${code} - ${e.message}`);
     }
-    await new Promise((r) => setTimeout(r, 1100)); // 키움 TR 초당1건 제한
+    // 키움 TR 초당1건 제한은 kiwoomRest 내부 전역 큐가 보장 - 별도 대기 불필요
   }
   newCodeFetchRunning = false;
 }
