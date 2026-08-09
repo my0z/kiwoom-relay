@@ -485,6 +485,12 @@ function scheduleSseBroadcast() {
   }, 200);
 }
 
+// 당일 최고 등락률(0B 체결 틱마다 갱신) / 직전 호가잔량(0D 틱마다 갱신) - 배치(2분 cron)로만
+// 계산하던 isTodayHigh/bidTurnedPositive/buyReqSpike/sellReqThinning을 relay가 실시간으로
+// 직접 계산하기 위한 캐시. 장 시작 시 리셋은 아래 miniCandleCacheClearedDate 옆 setInterval에서 같이 처리.
+const todayMaxRateCache = {}; // { code: 오늘 최고 등락률 }
+const prevOrderFlowCache = {}; // { code: { buyReq, selReq } } - 직전 호가 틱 값
+
 function handleRealtimeMessage(msg) {
   if (!Array.isArray(msg.data)) return;
   for (const entry of msg.data) {
@@ -502,12 +508,44 @@ function handleRealtimeMessage(msg) {
     } else if (entry.type === "0B" && entry.values) {
       // 주식체결: 10=현재가, 12=등락률, 13=누적거래량, 228=체결강도, 20=체결시각
       // 현재가는 위와 동일한 이유로 절댓값 처리
+      const rate = parseSignedNumber(entry.values["12"]);
+      // 당일 최고 등락률을 실시간으로 계속 갱신 - 배치(2분 cron)로만 계산하던 isTodayHigh를
+      // relay가 체결 틱마다 즉시 갱신할 수 있게 됨(장 시작 시 리셋은 아래 setInterval 참고)
+      const prevMax = todayMaxRateCache[entry.item];
+      if (prevMax === undefined || rate > prevMax) todayMaxRateCache[entry.item] = rate;
+      const isTodayHigh = rate >= (todayMaxRateCache[entry.item] ?? rate) - 0.001;
+      const existing = realtimeCache.stock[entry.item] || {};
       realtimeCache.stock[entry.item] = {
+        ...existing,
         price: Math.abs(parseSignedNumber(entry.values["10"])),
-        rate: parseSignedNumber(entry.values["12"]),
+        rate,
         volume: parseSignedNumber(entry.values["13"]),
         cntrStr: parseSignedNumber(entry.values["228"]),
         time: entry.values["20"] || "",
+        isTodayHigh,
+        updatedAt: new Date().toISOString(),
+      };
+    } else if (entry.type === "0D" && entry.values) {
+      // 주식호가잔량: 121=매도호가총잔량, 125=매수호가총잔량 - 배치(2분 cron)로만 비교하던
+      // 매수전환/매수잔량급증/매도잔량급감을 relay가 호가 변동 틱마다 즉시 계산할 수 있게 됨.
+      const code = entry.item;
+      const buyReq = Math.abs(parseSignedNumber(entry.values["125"]));
+      const selReq = Math.abs(parseSignedNumber(entry.values["121"]));
+      const prev = prevOrderFlowCache[code];
+      let bidTurnedPositive = false, buyReqSpike = false, sellReqThinning = false;
+      if (prev) {
+        // 매수전환: 직전엔 매도잔량이 더 많았는데 지금 막 매수잔량 우위로 뒤집힘
+        bidTurnedPositive = buyReq > selReq && prev.buyReq <= prev.selReq;
+        // 매수잔량급증: 직전 대비 매수잔량이 1.5배 이상
+        buyReqSpike = prev.buyReq > 0 && buyReq / prev.buyReq >= 1.5;
+        // 매도잔량급감: 직전 대비 매도잔량이 절반 이하로 줄어듦
+        sellReqThinning = prev.selReq > 0 && selReq / prev.selReq <= 0.5;
+      }
+      prevOrderFlowCache[code] = { buyReq, selReq };
+      const existing2 = realtimeCache.stock[code] || {};
+      realtimeCache.stock[code] = {
+        ...existing2,
+        buyReq, selReq, bidTurnedPositive, buyReqSpike, sellReqThinning,
         updatedAt: new Date().toISOString(),
       };
     } else if (entry.type === "02" && entry.values) {
@@ -590,7 +628,7 @@ function registerSubscriptions() {
   if (subscribedStocks.length) {
     later(() =>
       send(
-        { trnm: "REG", grp_no: "2", refresh: "1", data: [{ item: subscribedStocks, type: ["0B"] }] },
+        { trnm: "REG", grp_no: "2", refresh: "1", data: [{ item: subscribedStocks, type: ["0B", "0D"] }] },
         "실시간 관심종목 구독 등록 요청: " + subscribedStocks.length + "종목"
       )
     );
@@ -600,7 +638,7 @@ function registerSubscriptions() {
   if (subscribedListStocks.length) {
     later(() =>
       send(
-        { trnm: "REG", grp_no: "3", refresh: "1", data: [{ item: subscribedListStocks, type: ["0B"] }] },
+        { trnm: "REG", grp_no: "3", refresh: "1", data: [{ item: subscribedListStocks, type: ["0B", "0D"] }] },
         "실시간 리스트종목 구독 등록 요청: " + subscribedListStocks.length + "종목"
       )
     );
@@ -976,7 +1014,7 @@ async function checkWatchlistMembershipChanges() {
     const changed = codesArr.length !== subscribedStocks.length || codesArr.some((c) => !subscribedStocks.includes(c));
     if (changed && ws && ws.readyState === WebSocket.OPEN && wsLoggedIn) {
       subscribedStocks = codesArr;
-      ws.send(JSON.stringify({ trnm: "REG", grp_no: "2", refresh: "1", data: [{ item: subscribedStocks, type: ["0B"] }] }));
+      ws.send(JSON.stringify({ trnm: "REG", grp_no: "2", refresh: "1", data: [{ item: subscribedStocks, type: ["0B", "0D"] }] }));
       console.log("관심종목 변경 감지 - 웹소켓 구독 자체 갱신: " + subscribedStocks.length + "종목");
     }
 
@@ -1001,6 +1039,8 @@ setInterval(() => {
   if (minutes >= 9 * 60 && minutes < 9 * 60 + 1 && miniCandleCacheClearedDate !== dateKey) {
     Object.keys(miniCandleCache).forEach((k) => delete miniCandleCache[k]);
     saveMiniCandleCache();
+    Object.keys(todayMaxRateCache).forEach((k) => delete todayMaxRateCache[k]);
+    Object.keys(prevOrderFlowCache).forEach((k) => delete prevOrderFlowCache[k]);
     miniCandleCacheClearedDate = dateKey;
     console.log("미니차트 캐시 초기화 (새 거래일 시작)");
   }
@@ -1210,7 +1250,7 @@ const server = http.createServer((req, res) => {
         ws.send(JSON.stringify({ trnm: "REMOVE", grp_no: "2" }));
         ws.send(JSON.stringify({
           trnm: "REG", grp_no: "2", refresh: "1",
-          data: [{ item: codes, type: ["0B"] }],
+          data: [{ item: codes, type: ["0B", "0D"] }],
         }));
         console.log("관심종목 구독 갱신:", codes.length + "종목");
       }
@@ -1218,7 +1258,7 @@ const server = http.createServer((req, res) => {
         ws.send(JSON.stringify({ trnm: "REMOVE", grp_no: "3" }));
         ws.send(JSON.stringify({
           trnm: "REG", grp_no: "3", refresh: "1",
-          data: [{ item: listCodes, type: ["0B"] }],
+          data: [{ item: listCodes, type: ["0B", "0D"] }],
         }));
         console.log("리스트종목 구독 갱신:", listCodes.length + "종목");
       }
@@ -1238,13 +1278,13 @@ const server = http.createServer((req, res) => {
           if (subscribedStocks.length) {
             ws.send(JSON.stringify({
               trnm: "REG", grp_no: "2", refresh: "1",
-              data: [{ item: subscribedStocks, type: ["0B"] }],
+              data: [{ item: subscribedStocks, type: ["0B", "0D"] }],
             }));
           }
           if (subscribedListStocks.length) {
             ws.send(JSON.stringify({
               trnm: "REG", grp_no: "3", refresh: "1",
-              data: [{ item: subscribedListStocks, type: ["0B"] }],
+              data: [{ item: subscribedListStocks, type: ["0B", "0D"] }],
             }));
           }
           console.log("지연 구독 등록 완료 (관심 " + subscribedStocks.length + " / 리스트 " + subscribedListStocks.length + ")");
@@ -1337,17 +1377,6 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // 관심종목 미니차트 전체 일괄조회 - Worker의 /api/latest가 페이지 로드 시 이걸 한 번에 받아가서
-  // 응답에 포함시킴. 종목별로 /api/mini-candles를 따로따로 부르던 왕복(브라우저<->Worker<->relay)을
-  // 아예 없애서 첫 로드 시 차트가 별도 요청 없이 즉시 뜨게 함(가장 빠른 경로).
-  // 주의: 아래 "/realtime/mini-candles" startsWith 체크보다 반드시 먼저 와야 함 - 안 그러면
-  // "-all"이 붙은 이 경로가 그 개별조회 라우트에 먼저 가로채여서 code 파라미터 없다고 항상 실패함.
-  if (req.url === "/realtime/mini-candles-all") {
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ ok: true, cache: miniCandleCache }));
-    return;
-  }
-
   // 관심종목 미니차트(1분봉) 캐시 조회 - Worker의 /api/mini-candles가 이걸 우선 사용해서
   // 매번 종목당 1.1초 순차조회하던 걸 즉시 응답으로 바꿈 (relay가 백그라운드로 미리 갱신해둠).
   if (req.url.startsWith("/realtime/mini-candles")) {
@@ -1360,6 +1389,15 @@ const server = http.createServer((req, res) => {
     } else {
       res.end(JSON.stringify({ ok: false, error: "캐시 없음(관심종목이 아니거나 아직 미갱신)" }));
     }
+    return;
+  }
+
+  // 관심종목 미니차트 전체 일괄조회 - Worker의 /api/latest가 페이지 로드 시 이걸 한 번에 받아가서
+  // 응답에 포함시킴. 종목별로 /api/mini-candles를 따로따로 부르던 왕복(브라우저<->Worker<->relay)을
+  // 아예 없애서 첫 로드 시 차트가 별도 요청 없이 즉시 뜨게 함(가장 빠른 경로).
+  if (req.url === "/realtime/mini-candles-all") {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true, cache: miniCandleCache }));
     return;
   }
 
