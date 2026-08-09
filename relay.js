@@ -164,13 +164,13 @@ function runNameFetch() {
     .catch(() => {})
     .finally(() => {
       nameFetchRunning = false;
-      // 실제 API 간격은 kiwoomRest 내부 전역 큐가 보장하므로 여기선 바로 다음 항목을 큐에 밀어넣기만 함
-      runNameFetch();
+      // 키움 TR 초당1건 제한 준수
+      setTimeout(runNameFetch, 1100);
     });
 }
 
 // relay 내부에서 키움 REST를 직접 호출할 때 쓰는 헬퍼 (종목명 조회용)
-function kiwoomRestRaw(path, apiId, body, token) {
+function kiwoomRest(path, apiId, body, token) {
   return new Promise((resolve, reject) => {
     const payload = JSON.stringify(body);
     const req = https.request(
@@ -202,25 +202,6 @@ function kiwoomRestRaw(path, apiId, body, token) {
     req.on("error", reject);
     req.end(payload);
   });
-}
-
-// ---------- 전역 키움 REST 요청 큐 (초당1건 제한을 실제로 보장) ----------
-// collectAndForwardSnapshots(2분), refreshMiniCandlesForWatchlist(1분), processNewCodeFetchQueue(즉시),
-// runFinalQuoteReconcile(15:36) 등 서로 독립적인 setInterval/setTimeout이 각자 내부에서만
-// "await sleep(1100)"으로 순차 대기했었음 - 이 함수들이 우연히 겹쳐서 동시에 트리거되면
-// 실제로는 같은 순간에 여러 키움 TR 요청이 나가서 초당1건 제한을 어길 수 있었음(개별 함수 관점에선
-// 각자 지키고 있다고 착각하기 쉬운 함정). 이제 모든 kiwoomRest 호출이 이 큐 하나를 거치게 해서,
-// 호출 주체가 몇 개든 실제 키움 서버로 나가는 요청은 항상 최소 1.1초 간격으로 직렬화되게 만듦.
-let kiwoomQueueTail = Promise.resolve();
-function kiwoomRest(path, apiId, body, token) {
-  const run = () => kiwoomRestRaw(path, apiId, body, token);
-  const scheduled = kiwoomQueueTail.then(
-    () => run().finally(() => new Promise((r) => setTimeout(r, 1100))),
-    () => run().finally(() => new Promise((r) => setTimeout(r, 1100))) // 이전 요청이 실패했어도 큐는 계속 진행
-  );
-  // 큐의 다음 항목이 기다릴 대상은 "이번 요청+대기"가 끝나는 시점 - 결과(resolve/reject)와는 별개로 체이닝만 이어감
-  kiwoomQueueTail = scheduled.then(() => {}, () => {});
-  return scheduled;
 }
 
 // 토큰 캐시 (종목명 조회에 재사용 - 매번 발급하면 낭비)
@@ -319,7 +300,7 @@ async function collectAndForwardSnapshots() {
   try {
     const token = await issueTokenCached();
     const kospi = await fetchRiseListForMarket("001", "KOSPI", token);
-    // ka10027 초당1건 제한은 이제 kiwoomRest 내부 전역 큐가 보장하므로 여기서 별도 대기 불필요
+    await new Promise((r) => setTimeout(r, 1100)); // ka10027 초당 1건 제한
     const kosdaq = await fetchRiseListForMarket("101", "KOSDAQ", token);
     const all = [...kospi, ...kosdaq];
     if (!all.length) return;
@@ -337,11 +318,73 @@ async function collectAndForwardSnapshots() {
 setInterval(collectAndForwardSnapshots, 120000);
 setTimeout(collectAndForwardSnapshots, 5000); // 재시작 직후 2분 공백 방지용 1회 즉시 실행(5초 뒤, 토큰발급 여유)
 
-// 국내(웹소켓 실시간) 지수 - SSE/realtime-all 등 여러 응답 지점에서 공통으로 재사용.
+// ---------- 해외지수(다우/나스닥/S&P500) + 원달러 환율 ----------
+// 키움 국내주식 API 권한으로는 해외지수/환율을 못 받아옴(별도 해외파생 API 권한 필요) - 대신
+// 네이버 모바일증권의 공개 JSON API(인증 불필요, 비공식이지만 안정적으로 널리 쓰임)를 사용.
+// 국내 장 시간과 무관하게(미국 장은 밤에 열림) 24시간 갱신 - 장중 게이트 없음.
+function fetchNaverIndex(code) {
+  return new Promise((resolve, reject) => {
+    https
+      .get(
+        `https://m.stock.naver.com/api/index/${encodeURIComponent(code)}/basic`,
+        { headers: { "User-Agent": "Mozilla/5.0" }, timeout: 8000 },
+        (res) => {
+          let body = "";
+          res.on("data", (c) => (body += c));
+          res.on("end", () => {
+            try {
+              resolve(JSON.parse(body));
+            } catch (e) {
+              reject(new Error("파싱 실패: " + body.slice(0, 200)));
+            }
+          });
+        }
+      )
+      .on("error", reject)
+      .on("timeout", function () {
+        this.destroy(new Error("타임아웃"));
+      });
+  });
+}
+
+const globalIndexCache = { dji: null, ixic: null, spx: null, usdkrw: null, updatedAt: null };
+async function refreshGlobalIndices() {
+  const targets = [
+    ["dji", ".DJI"], // 다우존스
+    ["ixic", ".IXIC"], // 나스닥종합
+    ["spx", ".SPX"], // S&P500
+    ["usdkrw", "FX_USDKRW"], // 원달러 환율
+  ];
+  for (const [key, code] of targets) {
+    try {
+      const json = await fetchNaverIndex(code);
+      // 네이버 응답 필드명은 지수/환율 종류에 따라 조금씩 다를 수 있어 여러 후보를 순서대로 확인
+      const price = parseFloat(json.closePrice ?? json.now ?? json.tradePrice ?? json.closePriceStr ?? "0");
+      const rate = parseFloat(
+        String(json.fluctuationsRatio ?? json.changeRate ?? json.fluctuationsRatioStr ?? "0").replace(/[^0-9.-]/g, "")
+      );
+      if (price > 0) {
+        globalIndexCache[key] = { price, rate };
+      }
+    } catch (e) {
+      console.log(`해외지수(${code}) 조회 실패: ${e.message}`);
+    }
+  }
+  globalIndexCache.updatedAt = new Date().toISOString();
+}
+setInterval(refreshGlobalIndices, 5000); // 5초마다 - 너무 짧으면(3초 이하) 네이버 차단 위험, 5초가 안전권에서 최대한 당긴 값
+setTimeout(refreshGlobalIndices, 3000);
+
+// 국내(웹소켓 실시간)+해외(네이버 폴링) 지수를 한 번에 묶어서 반환 - SSE/realtime-all 등 여러
+// 응답 지점에서 공통으로 재사용.
 function buildIndexPayload() {
   return {
     kospi: realtimeCache.index["001"] || null,
     kosdaq: realtimeCache.index["101"] || null,
+    dji: globalIndexCache.dji,
+    ixic: globalIndexCache.ixic,
+    spx: globalIndexCache.spx,
+    usdkrw: globalIndexCache.usdkrw,
   };
 }
 
@@ -360,25 +403,7 @@ function parseKiwoomQuoteRelay(json) {
   };
 }
 
-// 파일로 영속화 - relay가 15:36~40 사이에 재시작되면 메모리 변수만으론 "오늘 이미 했음"을
-// 잊어버려서 D1에 같은 captured_at으로 중복 insert될 위험이 있었음(발견 즉시 수정).
-const FINAL_QUOTE_STATE_PATH = path.join(__dirname, "final-quote-done.json");
-let finalQuoteDoneToday = null; // "YYYY-MM-DD" - 하루 한 번만 실행되게
-try {
-  if (fs.existsSync(FINAL_QUOTE_STATE_PATH)) {
-    finalQuoteDoneToday = JSON.parse(fs.readFileSync(FINAL_QUOTE_STATE_PATH, "utf8")).dateKey || null;
-  }
-} catch (e) {
-  // 읽기 실패해도 null로 시작 - 최악의 경우 하루 1번 중복 실행되는 정도라 서비스에 치명적이지 않음
-}
-function markFinalQuoteDone(dateKey) {
-  finalQuoteDoneToday = dateKey;
-  try {
-    fs.writeFileSync(FINAL_QUOTE_STATE_PATH, JSON.stringify({ dateKey }));
-  } catch (e) {
-    console.log("종가재조회 완료상태 저장 실패: " + e.message);
-  }
-}
+let finalQuoteDoneToday = null; // "YYYY-MM-DD" - 하루 한 번만 실행되게 (같은 날 재시작돼도 중복 방지)
 async function runFinalQuoteReconcile() {
   const kst = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Seoul" }));
   const dateKey = `${kst.getFullYear()}-${String(kst.getMonth() + 1).padStart(2, "0")}-${String(kst.getDate()).padStart(2, "0")}`;
@@ -399,7 +424,7 @@ async function runFinalQuoteReconcile() {
       } catch (e) {
         failedCodes.push(t.code);
       }
-      // 키움 TR 초당1건 제한은 kiwoomRest 내부 전역 큐가 보장 - 별도 대기 불필요
+      await new Promise((r) => setTimeout(r, 1100)); // 키움 TR 초당1건 제한
     }
     if (rows.length) {
       const result = await workerRequest("/api/ingest/final-quotes", "POST", {
@@ -407,7 +432,7 @@ async function runFinalQuoteReconcile() {
       });
       if (result.ok) {
         console.log(`최종 종가 재조회 완료: ${result.saved}/${targets.length}종목 (실패 ${failedCodes.length}종목)`);
-        markFinalQuoteDone(dateKey);
+        finalQuoteDoneToday = dateKey;
       } else {
         console.log("최종 종가 재조회 전송 실패: " + (result.error || "unknown"));
       }
@@ -835,20 +860,7 @@ function loadMiniCandleCache() {
   }
 }
 loadMiniCandleCache();
-setInterval(saveMiniCandleCache, 60000); // 안전망 - 아래 디바운스 저장이 놓쳐도 최대 1분 내 저장 보장
-
-// 캐시가 바뀔 때마다(종목 하나 채워질 때마다) 즉시 저장 트리거하되, 매번 동기 파일쓰기는 부담이니
-// 2초 안에 여러 번 바뀌면 묶어서 한 번만 씀. 예전엔 1분 고정주기로만 저장해서, relay가 그 사이에
-// 재시작되면(배포 등) 방금 채운 캐시가 파일에 반영되기도 전에 날아가는 문제가 있었음 - 이게 매번
-// "복구: 종목 0개"로 이어져서 재시작할 때마다 첫 로딩이 느려지던 근본 원인.
-let saveDebounceTimer = null;
-function scheduleSaveMiniCandleCache() {
-  if (saveDebounceTimer) return;
-  saveDebounceTimer = setTimeout(() => {
-    saveDebounceTimer = null;
-    saveMiniCandleCache();
-  }, 2000);
-}
+setInterval(saveMiniCandleCache, 60000); // 갱신 주기와 맞춰 1분마다 저장
 
 function todayYYYYMMDDRelay() {
   const kst = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Seoul" }));
@@ -894,11 +906,10 @@ async function refreshMiniCandlesForWatchlist() {
         const targetDate = hasToday ? todayStr : parsed.reduce((max, c) => (c.time.slice(0, 8) > max ? c.time.slice(0, 8) : max), "");
         const candles = parsed.filter((c) => c.time.slice(0, 8) === targetDate && c.time.slice(8, 12) >= "0900");
         miniCandleCache[item.code] = { candles, tradingDate: targetDate || null, updatedAt: Date.now() };
-        scheduleSaveMiniCandleCache();
       } catch (e) {
         // 개별 종목 실패는 건너뜀 - 다음 갱신 주기에 재시도
       }
-      // 키움 TR 초당1건 제한은 kiwoomRest 내부 전역 큐가 보장 - 별도 대기 불필요
+      await new Promise((r) => setTimeout(r, 1100)); // 키움 TR 초당1건 제한
     }
   } catch (e) {
     console.log("미니차트 캐시 갱신 실패: " + e.message);
@@ -926,12 +937,11 @@ async function processNewCodeFetchQueue() {
       const targetDate = hasToday ? todayStr : parsed.reduce((max, c) => (c.time.slice(0, 8) > max ? c.time.slice(0, 8) : max), "");
       const candles = parsed.filter((c) => c.time.slice(0, 8) === targetDate && c.time.slice(8, 12) >= "0900");
       miniCandleCache[code] = { candles, tradingDate: targetDate || null, updatedAt: Date.now() };
-      scheduleSaveMiniCandleCache();
       console.log(`신규 관심종목 차트 즉시조회 완료: ${code} (${candles.length}봉)`);
     } catch (e) {
       console.log(`신규 관심종목 차트 즉시조회 실패: ${code} - ${e.message}`);
     }
-    // 키움 TR 초당1건 제한은 kiwoomRest 내부 전역 큐가 보장 - 별도 대기 불필요
+    await new Promise((r) => setTimeout(r, 1100)); // 키움 TR 초당1건 제한
   }
   newCodeFetchRunning = false;
 }
@@ -949,16 +959,15 @@ async function checkWatchlistMembershipChanges() {
       }
     }
 
-    // 캐시가 없는 종목은 즉시조회 큐에 추가 - 신규 등록이든, relay 재시작으로 캐시가 날아갔든
-    // 상관없이 채움. 예전엔 장중일 때만 채웠는데, 그러면 relay가 장마감 후 재시작된 경우
-    // (배포 등) 캐시가 텅 빈 채로 다음 장 시작 전까지 계속 비어있어서 첫 로딩이 매번 느려지는
-    // 문제가 있었음 - 장마감 후엔 데이터가 안 바뀌니 한 번 채워두면 계속 유효함.
-    for (const code of currentCodes) {
-      if (!miniCandleCache[code] && !newCodeFetchQueue.includes(code)) {
-        newCodeFetchQueue.push(code);
+    // 신규 종목: 장중이면 즉시조회 큐에 추가(60초 정기갱신을 기다리지 않음)
+    if (isMarketHoursKST()) {
+      for (const code of currentCodes) {
+        if (!prevWatchlistCodes.has(code) && !miniCandleCache[code] && !newCodeFetchQueue.includes(code)) {
+          newCodeFetchQueue.push(code);
+        }
       }
+      if (newCodeFetchQueue.length) processNewCodeFetchQueue();
     }
-    if (newCodeFetchQueue.length) processNewCodeFetchQueue();
 
     // 웹소켓 실시간가 구독도 관심종목 변경에 맞춰 자체 갱신 - 브라우저가 페이지를 안 열어놔도
     // (아무도 /realtime/subscribe를 호출 안 해도) 관심종목은 항상 최신 상태로 구독 유지됨.
@@ -982,18 +991,18 @@ setInterval(checkWatchlistMembershipChanges, 3000); // entries 자체는 5초 �
 setInterval(refreshMiniCandlesForWatchlist, 60000);
 setTimeout(refreshMiniCandlesForWatchlist, 8000); // 재시작 직후 워밍업 (토큰발급/entries조회 여유)
 
-// 매일 장 시작(09:01 KST) 로그만 남김 - 캐시를 미리 비우지 않음. refreshMiniCandlesForWatchlist가
-// 09:01부터 각 종목을 오늘자 데이터로 하나씩 자연스럽게 덮어쓰므로, 굳이 먼저 비워서 공백을
-// 만들 필요가 없음(비우면 09:00~막 채워지기 전 사이에 접속한 사용자는 차트가 완전히 빔 -
-// 안 비우면 최소 어제 마지막 데이터라도 보이다가 몇 초~몇 분 내 오늘 데이터로 자동 교체됨).
+// 매일 장 시작 전(09:00 KST) 캐시 초기화 - 어제 데이터가 오늘 장중에도 잠깐 보이는 걸 방지.
+// 09:01부터 refreshMiniCandlesForWatchlist가 새 거래일 데이터로 다시 채움.
 let miniCandleCacheClearedDate = null;
 setInterval(() => {
   const kst = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Seoul" }));
   const dateKey = `${kst.getFullYear()}-${String(kst.getMonth() + 1).padStart(2, "0")}-${String(kst.getDate()).padStart(2, "0")}`;
   const minutes = kst.getHours() * 60 + kst.getMinutes();
-  if (minutes >= 9 * 60 + 1 && minutes < 9 * 60 + 2 && miniCandleCacheClearedDate !== dateKey) {
+  if (minutes >= 9 * 60 && minutes < 9 * 60 + 1 && miniCandleCacheClearedDate !== dateKey) {
+    Object.keys(miniCandleCache).forEach((k) => delete miniCandleCache[k]);
+    saveMiniCandleCache();
     miniCandleCacheClearedDate = dateKey;
-    console.log("새 거래일 시작 - 미니차트 캐시는 유지한 채 오늘자 데이터로 순차 교체 시작");
+    console.log("미니차트 캐시 초기화 (새 거래일 시작)");
   }
 }, 30000);
 
@@ -1328,6 +1337,17 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // 관심종목 미니차트 전체 일괄조회 - Worker의 /api/latest가 페이지 로드 시 이걸 한 번에 받아가서
+  // 응답에 포함시킴. 종목별로 /api/mini-candles를 따로따로 부르던 왕복(브라우저<->Worker<->relay)을
+  // 아예 없애서 첫 로드 시 차트가 별도 요청 없이 즉시 뜨게 함(가장 빠른 경로).
+  // 주의: 아래 "/realtime/mini-candles" startsWith 체크보다 반드시 먼저 와야 함 - 안 그러면
+  // "-all"이 붙은 이 경로가 그 개별조회 라우트에 먼저 가로채여서 code 파라미터 없다고 항상 실패함.
+  if (req.url === "/realtime/mini-candles-all") {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true, cache: miniCandleCache }));
+    return;
+  }
+
   // 관심종목 미니차트(1분봉) 캐시 조회 - Worker의 /api/mini-candles가 이걸 우선 사용해서
   // 매번 종목당 1.1초 순차조회하던 걸 즉시 응답으로 바꿈 (relay가 백그라운드로 미리 갱신해둠).
   if (req.url.startsWith("/realtime/mini-candles")) {
@@ -1340,15 +1360,6 @@ const server = http.createServer((req, res) => {
     } else {
       res.end(JSON.stringify({ ok: false, error: "캐시 없음(관심종목이 아니거나 아직 미갱신)" }));
     }
-    return;
-  }
-
-  // 관심종목 미니차트 전체 일괄조회 - Worker의 /api/latest가 페이지 로드 시 이걸 한 번에 받아가서
-  // 응답에 포함시킴. 종목별로 /api/mini-candles를 따로따로 부르던 왕복(브라우저<->Worker<->relay)을
-  // 아예 없애서 첫 로드 시 차트가 별도 요청 없이 즉시 뜨게 함(가장 빠른 경로).
-  if (req.url === "/realtime/mini-candles-all") {
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ ok: true, cache: miniCandleCache }));
     return;
   }
 
