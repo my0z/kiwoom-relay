@@ -490,6 +490,7 @@ function scheduleSseBroadcast() {
 // 직접 계산하기 위한 캐시. 장 시작 시 리셋은 아래 miniCandleCacheClearedDate 옆 setInterval에서 같이 처리.
 const todayMaxRateCache = {}; // { code: 오늘 최고 등락률 }
 const prevOrderFlowCache = {}; // { code: { buyReq, selReq } } - 직전 호가 틱 값
+const conditionRealtimeSubscribed = new Set(); // 조건검색으로 편입돼 0D(호가잔량)까지 별도 구독해둔 종목 - 중복구독/무한증가 방지용
 
 function handleRealtimeMessage(msg) {
   if (!Array.isArray(msg.data)) return;
@@ -560,6 +561,19 @@ function handleRealtimeMessage(msg) {
       const idx = realtimeCache.condition.codes.indexOf(code);
       if (isInsert) {
         if (idx === -1) realtimeCache.condition.codes.push(code);
+        // 이 종목만 콕 집어서 호가잔량(0D)도 추가 구독 - 관심종목/화면리스트(최대180종목) 전체에
+        // 0D를 걸었더니 실시간 메시지량이 거의 2배가 돼서 relay(1vCPU) 부하로 장중 전체가 느려지는
+        // 문제가 있었음. isTodayHigh/수급신호는 실제로 "실시간포착" 자동편입 판단에만 쓰이므로
+        // 조건에 막 편입된 종목만 타겟팅하면 충분함. 총 구독 수가 과도하게 안 쌓이게 상한을 둠.
+        if (!conditionRealtimeSubscribed.has(code) && conditionRealtimeSubscribed.size < 80) {
+          conditionRealtimeSubscribed.add(code);
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+              trnm: "REG", grp_no: "9", refresh: "1",
+              data: [{ item: [code], type: ["0B", "0D"] }],
+            }));
+          }
+        }
       } else {
         if (idx !== -1) realtimeCache.condition.codes.splice(idx, 1);
       }
@@ -628,7 +642,7 @@ function registerSubscriptions() {
   if (subscribedStocks.length) {
     later(() =>
       send(
-        { trnm: "REG", grp_no: "2", refresh: "1", data: [{ item: subscribedStocks, type: ["0B", "0D"] }] },
+        { trnm: "REG", grp_no: "2", refresh: "1", data: [{ item: subscribedStocks, type: ["0B"] }] },
         "실시간 관심종목 구독 등록 요청: " + subscribedStocks.length + "종목"
       )
     );
@@ -638,7 +652,7 @@ function registerSubscriptions() {
   if (subscribedListStocks.length) {
     later(() =>
       send(
-        { trnm: "REG", grp_no: "3", refresh: "1", data: [{ item: subscribedListStocks, type: ["0B", "0D"] }] },
+        { trnm: "REG", grp_no: "3", refresh: "1", data: [{ item: subscribedListStocks, type: ["0B"] }] },
         "실시간 리스트종목 구독 등록 요청: " + subscribedListStocks.length + "종목"
       )
     );
@@ -1014,7 +1028,7 @@ async function checkWatchlistMembershipChanges() {
     const changed = codesArr.length !== subscribedStocks.length || codesArr.some((c) => !subscribedStocks.includes(c));
     if (changed && ws && ws.readyState === WebSocket.OPEN && wsLoggedIn) {
       subscribedStocks = codesArr;
-      ws.send(JSON.stringify({ trnm: "REG", grp_no: "2", refresh: "1", data: [{ item: subscribedStocks, type: ["0B", "0D"] }] }));
+      ws.send(JSON.stringify({ trnm: "REG", grp_no: "2", refresh: "1", data: [{ item: subscribedStocks, type: ["0B"] }] }));
       console.log("관심종목 변경 감지 - 웹소켓 구독 자체 갱신: " + subscribedStocks.length + "종목");
     }
 
@@ -1041,6 +1055,7 @@ setInterval(() => {
     saveMiniCandleCache();
     Object.keys(todayMaxRateCache).forEach((k) => delete todayMaxRateCache[k]);
     Object.keys(prevOrderFlowCache).forEach((k) => delete prevOrderFlowCache[k]);
+    conditionRealtimeSubscribed.clear();
     miniCandleCacheClearedDate = dateKey;
     console.log("미니차트 캐시 초기화 (새 거래일 시작)");
   }
@@ -1250,7 +1265,7 @@ const server = http.createServer((req, res) => {
         ws.send(JSON.stringify({ trnm: "REMOVE", grp_no: "2" }));
         ws.send(JSON.stringify({
           trnm: "REG", grp_no: "2", refresh: "1",
-          data: [{ item: codes, type: ["0B", "0D"] }],
+          data: [{ item: codes, type: ["0B"] }],
         }));
         console.log("관심종목 구독 갱신:", codes.length + "종목");
       }
@@ -1258,7 +1273,7 @@ const server = http.createServer((req, res) => {
         ws.send(JSON.stringify({ trnm: "REMOVE", grp_no: "3" }));
         ws.send(JSON.stringify({
           trnm: "REG", grp_no: "3", refresh: "1",
-          data: [{ item: listCodes, type: ["0B", "0D"] }],
+          data: [{ item: listCodes, type: ["0B"] }],
         }));
         console.log("리스트종목 구독 갱신:", listCodes.length + "종목");
       }
@@ -1278,13 +1293,13 @@ const server = http.createServer((req, res) => {
           if (subscribedStocks.length) {
             ws.send(JSON.stringify({
               trnm: "REG", grp_no: "2", refresh: "1",
-              data: [{ item: subscribedStocks, type: ["0B", "0D"] }],
+              data: [{ item: subscribedStocks, type: ["0B"] }],
             }));
           }
           if (subscribedListStocks.length) {
             ws.send(JSON.stringify({
               trnm: "REG", grp_no: "3", refresh: "1",
-              data: [{ item: subscribedListStocks, type: ["0B", "0D"] }],
+              data: [{ item: subscribedListStocks, type: ["0B"] }],
             }));
           }
           console.log("지연 구독 등록 완료 (관심 " + subscribedStocks.length + " / 리스트 " + subscribedListStocks.length + ")");
