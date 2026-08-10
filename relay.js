@@ -813,7 +813,7 @@ connectWebSocket();
 // Worker의 2분 cron(checkWatchlistRiskLevels)보다 훨씬 빠르게 -1.5%/+1.5% 트리거.
 // relay는 이미 웹소켓으로 실시간가를 들고 있으므로 키움 TR 호출 없이 즉시 계산 가능.
 const AUTO_REMOVE_PNL_PCT = -1.5; // 손절
-const AUTO_TAKE_PROFIT_PNL_PCT = 2.5; // 익절
+const AUTO_TAKE_PROFIT_PNL_PCT = 3.5; // 익절
 
 // 15:50 이후 자동매매(익절/손절) 중지 - Worker도 동일 기준으로 403 처리하지만
 // relay 쪽에서 먼저 걸러서 불필요한 요청/로그 방지.
@@ -1089,7 +1089,7 @@ async function checkWatchlistStopLoss() {
 setInterval(checkWatchlistStopLoss, 2000);
 
 // ---------- 15:50 일괄정리 (하루 1회) ----------
-// 15:50부터는 신규 매매/자동삭제가 전부 중지되는데, 그 직전 시점 기준으로 조건(+2.5%/-1.5%)에
+// 15:50부터는 신규 매매/자동삭제가 전부 중지되는데, 그 직전 시점 기준으로 조건(+3.5%/-1.5%)에
 // 걸려있는 종목들은 중지되기 전에 한 번 정리해줌. 이후(15:50~장마감)엔 다시 매매중지 유지.
 let finalSweepDoneToday = null;
 async function runFinalSweep() {
