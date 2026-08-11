@@ -456,6 +456,18 @@ setInterval(() => {
 // 즉시 연결된 모든 SSE 클라이언트(Worker 경유)에 바로 push. 폴링 지연이 사라지고
 // 키움->relay->Worker->브라우저 전 구간이 이벤트 기반이 됨(진짜 실시간에 가까워짐).
 const sseClients = new Set(); // Set<http.ServerResponse>
+// 캐시에 남아있는 전 종목이 아니라, 실제로 화면에 쓰이는 3그룹(관심종목/화면리스트/실시간포착)에
+// 속한 종목만 골라서 반환 - SSE 브로드캐스트와 폴링 엔드포인트(/realtime/all, /realtime/stocks)가
+// 공통으로 씀. 정리(trim) 타이밍 사이에 남아있는 자투리 데이터까지 매번 통째로 직렬화/전송하던 낭비를 줄임.
+function relevantStocksPayload() {
+  const relevantCodes = new Set([...subscribedStocks, ...subscribedListStocks, ...realtimeCache.condition.codes]);
+  const stocks = {};
+  for (const code of relevantCodes) {
+    if (realtimeCache.stock[code]) stocks[code] = realtimeCache.stock[code];
+  }
+  return stocks;
+}
+
 function sseBroadcast(payload) {
   if (!sseClients.size) return;
   const line = `data: ${JSON.stringify(payload)}\n\n`;
@@ -467,8 +479,10 @@ function sseBroadcast(payload) {
     }
   }
 }
-// 매 웹소켓 메시지마다 브로드캐스트하면 너무 잦을 수 있어(체결이 빈번한 종목은 초당 여러 번) 200ms
-// 간격으로 묶어서 전송 - 그래도 기존 2초 폴링보다 10배 빠르고, 브라우저 렌더링 부하도 줄어듦.
+// 매 웹소켓 메시지마다 브로드캐스트하면 너무 잦을 수 있어(체결이 빈번한 종목은 초당 여러 번) 묶어서
+// 전송. 200ms는 장중 종목 수가 많아지면(관심종목+화면리스트+실시간포착 합쳐 최대 250여개) relay
+// CPU와 클라이언트 렌더링 부하가 누적돼 장중 갈수록 느려지는 원인이 됐음 - 500ms로 완화.
+// 그래도 기존 2초 폴링보다 4배 빠름.
 let sseBroadcastPending = false;
 function scheduleSseBroadcast() {
   if (sseBroadcastPending || !sseClients.size) return;
@@ -479,10 +493,10 @@ function scheduleSseBroadcast() {
     const history = buildConditionHistory();
     sseBroadcast({
       index: buildIndexPayload(),
-      stocks: realtimeCache.stock,
+      stocks: relevantStocksPayload(),
       condition: { seq: cond.seq, name: cond.name, codes: cond.codes, count: cond.codes.length, lastEventAt: cond.lastEventAt, history },
     });
-  }, 200);
+  }, 500);
 }
 
 // 당일 최고 등락률(0B 체결 틱마다 갱신) / 직전 호가잔량(0D 틱마다 갱신) - 배치(2분 cron)로만
@@ -490,7 +504,28 @@ function scheduleSseBroadcast() {
 // 직접 계산하기 위한 캐시. 장 시작 시 리셋은 아래 miniCandleCacheClearedDate 옆 setInterval에서 같이 처리.
 const todayMaxRateCache = {}; // { code: 오늘 최고 등락률 }
 const prevOrderFlowCache = {}; // { code: { buyReq, selReq } } - 직전 호가 틱 값
-const conditionRealtimeSubscribed = new Set(); // 조건검색으로 편입돼 0D(호가잔량)까지 별도 구독해둔 종목 - 중복구독/무한증가 방지용
+let group9ResyncPending = false;
+let group9LastCodes = []; // 직전에 실제로 등록한 목록 - 내용이 안 바뀌었으면 재등록 스킵
+function scheduleGroup9Resync() {
+  if (group9ResyncPending) return;
+  group9ResyncPending = true;
+  setTimeout(() => {
+    group9ResyncPending = false;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    const current = [...realtimeCache.condition.codes];
+    const changed = current.length !== group9LastCodes.length || current.some((c) => !group9LastCodes.includes(c));
+    if (!changed) return;
+    ws.send(JSON.stringify({ trnm: "REMOVE", grp_no: "9" }));
+    if (current.length) {
+      ws.send(JSON.stringify({
+        trnm: "REG", grp_no: "9", refresh: "1",
+        data: [{ item: current, type: ["0B", "0D"] }],
+      }));
+    }
+    group9LastCodes = current;
+    console.log("실시간포착 호가잔량 구독 재동기화:", current.length + "종목");
+  }, 2000); // 조건검색 편입/이탈이 짧은 시간에 몰아서 일어날 수 있어 2초 묶어서 처리(REG 스팸 방지)
+}
 
 function handleRealtimeMessage(msg) {
   if (!Array.isArray(msg.data)) return;
@@ -561,22 +596,14 @@ function handleRealtimeMessage(msg) {
       const idx = realtimeCache.condition.codes.indexOf(code);
       if (isInsert) {
         if (idx === -1) realtimeCache.condition.codes.push(code);
-        // 이 종목만 콕 집어서 호가잔량(0D)도 추가 구독 - 관심종목/화면리스트(최대180종목) 전체에
-        // 0D를 걸었더니 실시간 메시지량이 거의 2배가 돼서 relay(1vCPU) 부하로 장중 전체가 느려지는
-        // 문제가 있었음. isTodayHigh/수급신호는 실제로 "실시간포착" 자동편입 판단에만 쓰이므로
-        // 조건에 막 편입된 종목만 타겟팅하면 충분함. 총 구독 수가 과도하게 안 쌓이게 상한을 둠.
-        if (!conditionRealtimeSubscribed.has(code) && conditionRealtimeSubscribed.size < 80) {
-          conditionRealtimeSubscribed.add(code);
-          if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({
-              trnm: "REG", grp_no: "9", refresh: "1",
-              data: [{ item: [code], type: ["0B", "0D"] }],
-            }));
-          }
-        }
       } else {
         if (idx !== -1) realtimeCache.condition.codes.splice(idx, 1);
       }
+      // 호가잔량(0D)까지 실시간 구독하는 그룹9을 "지금 조건에 걸려있는 종목"과 항상 일치시킴 -
+      // 예전엔 한 번 편입되면 하루 종일(최대 80종목까지) 구독이 안 빠져서, 시간이 갈수록 실시간
+      // 메시지량이 누적돼 relay(1vCPU) 부하로 장중 갈수록 느려지는 원인이 됐음. 이제는 조건에서
+      // 이탈하면 그 즉시 구독도 같이 빠짐 - 실제 필요한 만큼(보통 몇~수십 개)만 유지됨.
+      scheduleGroup9Resync();
 
       realtimeCache.condition.lastEventAt = new Date().toISOString();
       realtimeCache.condition.events.unshift({
@@ -1055,7 +1082,7 @@ setInterval(() => {
     saveMiniCandleCache();
     Object.keys(todayMaxRateCache).forEach((k) => delete todayMaxRateCache[k]);
     Object.keys(prevOrderFlowCache).forEach((k) => delete prevOrderFlowCache[k]);
-    conditionRealtimeSubscribed.clear();
+    group9LastCodes = [];
     miniCandleCacheClearedDate = dateKey;
     console.log("미니차트 캐시 초기화 (새 거래일 시작)");
   }
@@ -1198,7 +1225,7 @@ const server = http.createServer((req, res) => {
         wsConnected: wsConnected,
         wsLoggedIn: wsLoggedIn,
         index: buildIndexPayload(),
-        stocks: realtimeCache.stock,
+        stocks: relevantStocksPayload(),
         condition: { seq: cond.seq, name: cond.name, codes: cond.codes, count: cond.codes.length, lastEventAt: cond.lastEventAt, history },
       })
     );
@@ -1278,9 +1305,9 @@ const server = http.createServer((req, res) => {
         console.log("리스트종목 구독 갱신:", listCodes.length + "종목");
       }
 
-      // 두 그룹 어디에도 없는 종목의 캐시는 정리 (오래된 값이 남아 오해를 주지 않도록)
+      // 세 그룹(관심종목/화면리스트/조건검색 실시간포착) 어디에도 없는 종목의 캐시만 정리
       if (changedWatch || changedList) {
-        const keep = new Set([...codes, ...listCodes]);
+        const keep = new Set([...codes, ...listCodes, ...realtimeCache.condition.codes]);
         for (const cached of Object.keys(realtimeCache.stock)) {
           if (!keep.has(cached)) delete realtimeCache.stock[cached];
         }
@@ -1326,7 +1353,7 @@ const server = http.createServer((req, res) => {
         wsLoggedIn: wsLoggedIn,
         subscribed: subscribedStocks.length,
         subscribedList: subscribedListStocks.length,
-        stocks: realtimeCache.stock,
+        stocks: relevantStocksPayload(),
       })
     );
     return;
