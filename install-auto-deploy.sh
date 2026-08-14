@@ -5,6 +5,17 @@ set -e
 
 REPO_DIR="/home/ubuntu/kiwoom-relay"
 
+echo "== 0. 네트워크 성능 튜닝(BBR) =="
+# relay <-> 키움/Worker 간 TCP 처리량/지연 개선. 이미 적용돼 있으면 중복 추가 안 되게 grep으로 확인.
+if ! grep -q "^net.ipv4.tcp_congestion_control" /etc/sysctl.conf 2>/dev/null; then
+  echo 'net.ipv4.tcp_congestion_control = bbr' | sudo tee -a /etc/sysctl.conf > /dev/null
+fi
+if ! grep -q "^net.core.default_qdisc" /etc/sysctl.conf 2>/dev/null; then
+  echo 'net.core.default_qdisc = fq' | sudo tee -a /etc/sysctl.conf > /dev/null
+fi
+sudo sysctl -p > /dev/null
+echo "현재 혼잡제어 알고리즘: $(sysctl -n net.ipv4.tcp_congestion_control)"
+
 echo "== 1. 워처 스크립트 설치 =="
 sudo cp "$REPO_DIR/auto-deploy.sh" /usr/local/bin/kiwoom-auto-deploy.sh
 sudo chmod +x /usr/local/bin/kiwoom-auto-deploy.sh

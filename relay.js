@@ -8,6 +8,14 @@ const PORT = process.env.PORT || 8787;
 const RELAY_SECRET = process.env.RELAY_SECRET;
 const KIWOOM_REAL_HOST = "api.kiwoom.com";
 
+// ---------- Keep-Alive 연결 재사용 ----------
+// 기존엔 https.request 호출마다(키움 TR, Worker 전송, REST 패스스루) 매번 새 TCP+TLS
+// 핸드셰이크를 맺었음. 장중엔 2~3초 간격으로 이런 호출이 반복되므로, 연결을 재사용하는
+// keep-alive Agent를 붙여서 핸드셰이크 비용을 없앰 (지연시간 절감의 핵심 최적화).
+const kiwoomAgent = new https.Agent({ keepAlive: true, maxSockets: 20, keepAliveMsecs: 30000 });
+const workerAgent = new https.Agent({ keepAlive: true, maxSockets: 10, keepAliveMsecs: 30000 });
+const naverAgent = new https.Agent({ keepAlive: true, maxSockets: 5, keepAliveMsecs: 30000 });
+
 // 웹소켓 실시간 시세용 (지수 등). 앱키/시크릿이 없으면 웹소켓 기능만 비활성화되고
 // 기존 REST 중계는 그대로 동작함 (하위호환 - 환경변수 추가 전에도 안 죽음)
 const APP_KEY = process.env.KIWOOM_APP_KEY_REAL;
@@ -113,6 +121,7 @@ function issueToken() {
         hostname: KIWOOM_REAL_HOST,
         path: "/oauth2/token",
         method: "POST",
+        agent: kiwoomAgent,
         headers: {
           "Content-Type": "application/json;charset=UTF-8",
           "Content-Length": Buffer.byteLength(body),
@@ -178,6 +187,7 @@ function kiwoomRest(path, apiId, body, token) {
         hostname: KIWOOM_REAL_HOST,
         path: path,
         method: "POST",
+        agent: kiwoomAgent,
         headers: {
           "Content-Type": "application/json;charset=UTF-8",
           authorization: "Bearer " + token,
@@ -327,7 +337,7 @@ function fetchNaverIndex(code) {
     https
       .get(
         `https://m.stock.naver.com/api/index/${encodeURIComponent(code)}/basic`,
-        { headers: { "User-Agent": "Mozilla/5.0" }, timeout: 8000 },
+        { headers: { "User-Agent": "Mozilla/5.0" }, timeout: 8000, agent: naverAgent },
         (res) => {
           let body = "";
           res.on("data", (c) => (body += c));
@@ -860,6 +870,7 @@ function workerRequest(path, method, body) {
         hostname: url.hostname,
         path: url.pathname + url.search,
         method,
+        agent: workerAgent,
         headers: Object.assign(
           { "X-Admin-Key": ADMIN_KEY },
           data ? { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data) } : {}
@@ -1462,6 +1473,10 @@ const server = http.createServer((req, res) => {
         sseClientCount: sseClients.size,
         memoryRssMb: Math.round(mem.rss / 1024 / 1024),
         memoryHeapUsedMb: Math.round(mem.heapUsed / 1024 / 1024),
+        keepAliveSockets: {
+          kiwoom: Object.values(kiwoomAgent.sockets).reduce((s, a) => s + a.length, 0),
+          worker: Object.values(workerAgent.sockets).reduce((s, a) => s + a.length, 0),
+        },
       })
     );
     return;
@@ -1486,6 +1501,7 @@ const server = http.createServer((req, res) => {
         hostname: KIWOOM_REAL_HOST,
         path: req.url,
         method: req.method,
+        agent: kiwoomAgent,
         headers: forwardHeaders,
       },
       (upstreamRes) => {

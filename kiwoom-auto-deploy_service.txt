@@ -1,0 +1,17 @@
+[Unit]
+Description=Kiwoom Relay Auto Deploy Watcher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/kiwoom-relay
+ExecStart=/usr/local/bin/kiwoom-auto-deploy.sh
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
