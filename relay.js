@@ -184,8 +184,8 @@ async function runRender(jobId, images, audioUrl, outputKey, weights, captions) 
       if (caption) {
         const capFile = path.join(tmpDir, `cap-${i}.txt`);
         fs.writeFileSync(capFile, caption, "utf8");
-        chain += `,drawtext=fontfile=${CAPTION_FONT_PATH}:textfile=${capFile}:fontsize=42:fontcolor=white:` +
-          `line_spacing=10:box=1:boxcolor=black@0.55:boxborderw=20:x=(w-text_w)/2:y=h-th-60`;
+        chain += `,drawtext=fontfile=${CAPTION_FONT_PATH}:textfile=${capFile}:fontsize=48:fontcolor=white:` +
+          `line_spacing=12:box=1:boxcolor=black@0.68:boxborderw=24:x=(w-text_w)/2:y=h-th-64`;
       }
       return `${chain}[v${i}]`;
     }).join(";");
