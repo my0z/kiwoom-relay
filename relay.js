@@ -60,11 +60,23 @@ function downloadToFile(url, destPath) {
   });
 }
 
-function runFfmpeg(args) {
+// onProgress(percent): ffmpeg 진행 상황을 stderr의 "time=" 라인에서 파싱해서 콜백으로 알림
+function runFfmpeg(args, totalDurationSec, onProgress) {
   return new Promise((resolve, reject) => {
     const proc = spawn("ffmpeg", args);
     let stderr = "";
-    proc.stderr.on("data", (d) => { stderr += d.toString(); });
+    proc.stderr.on("data", (d) => {
+      const chunk = d.toString();
+      stderr += chunk;
+      if (onProgress && totalDurationSec > 0) {
+        const m = chunk.match(/time=(\d+):(\d+):(\d+\.\d+)/);
+        if (m) {
+          const elapsed = parseInt(m[1], 10) * 3600 + parseInt(m[2], 10) * 60 + parseFloat(m[3]);
+          const percent = Math.min(99, Math.round((elapsed / totalDurationSec) * 100));
+          onProgress(percent);
+        }
+      }
+    });
     proc.on("error", (err) => reject(new Error(`ffmpeg 실행 실패: ${err.message}`)));
     proc.on("close", (code) => {
       if (code === 0) resolve();
@@ -126,23 +138,32 @@ const CAPTION_FONT_PATH = resolveCaptionFontPath();
 
 async function runRender(jobId, images, audioUrl, outputKey, weights, captions) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), `render-${jobId}-`));
+  const setProgress = (stage, percent) => {
+    const prev = renderJobs.get(jobId) || {};
+    renderJobs.set(jobId, { ...prev, status: "processing", stage, percent, startedAt: prev.startedAt || Date.now() });
+  };
   try {
     if (!r2Client) throw new Error("R2_ACCESS_KEY_ID/R2_SECRET_ACCESS_KEY 환경변수 없음");
     if (!images.length) throw new Error("이미지가 없음");
 
+    setProgress("이미지 다운로드 중", 5);
     const imagePaths = [];
     for (let i = 0; i < images.length; i++) {
       const dest = path.join(tmpDir, `img-${i}.jpg`);
       await downloadToFile(images[i], dest);
       imagePaths.push(dest);
+      setProgress("이미지 다운로드 중", 5 + Math.round((i + 1) / images.length * 15)); // 5~20%
     }
     let audioPath = null;
     if (audioUrl) {
+      setProgress("음성 다운로드 중", 22);
       audioPath = path.join(tmpDir, "narration.mp3");
       await downloadToFile(audioUrl, audioPath);
     }
 
+    setProgress("영상 길이 계산 중", 25);
     const durations = await computeImageDurations(imagePaths.length, audioPath, weights);
+    const totalDurationSec = durations.reduce((a, b) => a + b, 0);
     const fontAvailable = fs.existsSync(CAPTION_FONT_PATH);
     if (!fontAvailable) {
       console.log(`[render:${jobId}] 자막 폰트를 못 찾음(${CAPTION_FONT_PATH}) — 이번 렌더링은 자막 없이 진행`);
@@ -175,14 +196,19 @@ async function runRender(jobId, images, audioUrl, outputKey, weights, captions) 
       ? ["-map", "[outv]", "-map", `${imagePaths.length}:a`, "-c:a", "aac", "-shortest"]
       : ["-map", "[outv]", "-an"];
 
+    setProgress("렌더링 중", 30);
     await runFfmpeg([
       "-y", ...inputArgs,
       "-filter_complex", filterComplex,
       ...outputArgs,
       "-c:v", "libx264", "-pix_fmt", "yuv420p",
       outputPath,
-    ]);
+    ], totalDurationSec, (ffmpegPercent) => {
+      // ffmpeg 자체 진행률(0~99)을 전체 진행률의 30~85% 구간에 매핑
+      setProgress("렌더링 중", 30 + Math.round((ffmpegPercent / 100) * 55));
+    });
 
+    setProgress("업로드 중", 90);
     const videoBuffer = fs.readFileSync(outputPath);
     await r2Client.send(new PutObjectCommand({
       Bucket: R2_BUCKET,
@@ -191,10 +217,10 @@ async function runRender(jobId, images, audioUrl, outputKey, weights, captions) 
       ContentType: "video/mp4",
     }));
 
-    renderJobs.set(jobId, { status: "done", r2Key: outputKey, startedAt: renderJobs.get(jobId)?.startedAt || Date.now() });
+    renderJobs.set(jobId, { status: "done", stage: "완료", percent: 100, r2Key: outputKey, startedAt: renderJobs.get(jobId)?.startedAt || Date.now() });
     console.log(`[render:${jobId}] 완료, R2 저장: ${outputKey}`);
   } catch (e) {
-    renderJobs.set(jobId, { status: "failed", error: e.message, startedAt: renderJobs.get(jobId)?.startedAt || Date.now() });
+    renderJobs.set(jobId, { status: "failed", stage: "실패", percent: 0, error: e.message, startedAt: renderJobs.get(jobId)?.startedAt || Date.now() });
     console.log(`[render:${jobId}] 실패: ${e.message}`);
   } finally {
     fs.rm(tmpDir, { recursive: true, force: true }, () => {});
@@ -1414,7 +1440,7 @@ const server = http.createServer((req, res) => {
         return;
       }
       const jobId = crypto.randomUUID();
-      renderJobs.set(jobId, { status: "processing", startedAt: Date.now() });
+      renderJobs.set(jobId, { status: "processing", stage: "대기 중", percent: 0, startedAt: Date.now() });
       runRender(jobId, images, audioUrl, outputKey, weights, captions); // 기다리지 않고 백그라운드 처리
       res.writeHead(202, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: true, jobId }));
