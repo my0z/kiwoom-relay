@@ -73,7 +73,43 @@ function runFfmpeg(args) {
   });
 }
 
-async function runRender(jobId, images, audioUrl, outputKey) {
+// 오디오 파일의 실제 길이(초)를 ffprobe로 확인 — 이걸 알아야 이미지별 노출시간을 자막 비율대로 정확히 나눌 수 있음
+function getAudioDurationSec(audioPath) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn("ffprobe", ["-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0", audioPath]);
+    let stdout = "";
+    let stderr = "";
+    proc.stdout.on("data", (d) => { stdout += d.toString(); });
+    proc.stderr.on("data", (d) => { stderr += d.toString(); });
+    proc.on("error", (err) => reject(new Error(`ffprobe 실행 실패: ${err.message}`)));
+    proc.on("close", (code) => {
+      const sec = parseFloat(stdout.trim());
+      if (code === 0 && Number.isFinite(sec) && sec > 0) resolve(sec);
+      else reject(new Error(`ffprobe 길이 확인 실패: ${stderr.slice(-300)}`));
+    });
+  });
+}
+
+// 이미지별 노출시간(초) 배열 계산 — weights(자막 글자수 비율)가 있으면 오디오 실길이에 비례 배분,
+// 없거나 개수가 안 맞으면 기존처럼 고정 길이(RENDER_IMAGE_DURATION_SEC)로 폴백
+async function computeImageDurations(imageCount, audioPath, weights) {
+  if (!audioPath) return Array(imageCount).fill(RENDER_IMAGE_DURATION_SEC);
+  let audioDuration;
+  try {
+    audioDuration = await getAudioDurationSec(audioPath);
+  } catch (e) {
+    console.log(`오디오 길이 확인 실패, 고정 길이로 폴백: ${e.message}`);
+    return Array(imageCount).fill(RENDER_IMAGE_DURATION_SEC);
+  }
+  if (!Array.isArray(weights) || weights.length !== imageCount) {
+    return Array(imageCount).fill(audioDuration / imageCount);
+  }
+  const sum = weights.reduce((a, b) => a + b, 0) || 1;
+  const MIN_SEC = 1.2; // 너무 짧은 컷은 어색하니 최소치는 보장
+  return weights.map((w) => Math.max(MIN_SEC, (w / sum) * audioDuration));
+}
+
+async function runRender(jobId, images, audioUrl, outputKey, weights) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), `render-${jobId}-`));
   try {
     if (!r2Client) throw new Error("R2_ACCESS_KEY_ID/R2_SECRET_ACCESS_KEY 환경변수 없음");
@@ -91,10 +127,12 @@ async function runRender(jobId, images, audioUrl, outputKey) {
       await downloadToFile(audioUrl, audioPath);
     }
 
+    const durations = await computeImageDurations(imagePaths.length, audioPath, weights);
+
     const outputPath = path.join(tmpDir, "output.mp4");
     const inputArgs = [];
-    imagePaths.forEach((p) => {
-      inputArgs.push("-loop", "1", "-t", String(RENDER_IMAGE_DURATION_SEC), "-i", p);
+    imagePaths.forEach((p, i) => {
+      inputArgs.push("-loop", "1", "-t", String(durations[i].toFixed(2)), "-i", p);
     });
     if (audioPath) inputArgs.push("-i", audioPath);
 
@@ -1337,6 +1375,7 @@ const server = http.createServer((req, res) => {
       const images = Array.isArray(body.images) ? body.images : [];
       const audioUrl = body.audioUrl || null;
       const outputKey = body.outputKey;
+      const weights = Array.isArray(body.weights) ? body.weights.filter((w) => typeof w === "number") : null;
       if (!images.length || !outputKey) {
         res.writeHead(400, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: false, error: "images/outputKey 필요" }));
@@ -1344,7 +1383,7 @@ const server = http.createServer((req, res) => {
       }
       const jobId = crypto.randomUUID();
       renderJobs.set(jobId, { status: "processing", startedAt: Date.now() });
-      runRender(jobId, images, audioUrl, outputKey); // 기다리지 않고 백그라운드 처리
+      runRender(jobId, images, audioUrl, outputKey, weights); // 기다리지 않고 백그라운드 처리
       res.writeHead(202, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: true, jobId }));
     });
