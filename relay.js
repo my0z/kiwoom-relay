@@ -3,10 +3,134 @@ const https = require("https");
 const WebSocket = require("ws");
 const fs = require("fs");
 const path = require("path");
+const os = require("os");
+const crypto = require("crypto");
+const { spawn } = require("child_process");
+const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
 
 const PORT = process.env.PORT || 8787;
 const RELAY_SECRET = process.env.RELAY_SECRET;
 const KIWOOM_REAL_HOST = "api.kiwoom.com";
+
+// ---------- 영상 렌더링 (life.news용, ffmpeg 무료 대체) ----------
+// Shotstack/Rendobar 같은 외부 유료 렌더링 서비스 대신, 이미 상시 가동 중인 이 VM에서
+// ffmpeg로 이미지+음성을 mp4로 합성 -> R2에 직접 업로드. R2 버킷은 Worker와 동일한 걸 써서
+// Worker는 그냥 자기 R2 바인딩으로 읽기만 하면 됨(중계 다운로드 불필요).
+const R2_ACCOUNT_ID = process.env.R2_ACCOUNT_ID || "709dcc6af36c8ee7b6d3d99e7a9fe422";
+const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID;
+const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY;
+const R2_BUCKET = process.env.R2_BUCKET || "usbkr-videos";
+const RENDER_IMAGE_DURATION_SEC = 4;
+
+const r2Client = (R2_ACCESS_KEY_ID && R2_SECRET_ACCESS_KEY)
+  ? new S3Client({
+      region: "auto",
+      endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+      credentials: { accessKeyId: R2_ACCESS_KEY_ID, secretAccessKey: R2_SECRET_ACCESS_KEY },
+    })
+  : null;
+
+// jobId -> { status: "processing"|"done"|"failed", error, r2Key, startedAt }
+const renderJobs = new Map();
+// 오래된 완료/실패 job은 메모리에서 주기적으로 정리 (30분 지나면 제거)
+setInterval(() => {
+  const cutoff = Date.now() - 30 * 60 * 1000;
+  for (const [id, job] of renderJobs) {
+    if (job.startedAt < cutoff && job.status !== "processing") renderJobs.delete(id);
+  }
+}, 5 * 60 * 1000);
+
+function downloadToFile(url, destPath) {
+  return new Promise((resolve, reject) => {
+    const file = fs.createWriteStream(destPath);
+    https.get(url, (res) => {
+      if (res.statusCode !== 200) {
+        file.close();
+        fs.unlink(destPath, () => {});
+        reject(new Error(`다운로드 실패 HTTP ${res.statusCode}: ${url}`));
+        return;
+      }
+      res.pipe(file);
+      file.on("finish", () => file.close(resolve));
+    }).on("error", (err) => {
+      file.close();
+      fs.unlink(destPath, () => {});
+      reject(err);
+    });
+  });
+}
+
+function runFfmpeg(args) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn("ffmpeg", args);
+    let stderr = "";
+    proc.stderr.on("data", (d) => { stderr += d.toString(); });
+    proc.on("error", (err) => reject(new Error(`ffmpeg 실행 실패: ${err.message}`)));
+    proc.on("close", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`ffmpeg 종료코드 ${code}: ${stderr.slice(-800)}`));
+    });
+  });
+}
+
+async function runRender(jobId, images, audioUrl, outputKey) {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), `render-${jobId}-`));
+  try {
+    if (!r2Client) throw new Error("R2_ACCESS_KEY_ID/R2_SECRET_ACCESS_KEY 환경변수 없음");
+    if (!images.length) throw new Error("이미지가 없음");
+
+    const imagePaths = [];
+    for (let i = 0; i < images.length; i++) {
+      const dest = path.join(tmpDir, `img-${i}.jpg`);
+      await downloadToFile(images[i], dest);
+      imagePaths.push(dest);
+    }
+    let audioPath = null;
+    if (audioUrl) {
+      audioPath = path.join(tmpDir, "narration.mp3");
+      await downloadToFile(audioUrl, audioPath);
+    }
+
+    const outputPath = path.join(tmpDir, "output.mp4");
+    const inputArgs = [];
+    imagePaths.forEach((p) => {
+      inputArgs.push("-loop", "1", "-t", String(RENDER_IMAGE_DURATION_SEC), "-i", p);
+    });
+    if (audioPath) inputArgs.push("-i", audioPath);
+
+    const filterInputs = imagePaths.map((_, i) => `[${i}:v]scale=1280:720,setsar=1[v${i}]`).join(";");
+    const concatInputs = imagePaths.map((_, i) => `[v${i}]`).join("");
+    const filterComplex = `${filterInputs};${concatInputs}concat=n=${imagePaths.length}:v=1:a=0[outv]`;
+
+    const outputArgs = audioPath
+      ? ["-map", "[outv]", "-map", `${imagePaths.length}:a`, "-c:a", "aac", "-shortest"]
+      : ["-map", "[outv]", "-an"];
+
+    await runFfmpeg([
+      "-y", ...inputArgs,
+      "-filter_complex", filterComplex,
+      ...outputArgs,
+      "-c:v", "libx264", "-pix_fmt", "yuv420p",
+      outputPath,
+    ]);
+
+    const videoBuffer = fs.readFileSync(outputPath);
+    await r2Client.send(new PutObjectCommand({
+      Bucket: R2_BUCKET,
+      Key: outputKey,
+      Body: videoBuffer,
+      ContentType: "video/mp4",
+    }));
+
+    renderJobs.set(jobId, { status: "done", r2Key: outputKey, startedAt: renderJobs.get(jobId)?.startedAt || Date.now() });
+    console.log(`[render:${jobId}] 완료, R2 저장: ${outputKey}`);
+  } catch (e) {
+    renderJobs.set(jobId, { status: "failed", error: e.message, startedAt: renderJobs.get(jobId)?.startedAt || Date.now() });
+    console.log(`[render:${jobId}] 실패: ${e.message}`);
+  } finally {
+    fs.rm(tmpDir, { recursive: true, force: true }, () => {});
+  }
+}
 
 // ---------- Keep-Alive 연결 재사용 ----------
 // 기존엔 https.request 호출마다(키움 TR, Worker 전송, REST 패스스루) 매번 새 TCP+TLS
@@ -1194,6 +1318,51 @@ const server = http.createServer((req, res) => {
   if (req.headers["x-relay-secret"] !== RELAY_SECRET) {
     res.writeHead(401, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: false, error: "relay secret mismatch" }));
+    return;
+  }
+
+  // 영상 렌더링 시작 - 이미지+음성 URL 받아서 백그라운드로 ffmpeg 렌더링, 즉시 202 응답
+  if (req.url === "/render" && req.method === "POST") {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      let body;
+      try {
+        body = JSON.parse(Buffer.concat(chunks).toString() || "{}");
+      } catch (e) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "invalid json" }));
+        return;
+      }
+      const images = Array.isArray(body.images) ? body.images : [];
+      const audioUrl = body.audioUrl || null;
+      const outputKey = body.outputKey;
+      if (!images.length || !outputKey) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "images/outputKey 필요" }));
+        return;
+      }
+      const jobId = crypto.randomUUID();
+      renderJobs.set(jobId, { status: "processing", startedAt: Date.now() });
+      runRender(jobId, images, audioUrl, outputKey); // 기다리지 않고 백그라운드 처리
+      res.writeHead(202, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, jobId }));
+    });
+    return;
+  }
+
+  // 영상 렌더링 상태 조회
+  if (req.url.startsWith("/render/status")) {
+    const q = new URL(req.url, "http://localhost").searchParams;
+    const jobId = q.get("jobId");
+    const job = jobId ? renderJobs.get(jobId) : null;
+    if (!job) {
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: false, error: "job not found" }));
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true, ...job }));
     return;
   }
 
