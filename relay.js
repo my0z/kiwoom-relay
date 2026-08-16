@@ -109,9 +109,20 @@ async function computeImageDurations(imageCount, audioPath, weights) {
   return weights.map((w) => Math.max(MIN_SEC, (w / sum) * audioDuration));
 }
 
-// 한글 자막을 그리려면 CJK 폰트가 필요함 — 없으면 sudo apt install -y fonts-noto-cjk 로 설치.
-// 실제 설치 경로가 다르면 CAPTION_FONT_PATH 환경변수로 덮어쓸 수 있게 해둠.
-const CAPTION_FONT_PATH = process.env.CAPTION_FONT_PATH || "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc";
+// 자막용 폰트 — Black Han Sans(굵고 임팩트 있어 자막/캡션에 흔히 쓰임)를 우선 찾고,
+// 없으면 Noto Sans CJK로 폴백. CAPTION_FONT_PATH 환경변수로 직접 지정하면 그게 최우선.
+function resolveCaptionFontPath() {
+  if (process.env.CAPTION_FONT_PATH && fs.existsSync(process.env.CAPTION_FONT_PATH)) {
+    return process.env.CAPTION_FONT_PATH;
+  }
+  const candidates = [
+    "/usr/local/share/fonts/BlackHanSans-Regular.ttf",
+    "/usr/share/fonts/truetype/custom/BlackHanSans-Regular.ttf",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+  ];
+  return candidates.find((p) => fs.existsSync(p)) || candidates[candidates.length - 1];
+}
+const CAPTION_FONT_PATH = resolveCaptionFontPath();
 
 async function runRender(jobId, images, audioUrl, outputKey, weights, captions) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), `render-${jobId}-`));
