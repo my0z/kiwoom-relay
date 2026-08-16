@@ -109,7 +109,11 @@ async function computeImageDurations(imageCount, audioPath, weights) {
   return weights.map((w) => Math.max(MIN_SEC, (w / sum) * audioDuration));
 }
 
-async function runRender(jobId, images, audioUrl, outputKey, weights) {
+// 한글 자막을 그리려면 CJK 폰트가 필요함 — 없으면 sudo apt install -y fonts-noto-cjk 로 설치.
+// 실제 설치 경로가 다르면 CAPTION_FONT_PATH 환경변수로 덮어쓸 수 있게 해둠.
+const CAPTION_FONT_PATH = process.env.CAPTION_FONT_PATH || "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc";
+
+async function runRender(jobId, images, audioUrl, outputKey, weights, captions) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), `render-${jobId}-`));
   try {
     if (!r2Client) throw new Error("R2_ACCESS_KEY_ID/R2_SECRET_ACCESS_KEY 환경변수 없음");
@@ -128,6 +132,10 @@ async function runRender(jobId, images, audioUrl, outputKey, weights) {
     }
 
     const durations = await computeImageDurations(imagePaths.length, audioPath, weights);
+    const fontAvailable = fs.existsSync(CAPTION_FONT_PATH);
+    if (!fontAvailable) {
+      console.log(`[render:${jobId}] 자막 폰트를 못 찾음(${CAPTION_FONT_PATH}) — 이번 렌더링은 자막 없이 진행`);
+    }
 
     const outputPath = path.join(tmpDir, "output.mp4");
     const inputArgs = [];
@@ -136,7 +144,19 @@ async function runRender(jobId, images, audioUrl, outputKey, weights) {
     });
     if (audioPath) inputArgs.push("-i", audioPath);
 
-    const filterInputs = imagePaths.map((_, i) => `[${i}:v]scale=1280:720,setsar=1[v${i}]`).join(";");
+    // 이미지별로 자막을 drawtext로 직접 그려넣음 — text= 대신 textfile=을 써서 콜론/따옴표 등
+    // ffmpeg 필터 문법 특수문자 이스케이프 문제를 원천적으로 피함. 자막 없는 컷은 그냥 스킵.
+    const filterInputs = imagePaths.map((p, i) => {
+      let chain = `[${i}:v]scale=1280:720,setsar=1`;
+      const caption = fontAvailable && Array.isArray(captions) ? (captions[i] || "").trim() : "";
+      if (caption) {
+        const capFile = path.join(tmpDir, `cap-${i}.txt`);
+        fs.writeFileSync(capFile, caption, "utf8");
+        chain += `,drawtext=fontfile=${CAPTION_FONT_PATH}:textfile=${capFile}:fontsize=42:fontcolor=white:` +
+          `line_spacing=10:box=1:boxcolor=black@0.55:boxborderw=20:x=(w-text_w)/2:y=h-th-60`;
+      }
+      return `${chain}[v${i}]`;
+    }).join(";");
     const concatInputs = imagePaths.map((_, i) => `[v${i}]`).join("");
     const filterComplex = `${filterInputs};${concatInputs}concat=n=${imagePaths.length}:v=1:a=0[outv]`;
 
@@ -1376,6 +1396,7 @@ const server = http.createServer((req, res) => {
       const audioUrl = body.audioUrl || null;
       const outputKey = body.outputKey;
       const weights = Array.isArray(body.weights) ? body.weights.filter((w) => typeof w === "number") : null;
+      const captions = Array.isArray(body.captions) ? body.captions.map((c) => (typeof c === "string" ? c : "")) : null;
       if (!images.length || !outputKey) {
         res.writeHead(400, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: false, error: "images/outputKey 필요" }));
@@ -1383,7 +1404,7 @@ const server = http.createServer((req, res) => {
       }
       const jobId = crypto.randomUUID();
       renderJobs.set(jobId, { status: "processing", startedAt: Date.now() });
-      runRender(jobId, images, audioUrl, outputKey, weights); // 기다리지 않고 백그라운드 처리
+      runRender(jobId, images, audioUrl, outputKey, weights, captions); // 기다리지 않고 백그라운드 처리
       res.writeHead(202, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: true, jobId }));
     });
