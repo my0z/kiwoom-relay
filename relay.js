@@ -3,237 +3,10 @@ const https = require("https");
 const WebSocket = require("ws");
 const fs = require("fs");
 const path = require("path");
-const os = require("os");
-const crypto = require("crypto");
-const { spawn } = require("child_process");
-const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
 
 const PORT = process.env.PORT || 8787;
 const RELAY_SECRET = process.env.RELAY_SECRET;
 const KIWOOM_REAL_HOST = "api.kiwoom.com";
-
-// ---------- 영상 렌더링 (life.news용, ffmpeg 무료 대체) ----------
-// Shotstack/Rendobar 같은 외부 유료 렌더링 서비스 대신, 이미 상시 가동 중인 이 VM에서
-// ffmpeg로 이미지+음성을 mp4로 합성 -> R2에 직접 업로드. R2 버킷은 Worker와 동일한 걸 써서
-// Worker는 그냥 자기 R2 바인딩으로 읽기만 하면 됨(중계 다운로드 불필요).
-const R2_ACCOUNT_ID = process.env.R2_ACCOUNT_ID || "709dcc6af36c8ee7b6d3d99e7a9fe422";
-const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID;
-const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY;
-const R2_BUCKET = process.env.R2_BUCKET || "usbkr-videos";
-const RENDER_IMAGE_DURATION_SEC = 4;
-
-const r2Client = (R2_ACCESS_KEY_ID && R2_SECRET_ACCESS_KEY)
-  ? new S3Client({
-      region: "auto",
-      endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
-      credentials: { accessKeyId: R2_ACCESS_KEY_ID, secretAccessKey: R2_SECRET_ACCESS_KEY },
-    })
-  : null;
-
-// jobId -> { status: "processing"|"done"|"failed", error, r2Key, startedAt }
-const renderJobs = new Map();
-// 오래된 완료/실패 job은 메모리에서 주기적으로 정리 (30분 지나면 제거)
-setInterval(() => {
-  const cutoff = Date.now() - 30 * 60 * 1000;
-  for (const [id, job] of renderJobs) {
-    if (job.startedAt < cutoff && job.status !== "processing") renderJobs.delete(id);
-  }
-}, 5 * 60 * 1000);
-
-function downloadToFile(url, destPath) {
-  return new Promise((resolve, reject) => {
-    const file = fs.createWriteStream(destPath);
-    https.get(url, (res) => {
-      if (res.statusCode !== 200) {
-        file.close();
-        fs.unlink(destPath, () => {});
-        reject(new Error(`다운로드 실패 HTTP ${res.statusCode}: ${url}`));
-        return;
-      }
-      res.pipe(file);
-      file.on("finish", () => file.close(resolve));
-    }).on("error", (err) => {
-      file.close();
-      fs.unlink(destPath, () => {});
-      reject(err);
-    });
-  });
-}
-
-// onProgress(percent): ffmpeg 진행 상황을 stderr의 "time=" 라인에서 파싱해서 콜백으로 알림
-function runFfmpeg(args, totalDurationSec, onProgress) {
-  return new Promise((resolve, reject) => {
-    const proc = spawn("ffmpeg", args);
-    let stderr = "";
-    proc.stderr.on("data", (d) => {
-      const chunk = d.toString();
-      stderr += chunk;
-      if (onProgress && totalDurationSec > 0) {
-        const m = chunk.match(/time=(\d+):(\d+):(\d+\.\d+)/);
-        if (m) {
-          const elapsed = parseInt(m[1], 10) * 3600 + parseInt(m[2], 10) * 60 + parseFloat(m[3]);
-          const percent = Math.min(99, Math.round((elapsed / totalDurationSec) * 100));
-          onProgress(percent);
-        }
-      }
-    });
-    proc.on("error", (err) => reject(new Error(`ffmpeg 실행 실패: ${err.message}`)));
-    proc.on("close", (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`ffmpeg 종료코드 ${code}: ${stderr.slice(-800)}`));
-    });
-  });
-}
-
-// 오디오 파일의 실제 길이(초)를 ffprobe로 확인 — 이걸 알아야 이미지별 노출시간을 자막 비율대로 정확히 나눌 수 있음
-function getAudioDurationSec(audioPath) {
-  return new Promise((resolve, reject) => {
-    const proc = spawn("ffprobe", ["-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0", audioPath]);
-    let stdout = "";
-    let stderr = "";
-    proc.stdout.on("data", (d) => { stdout += d.toString(); });
-    proc.stderr.on("data", (d) => { stderr += d.toString(); });
-    proc.on("error", (err) => reject(new Error(`ffprobe 실행 실패: ${err.message}`)));
-    proc.on("close", (code) => {
-      const sec = parseFloat(stdout.trim());
-      if (code === 0 && Number.isFinite(sec) && sec > 0) resolve(sec);
-      else reject(new Error(`ffprobe 길이 확인 실패: ${stderr.slice(-300)}`));
-    });
-  });
-}
-
-// 이미지별 노출시간(초) 배열 계산 — weights(자막 글자수 비율)가 있으면 오디오 실길이에 비례 배분,
-// 없거나 개수가 안 맞으면 기존처럼 고정 길이(RENDER_IMAGE_DURATION_SEC)로 폴백
-async function computeImageDurations(imageCount, audioPath, weights) {
-  if (!audioPath) return Array(imageCount).fill(RENDER_IMAGE_DURATION_SEC);
-  let audioDuration;
-  try {
-    audioDuration = await getAudioDurationSec(audioPath);
-  } catch (e) {
-    console.log(`오디오 길이 확인 실패, 고정 길이로 폴백: ${e.message}`);
-    return Array(imageCount).fill(RENDER_IMAGE_DURATION_SEC);
-  }
-  if (!Array.isArray(weights) || weights.length !== imageCount) {
-    return Array(imageCount).fill(audioDuration / imageCount);
-  }
-  const sum = weights.reduce((a, b) => a + b, 0) || 1;
-  const MIN_SEC = 1.2; // 너무 짧은 컷은 어색하니 최소치는 보장
-  return weights.map((w) => Math.max(MIN_SEC, (w / sum) * audioDuration));
-}
-
-// 자막용 폰트 — Black Han Sans(굵고 임팩트 있어 자막/캡션에 흔히 쓰임)를 우선 찾고,
-// 없으면 Noto Sans CJK로 폴백. CAPTION_FONT_PATH 환경변수로 직접 지정하면 그게 최우선.
-function resolveCaptionFontPath() {
-  if (process.env.CAPTION_FONT_PATH && fs.existsSync(process.env.CAPTION_FONT_PATH)) {
-    return process.env.CAPTION_FONT_PATH;
-  }
-  const candidates = [
-    "/usr/local/share/fonts/BlackHanSans-Regular.ttf",
-    "/usr/share/fonts/truetype/custom/BlackHanSans-Regular.ttf",
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-  ];
-  return candidates.find((p) => fs.existsSync(p)) || candidates[candidates.length - 1];
-}
-const CAPTION_FONT_PATH = resolveCaptionFontPath();
-
-async function runRender(jobId, images, audioUrl, outputKey, weights, captions) {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), `render-${jobId}-`));
-  const setProgress = (stage, percent) => {
-    const prev = renderJobs.get(jobId) || {};
-    renderJobs.set(jobId, { ...prev, status: "processing", stage, percent, startedAt: prev.startedAt || Date.now() });
-  };
-  try {
-    if (!r2Client) throw new Error("R2_ACCESS_KEY_ID/R2_SECRET_ACCESS_KEY 환경변수 없음");
-    if (!images.length) throw new Error("이미지가 없음");
-
-    setProgress("이미지 다운로드 중", 5);
-    const imagePaths = [];
-    for (let i = 0; i < images.length; i++) {
-      const dest = path.join(tmpDir, `img-${i}.jpg`);
-      await downloadToFile(images[i], dest);
-      imagePaths.push(dest);
-      setProgress("이미지 다운로드 중", 5 + Math.round((i + 1) / images.length * 15)); // 5~20%
-    }
-    let audioPath = null;
-    if (audioUrl) {
-      setProgress("음성 다운로드 중", 22);
-      audioPath = path.join(tmpDir, "narration.mp3");
-      await downloadToFile(audioUrl, audioPath);
-    }
-
-    setProgress("영상 길이 계산 중", 25);
-    const durations = await computeImageDurations(imagePaths.length, audioPath, weights);
-    const totalDurationSec = durations.reduce((a, b) => a + b, 0);
-    const fontAvailable = fs.existsSync(CAPTION_FONT_PATH);
-    if (!fontAvailable) {
-      console.log(`[render:${jobId}] 자막 폰트를 못 찾음(${CAPTION_FONT_PATH}) — 이번 렌더링은 자막 없이 진행`);
-    }
-
-    const outputPath = path.join(tmpDir, "output.mp4");
-    const inputArgs = [];
-    imagePaths.forEach((p, i) => {
-      inputArgs.push("-loop", "1", "-t", String(durations[i].toFixed(2)), "-i", p);
-    });
-    if (audioPath) inputArgs.push("-i", audioPath);
-
-    // 이미지별로 자막을 drawtext로 직접 그려넣음 — text= 대신 textfile=을 써서 콜론/따옴표 등
-    // ffmpeg 필터 문법 특수문자 이스케이프 문제를 원천적으로 피함. 자막 없는 컷은 그냥 스킵.
-    const filterInputs = imagePaths.map((p, i) => {
-      let chain = `[${i}:v]scale=1280:720,setsar=1`;
-      const caption = fontAvailable && Array.isArray(captions) ? (captions[i] || "").trim() : "";
-      if (caption) {
-        const capFile = path.join(tmpDir, `cap-${i}.txt`);
-        fs.writeFileSync(capFile, caption, "utf8");
-        chain += `,drawtext=fontfile=${CAPTION_FONT_PATH}:textfile=${capFile}:fontsize=48:fontcolor=white:` +
-          `line_spacing=12:box=1:boxcolor=black@0.68:boxborderw=24:x=(w-text_w)/2:y=h-th-64`;
-      }
-      return `${chain}[v${i}]`;
-    }).join(";");
-    const concatInputs = imagePaths.map((_, i) => `[v${i}]`).join("");
-    const filterComplex = `${filterInputs};${concatInputs}concat=n=${imagePaths.length}:v=1:a=0[outv]`;
-
-    const outputArgs = audioPath
-      ? ["-map", "[outv]", "-map", `${imagePaths.length}:a`, "-c:a", "aac", "-shortest"]
-      : ["-map", "[outv]", "-an"];
-
-    setProgress("렌더링 중", 30);
-    await runFfmpeg([
-      "-y", ...inputArgs,
-      "-filter_complex", filterComplex,
-      ...outputArgs,
-      "-c:v", "libx264", "-pix_fmt", "yuv420p",
-      outputPath,
-    ], totalDurationSec, (ffmpegPercent) => {
-      // ffmpeg 자체 진행률(0~99)을 전체 진행률의 30~85% 구간에 매핑
-      setProgress("렌더링 중", 30 + Math.round((ffmpegPercent / 100) * 55));
-    });
-
-    setProgress("업로드 중", 90);
-    const videoBuffer = fs.readFileSync(outputPath);
-    await r2Client.send(new PutObjectCommand({
-      Bucket: R2_BUCKET,
-      Key: outputKey,
-      Body: videoBuffer,
-      ContentType: "video/mp4",
-    }));
-
-    renderJobs.set(jobId, { status: "done", stage: "완료", percent: 100, r2Key: outputKey, startedAt: renderJobs.get(jobId)?.startedAt || Date.now() });
-    console.log(`[render:${jobId}] 완료, R2 저장: ${outputKey}`);
-  } catch (e) {
-    renderJobs.set(jobId, { status: "failed", stage: "실패", percent: 0, error: e.message, startedAt: renderJobs.get(jobId)?.startedAt || Date.now() });
-    console.log(`[render:${jobId}] 실패: ${e.message}`);
-  } finally {
-    fs.rm(tmpDir, { recursive: true, force: true }, () => {});
-  }
-}
-
-// ---------- Keep-Alive 연결 재사용 ----------
-// 기존엔 https.request 호출마다(키움 TR, Worker 전송, REST 패스스루) 매번 새 TCP+TLS
-// 핸드셰이크를 맺었음. 장중엔 2~3초 간격으로 이런 호출이 반복되므로, 연결을 재사용하는
-// keep-alive Agent를 붙여서 핸드셰이크 비용을 없앰 (지연시간 절감의 핵심 최적화).
-const kiwoomAgent = new https.Agent({ keepAlive: true, maxSockets: 20, keepAliveMsecs: 30000 });
-const workerAgent = new https.Agent({ keepAlive: true, maxSockets: 10, keepAliveMsecs: 30000 });
-const naverAgent = new https.Agent({ keepAlive: true, maxSockets: 5, keepAliveMsecs: 30000 });
 
 // 웹소켓 실시간 시세용 (지수 등). 앱키/시크릿이 없으면 웹소켓 기능만 비활성화되고
 // 기존 REST 중계는 그대로 동작함 (하위호환 - 환경변수 추가 전에도 안 죽음)
@@ -340,7 +113,6 @@ function issueToken() {
         hostname: KIWOOM_REAL_HOST,
         path: "/oauth2/token",
         method: "POST",
-        agent: kiwoomAgent,
         headers: {
           "Content-Type": "application/json;charset=UTF-8",
           "Content-Length": Buffer.byteLength(body),
@@ -406,7 +178,6 @@ function kiwoomRest(path, apiId, body, token) {
         hostname: KIWOOM_REAL_HOST,
         path: path,
         method: "POST",
-        agent: kiwoomAgent,
         headers: {
           "Content-Type": "application/json;charset=UTF-8",
           authorization: "Bearer " + token,
@@ -556,7 +327,7 @@ function fetchNaverIndex(code) {
     https
       .get(
         `https://m.stock.naver.com/api/index/${encodeURIComponent(code)}/basic`,
-        { headers: { "User-Agent": "Mozilla/5.0" }, timeout: 8000, agent: naverAgent },
+        { headers: { "User-Agent": "Mozilla/5.0" }, timeout: 8000 },
         (res) => {
           let body = "";
           res.on("data", (c) => (body += c));
@@ -1089,7 +860,6 @@ function workerRequest(path, method, body) {
         hostname: url.hostname,
         path: url.pathname + url.search,
         method,
-        agent: workerAgent,
         headers: Object.assign(
           { "X-Admin-Key": ADMIN_KEY },
           data ? { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data) } : {}
@@ -1365,9 +1135,13 @@ async function runFinalSweep() {
       const q = realtimeCache.stock[item.code];
       if (!q || !q.price) continue;
       const pnlPct = ((q.price - item.entry_price) / item.entry_price) * 100;
-      if (pnlPct >= AUTO_TAKE_PROFIT_PNL_PCT || pnlPct <= AUTO_REMOVE_PNL_PCT) {
-        items.push({ code: item.code, pnlPct });
-      }
+      // 예전엔 이미 +3.5%/-1.5% 조건을 넘긴 것만 정리하고, 그 사이(예: +1.5%)에 있는 포지션은
+      // 그대로 밤새 들고 가게 뒀음. 다음날 개장 갭(장중 변동성과 무관하게 밤사이 뉴스·수급으로
+      // 시가 자체가 크게 튀는 현상)에 그대로 노출돼서, 09:01 개장 직후 -10%/-6%/-5% 같은 대형
+      // 손절이 무더기로 발생하는 원인이 됐음(-1.5% 손절 기준을 갭 하나로 몇 배씩 뚫어버림).
+      // 이 시스템 자체가 장중 데이트레이딩(±1.5%/+3.5% 타이트한 리스크) 전제라 밤을 넘기는 순간
+      // 그 전제가 깨지므로, 조건 충족 여부와 무관하게 남은 전량을 무조건 청산함.
+      items.push({ code: item.code, pnlPct });
     }
     const result = await workerRequest("/api/watchlist/final-sweep", "POST", { items });
     if (result.ok) {
@@ -1413,53 +1187,6 @@ const server = http.createServer((req, res) => {
   if (req.headers["x-relay-secret"] !== RELAY_SECRET) {
     res.writeHead(401, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: false, error: "relay secret mismatch" }));
-    return;
-  }
-
-  // 영상 렌더링 시작 - 이미지+음성 URL 받아서 백그라운드로 ffmpeg 렌더링, 즉시 202 응답
-  if (req.url === "/render" && req.method === "POST") {
-    const chunks = [];
-    req.on("data", (c) => chunks.push(c));
-    req.on("end", () => {
-      let body;
-      try {
-        body = JSON.parse(Buffer.concat(chunks).toString() || "{}");
-      } catch (e) {
-        res.writeHead(400, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: false, error: "invalid json" }));
-        return;
-      }
-      const images = Array.isArray(body.images) ? body.images : [];
-      const audioUrl = body.audioUrl || null;
-      const outputKey = body.outputKey;
-      const weights = Array.isArray(body.weights) ? body.weights.filter((w) => typeof w === "number") : null;
-      const captions = Array.isArray(body.captions) ? body.captions.map((c) => (typeof c === "string" ? c : "")) : null;
-      if (!images.length || !outputKey) {
-        res.writeHead(400, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: false, error: "images/outputKey 필요" }));
-        return;
-      }
-      const jobId = crypto.randomUUID();
-      renderJobs.set(jobId, { status: "processing", stage: "대기 중", percent: 0, startedAt: Date.now() });
-      runRender(jobId, images, audioUrl, outputKey, weights, captions); // 기다리지 않고 백그라운드 처리
-      res.writeHead(202, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ok: true, jobId }));
-    });
-    return;
-  }
-
-  // 영상 렌더링 상태 조회
-  if (req.url.startsWith("/render/status")) {
-    const q = new URL(req.url, "http://localhost").searchParams;
-    const jobId = q.get("jobId");
-    const job = jobId ? renderJobs.get(jobId) : null;
-    if (!job) {
-      res.writeHead(404, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ok: false, error: "job not found" }));
-      return;
-    }
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ ok: true, ...job }));
     return;
   }
 
@@ -1739,10 +1466,6 @@ const server = http.createServer((req, res) => {
         sseClientCount: sseClients.size,
         memoryRssMb: Math.round(mem.rss / 1024 / 1024),
         memoryHeapUsedMb: Math.round(mem.heapUsed / 1024 / 1024),
-        keepAliveSockets: {
-          kiwoom: Object.values(kiwoomAgent.sockets).reduce((s, a) => s + a.length, 0),
-          worker: Object.values(workerAgent.sockets).reduce((s, a) => s + a.length, 0),
-        },
       })
     );
     return;
@@ -1767,7 +1490,6 @@ const server = http.createServer((req, res) => {
         hostname: KIWOOM_REAL_HOST,
         path: req.url,
         method: req.method,
-        agent: kiwoomAgent,
         headers: forwardHeaders,
       },
       (upstreamRes) => {
