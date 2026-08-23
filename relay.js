@@ -1240,6 +1240,84 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // usb.kr(쿠팡 어필리에이트 사이트)용 쿠팡 상품페이지 스크래핑 릴레이.
+  // Cloudflare Workers 데이터센터 IP가 쿠팡 봇차단에 걸렸을 때, 이 VM의 다른 IP로 대신 요청해서 우회.
+  // 이 파일 최상단의 x-relay-secret 인증을 그대로 공유해서 씀(usb.kr worker.js도 같은 RELAY_SECRET을 헤더로 보냄).
+  if (req.url === "/scrape-coupang" && req.method === "POST") {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      let targetUrl;
+      try {
+        const parsed = JSON.parse(Buffer.concat(chunks).toString() || "{}");
+        targetUrl = parsed.url;
+      } catch (e) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "invalid json" }));
+        return;
+      }
+      if (!targetUrl || typeof targetUrl !== "string") {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "url 파라미터 필요" }));
+        return;
+      }
+      let parsedUrl;
+      try {
+        parsedUrl = new URL(targetUrl);
+      } catch (e) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "URL 형식이 올바르지 않음" }));
+        return;
+      }
+      if (!/(^|\.)coupang\.com$/i.test(parsedUrl.hostname)) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "coupang.com 도메인 URL만 지원함" }));
+        return;
+      }
+      const browserHeaders = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": "https://www.coupang.com/",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+      };
+      const upstreamReq = https.request(
+        {
+          hostname: parsedUrl.hostname,
+          path: parsedUrl.pathname + parsedUrl.search,
+          method: "GET",
+          headers: browserHeaders,
+          timeout: 12000,
+        },
+        (upstreamRes) => {
+          const bodyChunks = [];
+          upstreamRes.on("data", (c) => bodyChunks.push(c));
+          upstreamRes.on("end", () => {
+            const html = Buffer.concat(bodyChunks).toString("utf8");
+            if (upstreamRes.statusCode < 200 || upstreamRes.statusCode >= 300) {
+              res.writeHead(200, { "content-type": "application/json" });
+              res.end(JSON.stringify({ ok: false, error: `쿠팡 응답 HTTP ${upstreamRes.statusCode}` }));
+              return;
+            }
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: true, html }));
+          });
+        }
+      );
+      upstreamReq.on("timeout", () => upstreamReq.destroy(new Error("타임아웃")));
+      upstreamReq.on("error", (err) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "요청 실패: " + err.message }));
+      });
+      upstreamReq.end();
+    });
+    return;
+  }
+
   // 실시간 지수 조회 - 웹소켓으로 받아둔 최신값을 즉시 반환 (키움 TR 호출 없음)
   // 지수+종목시세+조건검색을 한 번에 반환 - Worker가 이전엔 3개 엔드포인트를 따로 호출했는데,
   // 다 relay 메모리에서 읽는 거라 굳이 나눌 이유가 없어서 하나로 합침 (Worker<->relay 왕복 3번 -> 1번)
