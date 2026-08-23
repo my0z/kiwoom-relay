@@ -837,10 +837,13 @@ setInterval(() => {
 connectWebSocket();
 
 // ---------- 관심종목 손절/익절 자동체크 (10초 주기) ----------
-// Worker의 2분 cron(checkWatchlistRiskLevels)보다 훨씬 빠르게 -1.5%/+1.5% 트리거.
+// Worker의 2분 cron(checkWatchlistRiskLevels)보다 훨씬 빠르게 -2.5%/+3.5% 트리거.
 // relay는 이미 웹소켓으로 실시간가를 들고 있으므로 키움 TR 호출 없이 즉시 계산 가능.
-const AUTO_REMOVE_PNL_PCT = -1.5; // 손절
-const AUTO_TAKE_PROFIT_PNL_PCT = 3.5; // 익절
+const AUTO_REMOVE_PNL_PCT = -2.5; // 손절 (2026-08-21 외부 분석 근거로 -1.5%->-2.5% 확대: +3.5%/-1.5% 장벽에서
+// 드리프트 0인 무작위 워크라도 손절이 먼저 맞을 확률이 1.5/(3.5+1.5)=70%로 구조적으로 손절 우위였음.
+// -2.5%로 넓히면 41.7%로 개선됨. 급등주 장중 변동성(±1.5% 스윙이 몇 분 안에 발생)이 예전 손절폭
+// 안에 있어서 노이즈에 잦게 걸렸던 문제도 같이 완화됨.
+const AUTO_TAKE_PROFIT_PNL_PCT = 3.5; // 익절 (고정값 - 트레일링스톱이 실질적 익절 로직을 보완함)
 
 // 15:50 이후 자동매매(익절/손절) 중지 - Worker도 동일 기준으로 403 처리하지만
 // relay 쪽에서 먼저 걸러서 불필요한 요청/로그 방지.
@@ -1088,22 +1091,43 @@ setInterval(() => {
   }
 }, 30000);
 
+const TRAIL_ACTIVATE_PCT = 2.0; // 이 손익률에 한 번이라도 도달하면 트레일링 스톱 활성화
+const TRAIL_DISTANCE_PCT = 1.5; // 활성화 후 고점 대비 이만큼 밀리면 조기 청산
+const positionPeaks = new Map(); // code -> 그 포지션이 지금까지 도달한 최고 손익률 (relay가 상주 프로세스라 메모리로 충분 - 재시작되면 초기화되지만 큰 문제 없음, 다음 상승에서 다시 쌓임)
+
 async function checkWatchlistStopLoss() {
   if (!ADMIN_KEY) return; // 키 미설정이면 조용히 스킵 (fail closed)
   if (!isTradingActiveKST()) return; // 15:50 이후 자동매매 중지
   try {
     const items = await getWatchlistEntriesCached();
     if (!items.length) return;
+    const stillHeldCodes = new Set(items.map((it) => it.code));
+    for (const code of positionPeaks.keys()) {
+      if (!stillHeldCodes.has(code)) positionPeaks.delete(code); // 이미 청산된 종목은 추적 그만(메모리 누수 방지)
+    }
     for (const item of items) {
       const q = realtimeCache.stock[item.code];
       if (!q || !q.price) continue; // 아직 실시간가 미수신 - 다음 틱에 재시도
       const pnlPct = ((q.price - item.entry_price) / item.entry_price) * 100;
-      if (pnlPct <= AUTO_REMOVE_PNL_PCT || pnlPct >= AUTO_TAKE_PROFIT_PNL_PCT) {
-        const reason = pnlPct >= AUTO_TAKE_PROFIT_PNL_PCT ? "익절" : "손절";
+
+      const prevPeak = positionPeaks.get(item.code) || 0;
+      const peak = Math.max(prevPeak, pnlPct);
+      if (peak !== prevPeak) positionPeaks.set(item.code, peak);
+      // 고정 +3.5% 익절선은 승률 35% 안팎 전략에서 드문 대승(오른쪽 꼬리)이 전체 기대값을
+      // 만들어야 하는데 그 꼬리를 정확히 잘라내는 문제가 있었음(외부 분석: +3.9%, +4.6%로
+      // 오버슈트하며 청산된 사례 확인). +2% 한 번이라도 도달하면 활성화되고, 그 뒤로 고점 대비
+      // -1.5% 밀리면(최소 +0.5%는 확정 확보한 채로) 조기 확정 - 계속 오르면 익절선(+3.5%)까지 안
+      // 잘리고 그대로 따라감.
+      const trailingHit = peak >= TRAIL_ACTIVATE_PCT && pnlPct <= peak - TRAIL_DISTANCE_PCT;
+
+      if (pnlPct <= AUTO_REMOVE_PNL_PCT || pnlPct >= AUTO_TAKE_PROFIT_PNL_PCT || trailingHit) {
+        const reason = pnlPct >= 0 ? "익절" : "손절"; // trailingHit도 peak>=2%였으므로 pnlPct는 항상 +0.5% 이상 - 부호로 정확히 판정됨
         try {
           await workerRequest("/api/watchlist/auto-remove", "POST", { code: item.code, pnlPct, name: stockNameCache[item.code] });
           entriesCache.items = entriesCache.items.filter((x) => x.code !== item.code); // 즉시 캐시에서도 제거(중복삭제 요청 방지)
-          console.log(`${reason} 자동삭제: ${item.code} (${pnlPct.toFixed(2)}%)`);
+          positionPeaks.delete(item.code);
+          const tag = trailingHit ? reason + "(트레일링)" : reason;
+          console.log(`${tag} 자동삭제: ${item.code} (${pnlPct.toFixed(2)}%, 고점 ${peak.toFixed(2)}%)`);
         } catch (e) {
           console.log(`${reason} 자동삭제 요청 실패: ${item.code} - ${e.message}`);
         }
