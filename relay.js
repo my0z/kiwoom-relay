@@ -1269,6 +1269,7 @@ const server = http.createServer((req, res) => {
   // 진짜 크롬(Puppeteer)으로 페이지를 열어서 긁어옴 — Node.js의 raw https 요청은 TLS 지문이 브라우저와 달라 Akamai 차단에 걸렸음.
   // 브라우저 인스턴스는 프로세스 내내 재사용(매번 새로 띄우면 느리고 무거움), 요청마다 새 탭만 열고 닫음.
   if (req.url === "/scrape-coupang" && req.method === "POST") {
+    console.log(`[쿠팡스크래핑] POST /scrape-coupang 요청 도착`);
     const chunks = [];
     req.on("data", (c) => chunks.push(c));
     req.on("end", async () => {
@@ -1299,24 +1300,33 @@ const server = http.createServer((req, res) => {
         res.end(JSON.stringify({ ok: false, error: "coupang.com 도메인 URL만 지원함" }));
         return;
       }
+      console.log(`[쿠팡스크래핑] 요청 받음: ${targetUrl}`);
       let page = null;
       try {
+        console.log(`[쿠팡스크래핑] 브라우저 인스턴스 확보 중...`);
         const browser = await getBrowserInstance();
+        console.log(`[쿠팡스크래핑] 브라우저 확보됨, 새 탭 열기`);
         page = await browser.newPage();
         await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36");
         await page.setViewport({ width: 1280, height: 900 });
         await page.setExtraHTTPHeaders({ "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7" });
+        console.log(`[쿠팡스크래핑] 페이지 이동 시작: ${targetUrl}`);
         const response = await page.goto(targetUrl, { waitUntil: "networkidle2", timeout: 25000 });
         const statusCode = response ? response.status() : 0;
+        console.log(`[쿠팡스크래핑] 응답 받음: HTTP ${statusCode}`);
         if (statusCode && (statusCode < 200 || statusCode >= 400)) {
+          console.log(`[쿠팡스크래핑] 실패 - HTTP ${statusCode}`);
           res.writeHead(200, { "content-type": "application/json" });
           res.end(JSON.stringify({ ok: false, error: `쿠팡 응답 HTTP ${statusCode}` }));
           return;
         }
         const html = await page.content();
+        const hasOgTitle = /property=["']og:title["']/.test(html);
+        console.log(`[쿠팡스크래핑] 성공 - html길이=${html.length}, og:title있음=${hasOgTitle}`);
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: true, html }));
       } catch (e) {
+        console.log(`[쿠팡스크래핑] 예외 발생: ${e.message}`);
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: false, error: "요청 실패(puppeteer): " + e.message }));
       } finally {
