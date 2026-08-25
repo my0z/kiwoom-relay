@@ -1323,6 +1323,10 @@ const server = http.createServer((req, res) => {
         const html = await page.content();
         const hasOgTitle = /property=["']og:title["']/.test(html);
         console.log(`[쿠팡스크래핑] 성공 - html길이=${html.length}, og:title있음=${hasOgTitle}`);
+        if (!hasOgTitle) {
+          const titleMatch = html.match(/<title[^>]*>([^<]*)<\/title>/i);
+          console.log(`[쿠팡스크래핑] 진단 - <title>=${titleMatch ? titleMatch[1] : "없음"}, snippet="${html.replace(/\s+/g, " ").slice(0, 400)}"`);
+        }
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: true, html }));
       } catch (e) {
