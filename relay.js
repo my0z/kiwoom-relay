@@ -3,6 +3,7 @@ const https = require("https");
 const WebSocket = require("ws");
 const fs = require("fs");
 const path = require("path");
+const puppeteer = require("puppeteer");
 
 const PORT = process.env.PORT || 8787;
 const RELAY_SECRET = process.env.RELAY_SECRET;
@@ -13,6 +14,30 @@ const KIWOOM_REAL_HOST = "api.kiwoom.com";
 const APP_KEY = process.env.KIWOOM_APP_KEY_REAL;
 const APP_SECRET = process.env.KIWOOM_APP_SECRET_REAL;
 const WS_URL = "wss://api.kiwoom.com:10000/api/dostk/websocket";
+
+// 쿠팡 스크래핑용 크롬 인스턴스 — 요청마다 새로 띄우면 느리고 무거우니 프로세스 내내 하나 재사용, 탭만 매번 새로 열고 닫음.
+let _browserInstance = null;
+let _browserLaunching = null;
+async function getBrowserInstance() {
+  if (_browserInstance && _browserInstance.connected) return _browserInstance;
+  if (_browserLaunching) return _browserLaunching; // 동시에 여러 요청 들어와도 launch는 한 번만
+  _browserLaunching = puppeteer.launch({
+    headless: "new",
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage", // /dev/shm이 작은 소형 VM에서 크롬이 죽는 것 방지
+      "--disable-gpu",
+      "--single-process" // 메모리 작은 VM(1GB대)에서 도움됨, 대신 크래시 시 전체가 같이 죽을 수 있음
+    ]
+  }).then((b) => {
+    _browserInstance = b;
+    _browserLaunching = null;
+    b.on("disconnected", () => { _browserInstance = null; }); // 죽으면 다음 요청에서 자동 재시작
+    return b;
+  });
+  return _browserLaunching;
+}
 
 if (!RELAY_SECRET) {
   console.error("RELAY_SECRET 환경변수가 없습니다.");
@@ -1241,12 +1266,12 @@ const server = http.createServer((req, res) => {
   }
 
   // usb.kr(쿠팡 어필리에이트 사이트)용 쿠팡 상품페이지 스크래핑 릴레이.
-  // Cloudflare Workers 데이터센터 IP가 쿠팡 봇차단에 걸렸을 때, 이 VM의 다른 IP로 대신 요청해서 우회.
-  // 이 파일 최상단의 x-relay-secret 인증을 그대로 공유해서 씀(usb.kr worker.js도 같은 RELAY_SECRET을 헤더로 보냄).
+  // 진짜 크롬(Puppeteer)으로 페이지를 열어서 긁어옴 — Node.js의 raw https 요청은 TLS 지문이 브라우저와 달라 Akamai 차단에 걸렸음.
+  // 브라우저 인스턴스는 프로세스 내내 재사용(매번 새로 띄우면 느리고 무거움), 요청마다 새 탭만 열고 닫음.
   if (req.url === "/scrape-coupang" && req.method === "POST") {
     const chunks = [];
     req.on("data", (c) => chunks.push(c));
-    req.on("end", () => {
+    req.on("end", async () => {
       let targetUrl;
       try {
         const parsed = JSON.parse(Buffer.concat(chunks).toString() || "{}");
@@ -1274,46 +1299,29 @@ const server = http.createServer((req, res) => {
         res.end(JSON.stringify({ ok: false, error: "coupang.com 도메인 URL만 지원함" }));
         return;
       }
-      const browserHeaders = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Referer": "https://www.coupang.com/",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "same-origin",
-        "Sec-Fetch-User": "?1",
-        "Upgrade-Insecure-Requests": "1",
-      };
-      const upstreamReq = https.request(
-        {
-          hostname: parsedUrl.hostname,
-          path: parsedUrl.pathname + parsedUrl.search,
-          method: "GET",
-          headers: browserHeaders,
-          timeout: 12000,
-        },
-        (upstreamRes) => {
-          const bodyChunks = [];
-          upstreamRes.on("data", (c) => bodyChunks.push(c));
-          upstreamRes.on("end", () => {
-            const html = Buffer.concat(bodyChunks).toString("utf8");
-            if (upstreamRes.statusCode < 200 || upstreamRes.statusCode >= 300) {
-              res.writeHead(200, { "content-type": "application/json" });
-              res.end(JSON.stringify({ ok: false, error: `쿠팡 응답 HTTP ${upstreamRes.statusCode}` }));
-              return;
-            }
-            res.writeHead(200, { "content-type": "application/json" });
-            res.end(JSON.stringify({ ok: true, html }));
-          });
+      let page = null;
+      try {
+        const browser = await getBrowserInstance();
+        page = await browser.newPage();
+        await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36");
+        await page.setViewport({ width: 1280, height: 900 });
+        await page.setExtraHTTPHeaders({ "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7" });
+        const response = await page.goto(targetUrl, { waitUntil: "networkidle2", timeout: 25000 });
+        const statusCode = response ? response.status() : 0;
+        if (statusCode && (statusCode < 200 || statusCode >= 400)) {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: `쿠팡 응답 HTTP ${statusCode}` }));
+          return;
         }
-      );
-      upstreamReq.on("timeout", () => upstreamReq.destroy(new Error("타임아웃")));
-      upstreamReq.on("error", (err) => {
+        const html = await page.content();
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: false, error: "요청 실패: " + err.message }));
-      });
-      upstreamReq.end();
+        res.end(JSON.stringify({ ok: true, html }));
+      } catch (e) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "요청 실패(puppeteer): " + e.message }));
+      } finally {
+        if (page) { try { await page.close(); } catch (e) {} }
+      }
     });
     return;
   }
