@@ -3,7 +3,9 @@ const https = require("https");
 const WebSocket = require("ws");
 const fs = require("fs");
 const path = require("path");
-const puppeteer = require("puppeteer");
+const puppeteer = require("puppeteer-extra");
+const StealthPlugin = require("puppeteer-extra-plugin-stealth");
+puppeteer.use(StealthPlugin());
 
 const PORT = process.env.PORT || 8787;
 const RELAY_SECRET = process.env.RELAY_SECRET;
