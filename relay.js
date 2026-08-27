@@ -3,9 +3,6 @@ const https = require("https");
 const WebSocket = require("ws");
 const fs = require("fs");
 const path = require("path");
-const puppeteer = require("puppeteer-extra");
-const StealthPlugin = require("puppeteer-extra-plugin-stealth");
-puppeteer.use(StealthPlugin());
 
 const PORT = process.env.PORT || 8787;
 const RELAY_SECRET = process.env.RELAY_SECRET;
@@ -16,30 +13,6 @@ const KIWOOM_REAL_HOST = "api.kiwoom.com";
 const APP_KEY = process.env.KIWOOM_APP_KEY_REAL;
 const APP_SECRET = process.env.KIWOOM_APP_SECRET_REAL;
 const WS_URL = "wss://api.kiwoom.com:10000/api/dostk/websocket";
-
-// 쿠팡 스크래핑용 크롬 인스턴스 — 요청마다 새로 띄우면 느리고 무거우니 프로세스 내내 하나 재사용, 탭만 매번 새로 열고 닫음.
-let _browserInstance = null;
-let _browserLaunching = null;
-async function getBrowserInstance() {
-  if (_browserInstance && _browserInstance.connected) return _browserInstance;
-  if (_browserLaunching) return _browserLaunching; // 동시에 여러 요청 들어와도 launch는 한 번만
-  _browserLaunching = puppeteer.launch({
-    headless: "new",
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage", // /dev/shm이 작은 소형 VM에서 크롬이 죽는 것 방지
-      "--disable-gpu",
-      "--single-process" // 메모리 작은 VM(1GB대)에서 도움됨, 대신 크래시 시 전체가 같이 죽을 수 있음
-    ]
-  }).then((b) => {
-    _browserInstance = b;
-    _browserLaunching = null;
-    b.on("disconnected", () => { _browserInstance = null; }); // 죽으면 다음 요청에서 자동 재시작
-    return b;
-  });
-  return _browserLaunching;
-}
 
 if (!RELAY_SECRET) {
   console.error("RELAY_SECRET 환경변수가 없습니다.");
@@ -120,6 +93,7 @@ let wsConnected = false;
 let wsLoggedIn = false;
 let wsReconnectDelay = 5000; // 재연결 대기 (실패 누적 시 늘어남, 최대 60초)
 let wsLastMessageAt = 0;
+let wsLastGroup9MessageAt = 0; // 그룹9(0D 호가잔량) 전용 최근 수신시각 - 전체 트래픽은 정상인데 이것만 죽는 부분장애 감지용
 let wsLoginAt = 0; // 로그인 완료 시각 - 직후 구독 요청이 몰리는 것을 막는 데 씀
 
 function parseSignedNumber(v) {
@@ -605,6 +579,7 @@ function handleRealtimeMessage(msg) {
         sellReqThinning = prev.selReq > 0 && selReq / prev.selReq <= 0.5;
       }
       prevOrderFlowCache[code] = { buyReq, selReq };
+      wsLastGroup9MessageAt = Date.now(); // 그룹9(0D) 전용 최근 수신시각 - 아래 부분장애 감지에서 씀
       const existing2 = realtimeCache.stock[code] || {};
       realtimeCache.stock[code] = {
         ...existing2,
@@ -662,6 +637,13 @@ function handleRealtimeMessage(msg) {
 
 function registerSubscriptions() {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+  // 재연결마다 그룹9(조건검색 실시간포착 호가잔량 0D) 상태를 리셋 - 웹소켓이 새로 열리면 키움 서버
+  // 쪽 REG 상태도 전부 초기화되는데, group9LastCodes(diff 비교용 캐시)는 relay 프로세스 메모리에
+  // 그대로 남아있어서 "이미 등록했으니 다를 게 없다"고 착각하고 재등록을 건너뛰는 문제가 있었음.
+  // 그러면 재연결 이후 다음 자연 편입/이탈 이벤트가 올 때까지 0D 데이터가 전혀 안 들어와서,
+  // isTodayHigh 하드블록 필터(데이터 없으면 통과시키는 설계)가 그 사이 조용히 무력화됨.
+  group9LastCodes = [];
 
   // 요청을 한꺼번에 몰아 보내면 키움이 일부(특히 CNSRREQ)를 처리하지 못하는 현상이 있어,
   // 조건검색을 가장 먼저 보내고 나머지는 간격을 두고 순차 전송함.
@@ -821,6 +803,9 @@ async function connectWebSocket() {
 
       queueNameFetch(codes.slice(0, 40)); // 초기 목록도 이름을 미리 받아둠(초당1건이라 상위 일부만)
       console.log("조건검색 초기 종목:", codes.length + "종목 (seq=" + msg.seq + ")");
+      // 재연결 직후 이 시점에 바로 그룹9(호가잔량 0D) 재동기화를 걸어서, 다음 자연 편입/이탈
+      // 이벤트를 기다리지 않고 즉시 수급 데이터가 채워지게 함 (위 group9LastCodes 리셋과 짝)
+      scheduleGroup9Resync();
       return;
     }
 
@@ -858,6 +843,22 @@ setInterval(() => {
     try {
       ws.terminate();
     } catch (e) {}
+  }
+}, 60000);
+
+// 그룹9(호가잔량 0D) 부분장애 감지 - 조건검색에 종목이 있는데도 2분 넘게 0D 데이터가 전혀
+// 안 들어오면(REG가 서버 쪽에서 조용히 씹혔거나 등 웹소켓 자체는 멀쩡한 부분장애) 강제로
+// 재동기화. 전체 웹소켓을 끊는 것보다 가벼워서 우선 시도하고, 그래도 안 되면 위 3분 감지가
+// 결국 잡아냄. isTodayHigh 하드블록 필터가 이 데이터에 의존하므로 방치하면 안전장치가
+// 조용히 무력화된 채로 계속 돌게 됨.
+setInterval(() => {
+  if (!wsConnected || !isTradingActiveKST()) return;
+  if (!realtimeCache.condition.codes.length) return; // 조건에 걸린 종목 자체가 없으면 0D가 안 오는 게 정상
+  const silentFor = wsLastGroup9MessageAt ? Date.now() - wsLastGroup9MessageAt : Infinity;
+  if (silentFor > 2 * 60 * 1000) {
+    console.log("그룹9(호가잔량) 2분간 무응답 - 강제 재동기화");
+    group9LastCodes = []; // diff 캐시를 리셋해서 다음 resync가 반드시 REG를 다시 보내게 함
+    scheduleGroup9Resync();
   }
 }, 60000);
 
@@ -1267,81 +1268,6 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // usb.kr(쿠팡 어필리에이트 사이트)용 쿠팡 상품페이지 스크래핑 릴레이.
-  // 진짜 크롬(Puppeteer)으로 페이지를 열어서 긁어옴 — Node.js의 raw https 요청은 TLS 지문이 브라우저와 달라 Akamai 차단에 걸렸음.
-  // 브라우저 인스턴스는 프로세스 내내 재사용(매번 새로 띄우면 느리고 무거움), 요청마다 새 탭만 열고 닫음.
-  if (req.url === "/scrape-coupang" && req.method === "POST") {
-    console.log(`[쿠팡스크래핑] POST /scrape-coupang 요청 도착`);
-    const chunks = [];
-    req.on("data", (c) => chunks.push(c));
-    req.on("end", async () => {
-      let targetUrl;
-      try {
-        const parsed = JSON.parse(Buffer.concat(chunks).toString() || "{}");
-        targetUrl = parsed.url;
-      } catch (e) {
-        res.writeHead(400, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: false, error: "invalid json" }));
-        return;
-      }
-      if (!targetUrl || typeof targetUrl !== "string") {
-        res.writeHead(400, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: false, error: "url 파라미터 필요" }));
-        return;
-      }
-      let parsedUrl;
-      try {
-        parsedUrl = new URL(targetUrl);
-      } catch (e) {
-        res.writeHead(400, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: false, error: "URL 형식이 올바르지 않음" }));
-        return;
-      }
-      if (!/(^|\.)coupang\.com$/i.test(parsedUrl.hostname)) {
-        res.writeHead(400, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: false, error: "coupang.com 도메인 URL만 지원함" }));
-        return;
-      }
-      console.log(`[쿠팡스크래핑] 요청 받음: ${targetUrl}`);
-      let page = null;
-      try {
-        console.log(`[쿠팡스크래핑] 브라우저 인스턴스 확보 중...`);
-        const browser = await getBrowserInstance();
-        console.log(`[쿠팡스크래핑] 브라우저 확보됨, 새 탭 열기`);
-        page = await browser.newPage();
-        await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36");
-        await page.setViewport({ width: 1280, height: 900 });
-        await page.setExtraHTTPHeaders({ "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7" });
-        console.log(`[쿠팡스크래핑] 페이지 이동 시작: ${targetUrl}`);
-        const response = await page.goto(targetUrl, { waitUntil: "networkidle2", timeout: 25000 });
-        const statusCode = response ? response.status() : 0;
-        console.log(`[쿠팡스크래핑] 응답 받음: HTTP ${statusCode}`);
-        if (statusCode && (statusCode < 200 || statusCode >= 400)) {
-          console.log(`[쿠팡스크래핑] 실패 - HTTP ${statusCode}`);
-          res.writeHead(200, { "content-type": "application/json" });
-          res.end(JSON.stringify({ ok: false, error: `쿠팡 응답 HTTP ${statusCode}` }));
-          return;
-        }
-        const html = await page.content();
-        const hasOgTitle = /property=["']og:title["']/.test(html);
-        console.log(`[쿠팡스크래핑] 성공 - html길이=${html.length}, og:title있음=${hasOgTitle}`);
-        if (!hasOgTitle) {
-          const titleMatch = html.match(/<title[^>]*>([^<]*)<\/title>/i);
-          console.log(`[쿠팡스크래핑] 진단 - <title>=${titleMatch ? titleMatch[1] : "없음"}, snippet="${html.replace(/\s+/g, " ").slice(0, 400)}"`);
-        }
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: true, html }));
-      } catch (e) {
-        console.log(`[쿠팡스크래핑] 예외 발생: ${e.message}`);
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: false, error: "요청 실패(puppeteer): " + e.message }));
-      } finally {
-        if (page) { try { await page.close(); } catch (e) {} }
-      }
-    });
-    return;
-  }
-
   // 실시간 지수 조회 - 웹소켓으로 받아둔 최신값을 즉시 반환 (키움 TR 호출 없음)
   // 지수+종목시세+조건검색을 한 번에 반환 - Worker가 이전엔 3개 엔드포인트를 따로 호출했는데,
   // 다 relay 메모리에서 읽는 거라 굳이 나눌 이유가 없어서 하나로 합침 (Worker<->relay 왕복 3번 -> 1번)
@@ -1509,6 +1435,50 @@ const server = http.createServer((req, res) => {
         events: cond.events.slice(0, 20),
       })
     );
+    return;
+  }
+
+  // SNS 급등 조짐 판단용 - 네이버 종목토론방 게시글수 조회. 종목코드 6자리(영문 포함)만 받고
+  // 그 값을 finance.naver.com의 고정 URL 패턴에 끼워넣는 것 외에는 임의 URL을 받지 않음(오픈
+  // 프록시 방지). Cloudflare Worker에서 직접 네이버 페이지를 스크래핑하면 차단된 전례가 있어서
+  // (worker.js 상단 주석 참고) relay를 거쳐 우회함. 페이지 구조가 바뀔 수 있으므로 여러 패턴으로
+  // 방어적으로 파싱하고, 못 찾으면 null을 반환해 호출측이 조용히 건너뛰게 함.
+  if (req.url.startsWith("/proxy/naver-board")) {
+    const u = new URL(req.url, "http://localhost");
+    const code = u.searchParams.get("code");
+    if (!code || !/^[0-9A-Za-z]{6}$/.test(code)) {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: false, error: "code 형식 오류" }));
+      return;
+    }
+    https.get(
+      `https://finance.naver.com/item/board.naver?code=${code}`,
+      { headers: { "User-Agent": "Mozilla/5.0", Referer: "https://finance.naver.com/" }, timeout: 5000 },
+      (pageRes) => {
+        let body = "";
+        pageRes.on("data", (chunk) => { body += chunk; });
+        pageRes.on("end", () => {
+          // 페이지 구조가 자주 바뀌므로 여러 패턴을 순서대로 시도함:
+          // 1) "총 N건" 류의 텍스트
+          // 2) 페이지네이션의 최대 page= 번호 * 페이지당 20건(네이버 게시판 관례값)으로 근사
+          let totalPosts = null;
+          const totalMatch = body.match(/총\s*([\d,]+)\s*건/);
+          if (totalMatch) {
+            totalPosts = parseInt(totalMatch[1].replace(/,/g, ""), 10);
+          } else {
+            const pageNums = [...body.matchAll(/[?&]page=(\d+)/g)].map((m) => parseInt(m[1], 10));
+            if (pageNums.length) totalPosts = Math.max(...pageNums) * 20; // 근사치 - 상대적 증감 판단용이라 정밀할 필요 없음
+          }
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ ok: totalPosts !== null, totalPosts }));
+        });
+      }
+    ).on("error", (e) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: false, error: e.message }));
+    }).on("timeout", function () {
+      this.destroy();
+    });
     return;
   }
 
