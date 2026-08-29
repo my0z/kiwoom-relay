@@ -121,13 +121,15 @@ async function computeImageDurations(imageCount, audioPath, weights) {
   return weights.map((w) => Math.max(MIN_SEC, (w / sum) * audioDuration));
 }
 
-// 자막용 폰트 — Black Han Sans(굵고 임팩트 있어 자막/캡션에 흔히 쓰임)를 우선 찾고,
-// 없으면 Noto Sans CJK로 폴백. CAPTION_FONT_PATH 환경변수로 직접 지정하면 그게 최우선.
+// 자막용 폰트 — Do Hyeon(깔끔하고 두껍지 않은 고딕)을 우선 찾고, 없으면 Black Han Sans, 그다음 Noto Sans CJK로 폴백.
+// CAPTION_FONT_PATH 환경변수로 직접 지정하면 그게 최우선.
 function resolveCaptionFontPath() {
   if (process.env.CAPTION_FONT_PATH && fs.existsSync(process.env.CAPTION_FONT_PATH)) {
     return process.env.CAPTION_FONT_PATH;
   }
   const candidates = [
+    "/usr/local/share/fonts/DoHyeon-Regular.ttf",
+    "/usr/share/fonts/truetype/custom/DoHyeon-Regular.ttf",
     "/usr/local/share/fonts/BlackHanSans-Regular.ttf",
     "/usr/share/fonts/truetype/custom/BlackHanSans-Regular.ttf",
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
