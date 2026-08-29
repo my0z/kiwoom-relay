@@ -16,6 +16,10 @@ const KIWOOM_REAL_HOST = "api.kiwoom.com";
 // Shotstack/Rendobar 같은 외부 유료 렌더링 서비스 대신, 이미 상시 가동 중인 이 VM에서
 // ffmpeg로 이미지+음성을 mp4로 합성 -> R2에 직접 업로드. R2 버킷은 Worker와 동일한 걸 써서
 // Worker는 그냥 자기 R2 바인딩으로 읽기만 하면 됨(중계 다운로드 불필요).
+// 렌더링 큐: 한 번에 하나씩만 처리(VM 메모리가 빠듯해서 동시 여러 개 돌리면 다 같이 느려짐/멈춤).
+// 자막: 이미지별 "비트"(줄 단위) 배열을 drawtext로 시간대별로 그림, 사진 전환은 xfade 크로스페이드
+// (전환마다 밀리지 않도록 이미지별로 그때그때 보정), 컬러그레이딩(eq)·업스케일(lanczos)도 여기서 적용.
+// 음성 있으면 loudnorm으로 볼륨 정규화, 없으면 사인파 3개로 만든 자체 배경음악(저작권 문제 없음)을 대신 깖.
 const R2_ACCOUNT_ID = process.env.R2_ACCOUNT_ID || "709dcc6af36c8ee7b6d3d99e7a9fe422";
 const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID;
 const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY;
