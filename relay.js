@@ -40,6 +40,14 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000);
 
+// VM 메모리가 빠듯해서(kiwoomapi 실시간 릴레이랑 같이 씀) ffmpeg 렌더링을 동시에 여러 개 돌리면
+// 서로 자원을 다투다가 다 같이 느려지거나 멈춘 것처럼 보임 — 한 번에 하나씩만 순서대로 처리하는 큐.
+let renderQueue = Promise.resolve();
+function enqueueRender(task) {
+  renderQueue = renderQueue.then(task, task); // 앞 작업이 실패해도 큐는 계속 이어짐
+  return renderQueue;
+}
+
 function downloadToFile(url, destPath) {
   return new Promise((resolve, reject) => {
     const file = fs.createWriteStream(destPath);
@@ -1454,8 +1462,9 @@ const server = http.createServer((req, res) => {
         return;
       }
       const jobId = crypto.randomUUID();
-      renderJobs.set(jobId, { status: "processing", stage: "대기 중", percent: 0, startedAt: Date.now() });
-      runRender(jobId, images, audioUrl, outputKey, weights, captionBeats); // 기다리지 않고 백그라운드 처리
+      renderJobs.set(jobId, { status: "processing", stage: "대기열 대기 중", percent: 0, startedAt: Date.now() });
+      // 큐에 넣고 기다리지 않고 바로 응답 — 앞에 진행 중인 렌더링이 있으면 그거 끝나야 시작됨(VM 자원 보호)
+      enqueueRender(() => runRender(jobId, images, audioUrl, outputKey, weights, captionBeats));
       res.writeHead(202, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: true, jobId }));
     });
