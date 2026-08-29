@@ -207,7 +207,9 @@ async function runRender(jobId, images, audioUrl, outputKey, weights, captionBea
     // enable='between(t,시작,끝)'으로 시간대를 나눠서 그 이미지가 떠 있는 동안 순서대로 갈아끼움.
     // text= 대신 textfile=을 써서 콜론/따옴표 등 ffmpeg 필터 문법 특수문자 이스케이프 문제를 원천적으로 피함.
     const filterInputs = imagePaths.map((p, i) => {
-      let chain = `[${i}:v]scale=1280:720,setsar=1`;
+      // lanczos: 원본 해상도가 1280x720이랑 다를 때(Pixabay/Pexels/FLUX 다 제각각) 기본 리사이즈보다 훨씬 선명하게 나옴
+      // eq: 사진 톤을 살짝 또렷하고 생기있게 보정(과하지 않게) — 화질 좋아 보이는 효과의 8할은 이 정도 보정에서 나옴
+      let chain = `[${i}:v]scale=1280:720:flags=lanczos,setsar=1,eq=contrast=1.06:saturation=1.12:brightness=0.02:gamma=1.02`;
       const beats = fontAvailable && Array.isArray(captionBeats) ? (captionBeats[i] || []) : [];
       if (beats.length) {
         const sumWeight = beats.reduce((a, b) => a + (b.weight || 1), 0) || 1;
@@ -250,7 +252,9 @@ async function runRender(jobId, images, audioUrl, outputKey, weights, captionBea
 
     let outputArgs;
     if (audioPath) {
-      outputArgs = ["-map", "[outv]", "-map", `${imagePaths.length}:a`, "-c:a", "aac", "-shortest"];
+      // loudnorm: TTS 음원마다 볼륨이 들쭉날쭉할 수 있어서, 방송 표준 음량(-16 LUFS)으로 정규화
+      filterComplex += `;[${imagePaths.length}:a]loudnorm=I=-16:TP=-1.5:LRA=11[anorm]`;
+      outputArgs = ["-map", "[outv]", "-map", "[anorm]", "-c:a", "aac", "-shortest"];
     } else {
       // 음성이 없을 때는 무음 대신, 외부 음원 없이 ffmpeg 자체 신호(사인파 3개로 만든 화음 패드)를
       // 배경음악으로 깔아줌 — 저작권 걱정이 원천적으로 없고 외부 링크에 의존하지 않아 항상 안정적으로 동작함.
