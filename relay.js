@@ -184,11 +184,13 @@ async function runRender(jobId, images, audioUrl, outputKey, weights, captionBea
 
     setProgress("영상 길이 계산 중", 25);
     const durations = await computeImageDurations(imagePaths.length, audioPath, weights);
-    // 사진 전환마다 크로스페이드(xfade)를 넣으면 그만큼 전체 길이가 짧아지는데, 그대로 두면 음성이랑
-    // 길이가 안 맞아서 끝부분이 잘림 — 줄어들 시간을 미리 계산해서 마지막 이미지 길이에 보태줌(총 길이 보존).
+    // 전환(xfade)이 일어날 때마다 그 이미지 이후의 실제 화면 타이밍이 계획보다 조금씩 앞으로 당겨짐 —
+    // 마지막 이미지 하나에만 보정을 몰아주면 총 길이는 맞아도 중간 지점들은 계속 어긋난 채로 누적됨(끝으로
+    // 갈수록 자막이 빨라지는 원인). 전환이 걸리는 "매 이미지"(마지막 제외)에 그때그때 보정해야
+    // 중간에도 밀리지 않고 항상 정확히 맞음.
     const XFADE_DUR = 0.6; // 전환 길이(초) — 이미지 최소길이(1.5초)의 40% 캡에 걸려서 사실상 항상 이 값 그대로 적용됨
     if (durations.length > 1) {
-      durations[durations.length - 1] += (durations.length - 1) * XFADE_DUR;
+      for (let i = 0; i < durations.length - 1; i++) durations[i] += XFADE_DUR;
     }
     const totalDurationSec = durations.reduce((a, b) => a + b, 0);
     const fontAvailable = fs.existsSync(CAPTION_FONT_PATH);
@@ -260,11 +262,15 @@ async function runRender(jobId, images, audioUrl, outputKey, weights, captionBea
       // 배경음악으로 깔아줌 — 저작권 걱정이 원천적으로 없고 외부 링크에 의존하지 않아 항상 안정적으로 동작함.
       const bgmFreqs = [130.81, 164.81, 196.0]; // C3-E3-G3, 낮고 잔잔한 장3화음
       const bgmInputStart = imagePaths.length;
+      // totalDurationSec은 전환 보정 때문에 실제 최종 영상 길이보다 살짝 크게 잡혀있음 — 페이드아웃이
+      // 영상 끝나기 전에 끝나도록 실제 길이(전환으로 줄어드는 만큼 뺀 값) 기준으로 계산
+      const xfadeLoss = durations.length > 1 ? (durations.length - 1) * XFADE_DUR : 0;
+      const finalVideoLengthSec = totalDurationSec - xfadeLoss;
       bgmFreqs.forEach((f) => {
         inputArgs.push("-f", "lavfi", "-i", `sine=frequency=${f}:duration=${totalDurationSec.toFixed(2)}`);
       });
       const bgmMixInputs = bgmFreqs.map((_, i) => `[${bgmInputStart + i}:a]`).join("");
-      const fadeOutStart = Math.max(0, totalDurationSec - 2).toFixed(2);
+      const fadeOutStart = Math.max(0, finalVideoLengthSec - 2).toFixed(2);
       filterComplex += `;${bgmMixInputs}amix=inputs=${bgmFreqs.length}:duration=longest,volume=0.12,afade=t=in:d=2,afade=t=out:st=${fadeOutStart}:d=2[bgm]`;
       outputArgs = ["-map", "[outv]", "-map", "[bgm]", "-c:a", "aac", "-shortest"];
     }
