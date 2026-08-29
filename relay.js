@@ -184,6 +184,12 @@ async function runRender(jobId, images, audioUrl, outputKey, weights, captionBea
 
     setProgress("영상 길이 계산 중", 25);
     const durations = await computeImageDurations(imagePaths.length, audioPath, weights);
+    // 사진 전환마다 크로스페이드(xfade)를 넣으면 그만큼 전체 길이가 짧아지는데, 그대로 두면 음성이랑
+    // 길이가 안 맞아서 끝부분이 잘림 — 줄어들 시간을 미리 계산해서 마지막 이미지 길이에 보태줌(총 길이 보존).
+    const XFADE_DUR = 0.6; // 전환 길이(초) — 이미지 최소길이(1.5초)의 40% 캡에 걸려서 사실상 항상 이 값 그대로 적용됨
+    if (durations.length > 1) {
+      durations[durations.length - 1] += (durations.length - 1) * XFADE_DUR;
+    }
     const totalDurationSec = durations.reduce((a, b) => a + b, 0);
     const fontAvailable = fs.existsSync(CAPTION_FONT_PATH);
     if (!fontAvailable) {
@@ -222,12 +228,42 @@ async function runRender(jobId, images, audioUrl, outputKey, weights, captionBea
       }
       return `${chain}[v${i}]`;
     }).join(";");
-    const concatInputs = imagePaths.map((_, i) => `[v${i}]`).join("");
-    const filterComplex = `${filterInputs};${concatInputs}concat=n=${imagePaths.length}:v=1:a=0[outv]`;
+    const concatInputsJoined = imagePaths.map((_, i) => `[v${i}]`).join("");
+    // 하드컷 대신 xfade로 사진 전환마다 크로스페이드 — 이미지가 1장뿐이면 전환 자체가 없으니 concat 그대로 둠.
+    let filterComplex;
+    if (imagePaths.length <= 1) {
+      filterComplex = `${filterInputs};${concatInputsJoined}concat=n=${imagePaths.length}:v=1:a=0[outv]`;
+    } else {
+      let prevLabel = "v0";
+      let cumulative = durations[0];
+      const xfadeParts = [];
+      for (let i = 1; i < imagePaths.length; i++) {
+        const dur = Math.min(XFADE_DUR, durations[i - 1] * 0.4, durations[i] * 0.4);
+        const offset = Math.max(0, cumulative - dur);
+        const outLabel = i === imagePaths.length - 1 ? "outv" : `vx${i}`;
+        xfadeParts.push(`[${prevLabel}][v${i}]xfade=transition=fade:duration=${dur.toFixed(2)}:offset=${offset.toFixed(2)}[${outLabel}]`);
+        prevLabel = outLabel;
+        cumulative += durations[i] - dur;
+      }
+      filterComplex = `${filterInputs};${xfadeParts.join(";")}`;
+    }
 
-    const outputArgs = audioPath
-      ? ["-map", "[outv]", "-map", `${imagePaths.length}:a`, "-c:a", "aac", "-shortest"]
-      : ["-map", "[outv]", "-an"];
+    let outputArgs;
+    if (audioPath) {
+      outputArgs = ["-map", "[outv]", "-map", `${imagePaths.length}:a`, "-c:a", "aac", "-shortest"];
+    } else {
+      // 음성이 없을 때는 무음 대신, 외부 음원 없이 ffmpeg 자체 신호(사인파 3개로 만든 화음 패드)를
+      // 배경음악으로 깔아줌 — 저작권 걱정이 원천적으로 없고 외부 링크에 의존하지 않아 항상 안정적으로 동작함.
+      const bgmFreqs = [130.81, 164.81, 196.0]; // C3-E3-G3, 낮고 잔잔한 장3화음
+      const bgmInputStart = imagePaths.length;
+      bgmFreqs.forEach((f) => {
+        inputArgs.push("-f", "lavfi", "-i", `sine=frequency=${f}:duration=${totalDurationSec.toFixed(2)}`);
+      });
+      const bgmMixInputs = bgmFreqs.map((_, i) => `[${bgmInputStart + i}:a]`).join("");
+      const fadeOutStart = Math.max(0, totalDurationSec - 2).toFixed(2);
+      filterComplex += `;${bgmMixInputs}amix=inputs=${bgmFreqs.length}:duration=longest,volume=0.12,afade=t=in:d=2,afade=t=out:st=${fadeOutStart}:d=2[bgm]`;
+      outputArgs = ["-map", "[outv]", "-map", "[bgm]", "-c:a", "aac", "-shortest"];
+    }
 
     setProgress("렌더링 중", 30);
     await runFfmpeg([
