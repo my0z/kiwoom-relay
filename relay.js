@@ -113,20 +113,31 @@ function getAudioDurationSec(audioPath) {
 // 이미지별 노출시간(초) 배열 계산 — weights(자막 글자수 비율)가 있으면 오디오 실길이에 비례 배분,
 // 없거나 개수가 안 맞으면 기존처럼 고정 길이(RENDER_IMAGE_DURATION_SEC)로 폴백
 async function computeImageDurations(imageCount, audioPath, weights) {
-  if (!audioPath) return Array(imageCount).fill(RENDER_IMAGE_DURATION_SEC);
+  // 음성이 없어도 자막 분량(weights)에 비례해서 노출시간을 나눠줌 — 안 그러면 이미지당 고정 시간 안에
+  // 문장이 몇 개든 욱여넣게 돼서 자막이 순식간에 지나가버림.
+  const hasWeights = Array.isArray(weights) && weights.length === imageCount;
+  const sumWeights = hasWeights ? (weights.reduce((a, b) => a + b, 0) || 1) : 1;
+  const MIN_SEC = 1.5; // 너무 짧은 컷은 어색하니 최소치는 보장
+
+  if (!audioPath) {
+    const totalSec = imageCount * RENDER_IMAGE_DURATION_SEC; // 음성 없을 때 전체 길이 기준(이미지당 평균 4초어치)
+    if (!hasWeights) return Array(imageCount).fill(RENDER_IMAGE_DURATION_SEC);
+    return weights.map((w) => Math.max(MIN_SEC, (w / sumWeights) * totalSec));
+  }
+
   let audioDuration;
   try {
     audioDuration = await getAudioDurationSec(audioPath);
   } catch (e) {
     console.log(`오디오 길이 확인 실패, 고정 길이로 폴백: ${e.message}`);
-    return Array(imageCount).fill(RENDER_IMAGE_DURATION_SEC);
+    const totalSec = imageCount * RENDER_IMAGE_DURATION_SEC;
+    if (!hasWeights) return Array(imageCount).fill(RENDER_IMAGE_DURATION_SEC);
+    return weights.map((w) => Math.max(MIN_SEC, (w / sumWeights) * totalSec));
   }
-  if (!Array.isArray(weights) || weights.length !== imageCount) {
+  if (!hasWeights) {
     return Array(imageCount).fill(audioDuration / imageCount);
   }
-  const sum = weights.reduce((a, b) => a + b, 0) || 1;
-  const MIN_SEC = 1.2; // 너무 짧은 컷은 어색하니 최소치는 보장
-  return weights.map((w) => Math.max(MIN_SEC, (w / sum) * audioDuration));
+  return weights.map((w) => Math.max(MIN_SEC, (w / sumWeights) * audioDuration));
 }
 
 // 자막용 폰트 — Do Hyeon(깔끔하고 두껍지 않은 고딕)을 우선 찾고, 없으면 Black Han Sans, 그다음 Noto Sans CJK로 폴백.
