@@ -216,7 +216,7 @@ async function runRender(jobId, images, audioUrl, outputKey, weights, captionBea
           const capFile = path.join(tmpDir, `cap-${i}-${bi}.txt`);
           fs.writeFileSync(capFile, text, "utf8");
           chain += `,drawtext=fontfile=${CAPTION_FONT_PATH}:textfile=${capFile}:fontsize=60:fontcolor=white:` +
-            `borderw=8:bordercolor=black:box=0:line_spacing=12:x=(w-text_w)/2:y=h-th-14:` +
+            `borderw=8:bordercolor=black:box=0:line_spacing=12:x=(w-text_w)/2:y=h-th-80:` +
             `enable='between(t,${start.toFixed(2)},${end.toFixed(2)})'`;
         });
       }
