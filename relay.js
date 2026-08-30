@@ -199,24 +199,55 @@ function detectSilenceGaps(audioPath, noiseDb = -30, minDurSec = 0.12) {
 }
 
 // captionBeats(이미지별 자막 비트 배열)를 한 줄로 펼쳐서, 오디오 전체를 하나의 타임라인으로 보고 각 비트의
-// 실제 시작/끝 시각(초, 오디오 처음부터 기준)을 계산함. 글자수 비율 추정("문장이 쌓일수록 자막이 점점
-// 밀리는" 원인)과 달리, 문장 경계마다 실제 무음 위치로 다시 맞춰지기 때문에 오차가 문장 하나 분량으로만
-// 국한되고 영상 전체에 걸쳐 누적되지 않음. 감지된 무음 개수가 예상 문장 경계 개수와 정확히 안 맞으면(TTS가
-// 무음을 안 두는 경우 등) null을 반환해서 호출부가 기존 글자수 비율 추정으로 안전하게 되돌아가게 함.
-async function computeRealBeatTimeline(audioPath, audioDuration, captionBeatsPerImage) {
-  if (!audioPath || !Array.isArray(captionBeatsPerImage) || !captionBeatsPerImage.length) return null;
-  // 이미지마다 비트가 최소 1개는 있어야 이미지별 시작 시각을 앵커링할 수 있음 — 하나라도 비어있으면 폴백.
+// 실제 시작/끝 시각(초, 오디오 처음부터 기준)을 계산함.
+//
+// 동작 원리(경량 강제정렬): ① 글자수 비율로 각 문장 경계의 "예상 위치"를 먼저 계산 ② 실제 음성에서 찾은
+// 무음 구간들 중 예상 위치 근처(허용오차 안)에 있는 것을 그 경계의 실제 시각으로 앵커링 ③ 앵커가 잡힐
+// 때마다 이후 예상 위치들을 실제 진행 속도에 맞춰 다시 스케일링(추정 오차가 누적되기 전에 계속 교정됨)
+// ④ 무음이 안 잡힌 경계는 이웃 앵커 사이에서 비율 보간.
+//
+// 예전 구현은 "감지된 무음 개수 == 문장 경계 개수"가 정확히 일치할 때만 적용하고 아니면 통째로 포기했는데,
+// 실제 TTS는 쉼표에서도 쉬고(가짜 무음) 문장 사이를 붙여 읽기도 해서(무음 누락) 개수가 정확히 맞는 경우가
+// 드묾 — 사실상 거의 항상 폴백돼서 개선이 적용되지 않았음. 지금 방식은 개수가 안 맞아도 맞는 무음만 골라
+// 쓰므로 대부분의 영상에서 실제 앵커링이 동작함. 앵커를 하나도 못 찾은 경우에만 null(기존 추정 방식 폴백).
+async function computeRealBeatTimeline(audioPath, audioDuration, captionBeatsPerImage, imageWeights) {
+  if (!audioPath || !Number.isFinite(audioDuration) || audioDuration <= 0) return null;
+  if (!Array.isArray(captionBeatsPerImage) || !captionBeatsPerImage.length) return null;
+  // 이미지마다 비트가 최소 1개는 있어야 이미지별 노출시간을 실제 타임라인에서 얻을 수 있음 — 하나라도 비면 폴백.
   if (captionBeatsPerImage.some((beats) => !Array.isArray(beats) || !beats.length)) return null;
 
-  const flat = []; // { imgIndex, beatIndex, weight, isSentenceEnd } — 재생 순서 그대로 펼친 배열
+  // 이미지별 오디오 배분 비율 — Worker가 보낸 weights(글자수 기반, 합=1)를 쓰고, 없으면 균등 분배로 대체.
+  const n = captionBeatsPerImage.length;
+  const hasW = Array.isArray(imageWeights) && imageWeights.length === n && imageWeights.every((w) => Number.isFinite(w) && w > 0);
+  const rawW = hasW ? imageWeights : Array(n).fill(1 / n);
+  const sumW = rawW.reduce((a, b) => a + b, 0) || 1;
+  const wNorm = rawW.map((w) => w / sumW);
+
+  // 재생 순서 그대로 펼치면서, 글자수 비율 기반 "예상" 시작/끝 시각을 함께 계산.
+  // isSentenceEnd 플래그가 없는 옛 버전 Worker가 보낸 비트여도 동작하도록, 줄 텍스트가 문장부호로
+  // 끝나는지로 문장 경계를 추론하는 폴백을 둠(문장 마지막 줄에는 마침표/물음표 등이 남아있음).
+  const flat = []; // { imgIndex, beatIndex, weight, isSentenceEnd, estStart, estEnd }
+  let cursor = 0;
   captionBeatsPerImage.forEach((beats, imgIndex) => {
+    const imgDur = wNorm[imgIndex] * audioDuration;
+    const beatSum = beats.reduce((a, b) => a + (Math.max(Number(b.weight) || 0, 0.0001)), 0) || 1;
     beats.forEach((beat, beatIndex) => {
-      flat.push({ imgIndex, beatIndex, weight: Math.max(Number(beat.weight) || 0, 0.0001), isSentenceEnd: !!beat.isSentenceEnd });
+      const w = Math.max(Number(beat.weight) || 0, 0.0001);
+      const dur = (w / beatSum) * imgDur;
+      const text = (beat.text || "").trim();
+      const isEnd = beat.isSentenceEnd !== undefined ? !!beat.isSentenceEnd : /[.!?。！？…]["'」』)]?$/.test(text);
+      flat.push({ imgIndex, beatIndex, weight: w, isSentenceEnd: isEnd, estStart: cursor, estEnd: cursor + dur });
+      cursor += dur;
     });
   });
+  if (flat.length) flat[flat.length - 1].isSentenceEnd = true; // 마지막 비트는 무조건 마지막 문장의 끝
 
-  const expectedGapCount = flat.filter((b) => b.isSentenceEnd).length - 1; // 마지막 문장 뒤엔 쉼 필요없음
-  if (expectedGapCount <= 0) return null; // 문장이 1개뿐이면 추정이랑 차이가 없음 — 그냥 폴백
+  // 문장 경계 목록: "문장이 끝나는 비트" 뒤가 경계(마지막 문장 뒤는 파일 끝이라 경계 아님)
+  const boundaries = []; // { flatIdx, est } — est: 경계의 예상 시각(= 그 문장 마지막 비트의 예상 끝)
+  for (let i = 0; i < flat.length - 1; i++) {
+    if (flat[i].isSentenceEnd) boundaries.push({ flatIdx: i, est: flat[i].estEnd, real: null });
+  }
+  if (!boundaries.length) return null; // 문장이 1개뿐이면 추정이랑 차이가 없음 — 그냥 폴백
 
   let gaps;
   try {
@@ -224,43 +255,91 @@ async function computeRealBeatTimeline(audioPath, audioDuration, captionBeatsPer
   } catch (e) {
     return null;
   }
-  // 파일 시작/끝 0.2초 근처의 무음은 문장 사이 쉼이 아니라 파일 자체 여백일 가능성이 높아서 제외
-  const EDGE_MARGIN = 0.2;
-  const filtered = gaps
-    .filter((g) => g.start > EDGE_MARGIN && g.end < audioDuration - EDGE_MARGIN)
+  // 파일 시작/끝 여백의 무음은 문장 사이 쉼이 아니므로 제외. 너무 짧은 무음(쉼표 수준)은 후보에서 빼되,
+  // 문장 사이 쉼이 원래 짧은 TTS도 있어서 0.15초까지는 후보로 인정(스코어에서 긴 쉼을 우대해 구분).
+  const EDGE_MARGIN = 0.25;
+  const candidates = gaps
+    .map((g) => ({ start: g.start, end: g.end, dur: g.end - g.start }))
+    .filter((g) => g.dur >= 0.15 && g.start > EDGE_MARGIN && g.end < audioDuration - EDGE_MARGIN)
     .sort((a, b) => a.start - b.start);
+  if (!candidates.length) return null;
 
-  if (filtered.length !== expectedGapCount) return null; // 개수 안 맞으면 신뢰 못함 — 폴백
+  // 예상 위치 근처의 무음을 순서대로(단조증가) 앵커링. 앵커가 잡히면 남은 구간의 예상 위치를
+  // "실제 남은 시간 / 예상 남은 시간" 비율로 재스케일 — TTS가 추정보다 빨리/느리게 읽어도 계속 따라감.
+  let lastAnchorTime = 0;
+  let lastAnchorEst = 0;
+  let gapPtr = 0;
+  let anchoredCount = 0;
+  for (const b of boundaries) {
+    const remainReal = audioDuration - lastAnchorTime;
+    const remainEst = Math.max(0.001, audioDuration - lastAnchorEst);
+    const estAdj = lastAnchorTime + (b.est - lastAnchorEst) * (remainReal / remainEst);
+    // 허용오차: 마지막 앵커에서 멀수록 추정 오차가 커지므로 거리에 비례해 넓힘. TTS 말속도가 문장에 따라
+    // 추정보다 30~40%씩 다를 수 있어서 넉넉히 잡되(최소 1.2초), 쉼표급 짧은 무음(0.28초 미만)은 진짜
+    // 문장 쉼일 가능성이 낮으니 절반 오차 안에 있을 때만 인정 — 미끼에 낚이는 걸 막음.
+    const tol = Math.max(1.2, 0.35 * (estAdj - lastAnchorTime));
+    let best = null;
+    for (let gi = gapPtr; gi < candidates.length; gi++) {
+      const g = candidates[gi];
+      if (g.end <= lastAnchorTime + 0.15) { continue; }
+      if (g.end > estAdj + tol) break; // 후보는 시각순 정렬돼 있으니 더 볼 필요 없음
+      const gapTol = g.dur >= 0.28 ? tol : tol * 0.5;
+      if (Math.abs(g.end - estAdj) > gapTol) continue;
+      // 예상 위치에 가까울수록 + 무음이 길수록(진짜 문장 쉼일수록) 좋은 후보
+      const score = Math.abs(g.end - estAdj) - Math.min(g.dur, 0.6) * 0.5;
+      if (!best || score < best.score) best = { gi, g, score };
+    }
+    if (best) {
+      b.real = best.g.end; // 다음 문장 음성이 실제로 시작하는 순간에 자막이 바뀜(무음 동안은 이전 자막 유지)
+      gapPtr = best.gi + 1; // 단조증가 보장 — 이미 쓴 무음(과 그 이전 것)은 재사용 안 함
+      lastAnchorTime = b.real;
+      lastAnchorEst = b.est;
+      anchoredCount++;
+    }
+  }
+  if (!anchoredCount) return null; // 하나도 못 맞췄으면 무음 감지를 신뢰할 수 없음 — 폴백
 
-  // anchors: [0, gap0.end, gap1.end, ..., audioDuration] — 문장 s는 [anchors[s], anchors[s+1]) 구간을 씀.
-  // 무음 구간(gap.start~gap.end) 동안은 이전 문장 자막이 그대로 떠 있다가, 다음 문장 음성이 실제로
-  // 시작하는 gap.end 시점에 정확히 다음 자막으로 바뀜(빈 화면 없이, 미리 안 바뀌게).
-  const anchors = [0, ...filtered.map((g) => g.end), audioDuration];
+  // 앵커 못 잡은 경계는 이웃 앵커(없으면 파일 시작 0 / 끝 audioDuration) 사이에서 예상 비율로 보간
+  const points = [{ est: 0, real: 0 }, ...boundaries.filter((b) => b.real !== null).map((b) => ({ est: b.est, real: b.real })), { est: audioDuration, real: audioDuration }];
+  const mapEstToReal = (est) => {
+    for (let i = 1; i < points.length; i++) {
+      if (est <= points[i].est || i === points.length - 1) {
+        const a = points[i - 1];
+        const b = points[i];
+        const span = Math.max(0.001, b.est - a.est);
+        return a.real + ((est - a.est) / span) * (b.real - a.real);
+      }
+    }
+    return est;
+  };
+  boundaries.forEach((b) => { if (b.real === null) b.real = mapEstToReal(b.est); });
 
+  // 문장 단위로 실제 구간을 배정하고, 문장 안의 각 줄(비트)은 글자수 비율로 그 작은 구간만 나눔 —
+  // 남은 추정 오차는 문장 하나 길이 안으로만 국한되고 영상 전체에 누적되지 않음.
+  const segStarts = [0, ...boundaries.map((b) => b.real)];
+  const segEnds = [...boundaries.map((b) => b.real), audioDuration];
   const perImageBeatTimes = captionBeatsPerImage.map((beats) => new Array(beats.length));
   let sentenceStartFlatIdx = 0;
-  let anchorIdx = 0;
+  let segIdx = 0;
   for (let i = 0; i < flat.length; i++) {
     if (!flat[i].isSentenceEnd) continue;
     const sentenceBeats = flat.slice(sentenceStartFlatIdx, i + 1);
-    const segStart = anchors[anchorIdx];
-    const segEnd = anchors[anchorIdx + 1];
+    const segStart = segStarts[segIdx];
+    const segEnd = segEnds[segIdx];
     const segDur = Math.max(0.05, segEnd - segStart);
-    const sumW = sentenceBeats.reduce((a, b) => a + b.weight, 0) || 1;
+    const sw = sentenceBeats.reduce((a, b) => a + b.weight, 0) || 1;
     let t = segStart;
     sentenceBeats.forEach((b) => {
-      const dur = (b.weight / sumW) * segDur;
-      const start = t;
-      const end = t + dur;
-      t = end;
-      perImageBeatTimes[b.imgIndex][b.beatIndex] = { start, end };
+      const dur = (b.weight / sw) * segDur;
+      perImageBeatTimes[b.imgIndex][b.beatIndex] = { start: t, end: t + dur };
+      t += dur;
     });
     sentenceStartFlatIdx = i + 1;
-    anchorIdx++;
+    segIdx++;
   }
 
   const imageSpans = perImageBeatTimes.map((times) => ({ start: times[0].start, end: times[times.length - 1].end }));
-  return { perImageBeatTimes, imageSpans };
+  return { perImageBeatTimes, imageSpans, anchoredCount, boundaryCount: boundaries.length };
 }
 
 // 자막용 폰트 4종을 각각 개별로 찾아둠(예전엔 하나만 골라서 전체에 썼는데, 이제 영상마다 Worker가
@@ -346,12 +425,14 @@ async function runRender(jobId, images, audioUrl, outputKey, weights, captionBea
     let realTimeline = null;
     if (audioPath && audioDurationSec && Array.isArray(captionBeats)) {
       try {
-        realTimeline = await computeRealBeatTimeline(audioPath, audioDurationSec, captionBeats);
+        realTimeline = await computeRealBeatTimeline(audioPath, audioDurationSec, captionBeats, weights);
       } catch (e) {
         console.log(`[render:${jobId}] 실제 무음 구간 타이밍 계산 실패, 글자수 비율 추정으로 폴백: ${e.message}`);
         realTimeline = null;
       }
-      console.log(`[render:${jobId}] 자막 타이밍: ${realTimeline ? '실제 무음 구간 기준(정확)' : '글자수 비율 추정(폴백)'}`);
+      console.log(`[render:${jobId}] 자막 타이밍: ${realTimeline
+        ? `실제 무음 구간 앵커링(문장 경계 ${realTimeline.boundaryCount}개 중 ${realTimeline.anchoredCount}개 실측, 나머지 보간)`
+        : '글자수 비율 추정(폴백)'}`);
     }
     const durations = realTimeline
       ? realTimeline.imageSpans.map((span) => Math.max(0.3, span.end - span.start))
