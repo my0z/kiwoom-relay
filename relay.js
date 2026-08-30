@@ -114,6 +114,30 @@ function getAudioDurationSec(audioPath) {
   });
 }
 
+// 완성된 output.mp4에 실제로 재생 가능한 오디오 트랙이 들어갔는지 검증 — 나레이션이 있었는데(audioPath)
+// 다운로드가 미묘하게 깨졌거나 필터 그래프 문제로 최종 파일엔 오디오가 빠지는 경우를 잡아내기 위함.
+// 그냥 오디오 스트림 존재 여부만 보지 않고, duration이 0.5초 넘게 실제로 있는지까지 확인(빈 트랙 방지).
+function verifyOutputHasAudio(filePath) {
+  return new Promise((resolve) => {
+    const proc = spawn("ffprobe", [
+      "-v", "error",
+      "-select_streams", "a",
+      "-show_entries", "stream=codec_type,duration",
+      "-of", "csv=p=0",
+      filePath,
+    ]);
+    let stdout = "";
+    proc.stdout.on("data", (d) => { stdout += d.toString(); });
+    proc.on("error", () => resolve(false));
+    proc.on("close", () => {
+      const line = stdout.trim().split("\n")[0] || "";
+      const [codecType, durationRaw] = line.split(",");
+      const duration = parseFloat(durationRaw);
+      resolve(codecType === "audio" && Number.isFinite(duration) && duration > 0.5);
+    });
+  });
+}
+
 // 이미지별 노출시간(초) 배열 계산 — weights(자막 글자수 비율)가 있으면 오디오 실길이에 비례 배분,
 // 없거나 개수가 안 맞으면 기존처럼 고정 길이(RENDER_IMAGE_DURATION_SEC)로 폴백
 async function computeImageDurations(imageCount, audioPath, weights) {
@@ -328,6 +352,18 @@ async function runRender(jobId, images, audioUrl, outputKey, weights, captionBea
       // ffmpeg 자체 진행률(0~99)을 전체 진행률의 30~85% 구간에 매핑
       setProgress("렌더링 중", 30 + Math.round((ffmpegPercent / 100) * 55));
     });
+
+    // 나레이션이 있었는데(audioPath) 최종 mp4에 오디오 트랙이 실제로 없으면(다운로드 미묘한 손상,
+    // 필터그래프 문제 등) R2에 올리지 않고 여기서 바로 실패 처리 — 무음 영상이 조용히 발행되는 걸 막음.
+    // 에러 메시지에 NO_AUDIO_TRACK 마커를 붙여서 Worker(worker.js)가 이 실패를 일반 렌더링 실패와
+    // 구분해서 글 자체를 삭제하도록 함(finalizeRenderFailed 참고).
+    if (audioPath) {
+      setProgress("오디오 트랙 검증 중", 89);
+      const hasAudioTrack = await verifyOutputHasAudio(outputPath);
+      if (!hasAudioTrack) {
+        throw new Error("NO_AUDIO_TRACK: 최종 mp4에 오디오 트랙이 없음(나레이션 있었는데 누락됨)");
+      }
+    }
 
     setProgress("업로드 중", 90);
     const videoBuffer = fs.readFileSync(outputPath);
