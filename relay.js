@@ -144,46 +144,53 @@ async function computeImageDurations(imageCount, audioPath, weights) {
   return weights.map((w) => Math.max(MIN_SEC, (w / sumWeights) * audioDuration));
 }
 
-// 자막용 폰트 — Gowun Dodum(정갈하고 부드러운 느낌)을 우선 찾고, 없으면 Do Hyeon → Black Han Sans → Noto Sans CJK 순으로 폴백.
-// CAPTION_FONT_PATH 환경변수로 직접 지정하면 그게 최우선.
-function resolveCaptionFontPath() {
+// 자막용 폰트 4종을 각각 개별로 찾아둠(예전엔 하나만 골라서 전체에 썼는데, 이제 영상마다 Worker가
+// 정해준 폰트 키 하나로 고정해서 씀 — worker.js의 CAPTION_FONT_CHOICES와 key가 일치해야 함).
+// CAPTION_FONT_PATH 환경변수를 지정하면 모든 키가 그 폰트 하나로 강제됨(예전 동작 유지용 이스케이프 해치).
+function resolveFontPath(candidates) {
   if (process.env.CAPTION_FONT_PATH && fs.existsSync(process.env.CAPTION_FONT_PATH)) {
     return process.env.CAPTION_FONT_PATH;
   }
-  const candidates = [
+  return candidates.find((p) => fs.existsSync(p)) || null;
+}
+const CAPTION_FONT_PATHS = {
+  gowun: resolveFontPath([
     "/usr/local/share/fonts/GowunDodum-Regular.ttf",
     "/usr/share/fonts/truetype/custom/GowunDodum-Regular.ttf",
+  ]),
+  dohyeon: resolveFontPath([
     "/usr/local/share/fonts/DoHyeon-Regular.ttf",
     "/usr/share/fonts/truetype/custom/DoHyeon-Regular.ttf",
+  ]),
+  blackhan: resolveFontPath([
     "/usr/local/share/fonts/BlackHanSans-Regular.ttf",
     "/usr/share/fonts/truetype/custom/BlackHanSans-Regular.ttf",
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-  ];
-  return candidates.find((p) => fs.existsSync(p)) || candidates[candidates.length - 1];
-}
-const CAPTION_FONT_PATH = resolveCaptionFontPath();
-
-// 필기체(포인트용) — 없으면 그냥 기본 폰트로 자동 대체되니 설치 안 해도 에러는 안 남.
-function resolveCursiveFontPath() {
-  const candidates = [
+  ]),
+  nanumpen: resolveFontPath([
     "/usr/local/share/fonts/NanumPenScript-Regular.ttf",
     "/usr/share/fonts/truetype/custom/NanumPenScript-Regular.ttf",
-  ];
-  return candidates.find((p) => fs.existsSync(p)) || CAPTION_FONT_PATH;
+  ]),
+};
+// 요청받은 폰트 키가 이 VM에 실제로 설치돼있지 않으면(아직 다운로드 전 등) 있는 것 중 아무거나로 폴백 —
+// 폰트 없다고 자막 자체를 통째로 스킵하던 예전 방식보다 훨씬 덜 아쉬움.
+const FALLBACK_FONT_PATH =
+  CAPTION_FONT_PATHS.gowun || CAPTION_FONT_PATHS.dohyeon || CAPTION_FONT_PATHS.blackhan || CAPTION_FONT_PATHS.nanumpen ||
+  "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc";
+function resolveVideoFontPath(fontKey) {
+  return (fontKey && CAPTION_FONT_PATHS[fontKey]) || FALLBACK_FONT_PATH;
 }
-const CURSIVE_FONT_PATH = resolveCursiveFontPath();
 
-// 자막 스타일 5종 순환 — 위치/색/폰트/크기가 비트마다 바뀌면서 아기자기한 느낌을 줌.
+// 자막 "위치" 5종 순환 — 예전과 동일하게 유지. 폰트/색은 여기서 빠지고 영상 하나당 하나로 고정(runRender 인자로 받음).
 // styleIndex는 Worker(worker.js)가 계산해서 넘겨줌, 여기선 같은 인덱스 규칙으로 매칭만 함.
-const CAPTION_STYLES = [
-  { x: "(w-text_w)/2", y: "h-th-80", color: "0xFFFFFF", font: CAPTION_FONT_PATH, size: 60 },
-  { x: "(w-text_w)/2", y: "80", color: "0xFFD93D", font: CAPTION_FONT_PATH, size: 56 },
-  { x: "60", y: "h-th-90", color: "0xFF6FA5", font: CURSIVE_FONT_PATH, size: 66 },
-  { x: "w-text_w-60", y: "h-th-90", color: "0x4FC3F7", font: CAPTION_FONT_PATH, size: 62 },
-  { x: "(w-text_w)/2", y: "(h-th)/2", color: "0x6EE7B7", font: CURSIVE_FONT_PATH, size: 64 },
+const CAPTION_POSITIONS = [
+  { x: "(w-text_w)/2", y: "h-th-80", size: 60 },
+  { x: "(w-text_w)/2", y: "80", size: 56 },
+  { x: "60", y: "h-th-90", size: 66 },
+  { x: "w-text_w-60", y: "h-th-90", size: 62 },
+  { x: "(w-text_w)/2", y: "(h-th)/2", size: 64 },
 ];
 
-async function runRender(jobId, images, audioUrl, outputKey, weights, captionBeats) {
+async function runRender(jobId, images, audioUrl, outputKey, weights, captionBeats, captionFontKey, captionColor) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), `render-${jobId}-`));
   const setProgress = (stage, percent) => {
     const prev = renderJobs.get(jobId) || {};
@@ -219,10 +226,15 @@ async function runRender(jobId, images, audioUrl, outputKey, weights, captionBea
       for (let i = 0; i < durations.length - 1; i++) durations[i] += XFADE_DUR;
     }
     const totalDurationSec = durations.reduce((a, b) => a + b, 0);
-    const fontAvailable = fs.existsSync(CAPTION_FONT_PATH);
+    // 이 영상 전체에 쓸 폰트/색을 하나로 확정 — Worker가 골라서 넘겨준 값(위치만 비트마다 순환, 폰트·색은 고정).
+    const resolvedFontPath = resolveVideoFontPath(captionFontKey);
+    const fontAvailable = !!resolvedFontPath && fs.existsSync(resolvedFontPath);
     if (!fontAvailable) {
-      console.log(`[render:${jobId}] 자막 폰트를 못 찾음(${CAPTION_FONT_PATH}) — 이번 렌더링은 자막 없이 진행`);
+      console.log(`[render:${jobId}] 자막 폰트를 못 찾음(요청 키: ${captionFontKey}, 경로: ${resolvedFontPath}) — 이번 렌더링은 자막 없이 진행`);
     }
+    const captionColorFF = (typeof captionColor === "string" && /^#[0-9a-fA-F]{6}$/.test(captionColor))
+      ? captionColor.replace("#", "0x")
+      : "0xFFFFFF";
 
     const outputPath = path.join(tmpDir, "output.mp4");
     const inputArgs = [];
@@ -251,8 +263,8 @@ async function runRender(jobId, images, audioUrl, outputKey, weights, captionBea
           if (!text) return;
           const capFile = path.join(tmpDir, `cap-${i}-${bi}.txt`);
           fs.writeFileSync(capFile, text, "utf8");
-          const st = CAPTION_STYLES[(beat.styleIndex || 0) % CAPTION_STYLES.length];
-          chain += `,drawtext=fontfile=${st.font}:textfile=${capFile}:fontsize=${st.size}:fontcolor=${st.color}:` +
+          const st = CAPTION_POSITIONS[(beat.styleIndex || 0) % CAPTION_POSITIONS.length];
+          chain += `,drawtext=fontfile=${resolvedFontPath}:textfile=${capFile}:fontsize=${st.size}:fontcolor=${captionColorFF}:` +
             `borderw=8:bordercolor=black:box=0:line_spacing=12:x=${st.x}:y=${st.y}:` +
             `enable='between(t,${start.toFixed(2)},${end.toFixed(2)})'`;
         });
@@ -1542,6 +1554,9 @@ const server = http.createServer((req, res) => {
       const outputKey = body.outputKey;
       const weights = Array.isArray(body.weights) ? body.weights.filter((w) => typeof w === "number") : null;
       const captionBeats = Array.isArray(body.captionBeats) ? body.captionBeats : null;
+      // 이 영상 전체에 고정으로 쓸 자막 폰트 키/색 — Worker가 영상당 하나씩 랜덤으로 뽑아서 넘겨줌.
+      const captionFontKey = typeof body.captionFontKey === "string" ? body.captionFontKey : null;
+      const captionColor = typeof body.captionColor === "string" ? body.captionColor : null;
       if (!images.length || !outputKey) {
         res.writeHead(400, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: false, error: "images/outputKey 필요" }));
@@ -1550,7 +1565,7 @@ const server = http.createServer((req, res) => {
       const jobId = crypto.randomUUID();
       renderJobs.set(jobId, { status: "processing", stage: "대기열 대기 중", percent: 0, startedAt: Date.now() });
       // 큐에 넣고 기다리지 않고 바로 응답 — 앞에 진행 중인 렌더링이 있으면 그거 끝나야 시작됨(VM 자원 보호)
-      enqueueRender(() => runRender(jobId, images, audioUrl, outputKey, weights, captionBeats));
+      enqueueRender(() => runRender(jobId, images, audioUrl, outputKey, weights, captionBeats, captionFontKey, captionColor));
       res.writeHead(202, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: true, jobId }));
     });
