@@ -476,6 +476,23 @@ const CAPTION_FONT_PATHS = {
     "/usr/local/share/fonts/HiMelody-Regular.ttf",
     "/usr/share/fonts/truetype/custom/HiMelody-Regular.ttf",
   ]),
+  // [2026-08-30 22:02] 아기자기한 폰트 4종 추가(사용자 요청) — worker.js CAPTION_FONT_CHOICES와 키 일치, TTF는 VM 설치 필요
+  poorstory: resolveFontPath([
+    "/usr/local/share/fonts/PoorStory-Regular.ttf",
+    "/usr/share/fonts/truetype/custom/PoorStory-Regular.ttf",
+  ]),
+  gamjaflower: resolveFontPath([
+    "/usr/local/share/fonts/GamjaFlower-Regular.ttf",
+    "/usr/share/fonts/truetype/custom/GamjaFlower-Regular.ttf",
+  ]),
+  singleday: resolveFontPath([
+    "/usr/local/share/fonts/SingleDay-Regular.ttf",
+    "/usr/share/fonts/truetype/custom/SingleDay-Regular.ttf",
+  ]),
+  cutefont: resolveFontPath([
+    "/usr/local/share/fonts/CuteFont-Regular.ttf",
+    "/usr/share/fonts/truetype/custom/CuteFont-Regular.ttf",
+  ]),
 };
 // 요청받은 폰트 키가 이 VM에 실제로 설치돼있지 않으면(아직 다운로드 전 등) 있는 것 중 아무거나로 폴백 —
 // 폰트 없다고 자막 자체를 통째로 스킵하던 예전 방식보다 훨씬 덜 아쉬움.
