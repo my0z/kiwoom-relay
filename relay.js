@@ -12,7 +12,7 @@ const PORT = process.env.PORT || 8787;
 const RELAY_SECRET = process.env.RELAY_SECRET;
 const KIWOOM_REAL_HOST = "api.kiwoom.com";
 
-// ---------- 영상 렌더링 (life.news용, ffmpeg 무료 대체) — 작업: 2026-08-30 19:59 ----------
+// ---------- 영상 렌더링 (life.news용, ffmpeg 무료 대체) — 작업: 2026-08-30 20:13 ----------
 // Shotstack/Rendobar 같은 외부 유료 렌더링 서비스 대신, 이미 상시 가동 중인 이 VM에서
 // ffmpeg로 이미지+음성을 mp4로 합성 -> R2에 직접 업로드. R2 버킷은 Worker와 동일한 걸 써서
 // Worker는 그냥 자기 R2 바인딩으로 읽기만 하면 됨(중계 다운로드 불필요).
@@ -478,12 +478,13 @@ function resolveVideoFontPath(fontKey) {
 
 // 자막 "위치" 후보 5개 — 이제 비트마다 순환하지 않고, Worker(worker.js)가 영상 하나당 하나를 골라서
 // 모든 비트에 같은 styleIndex로 넣어 보냄(폰트/색과 동일하게 영상 전체 고정). 여기선 그 인덱스로 매칭만 함.
+// [2026-08-30 20:13] 자막 크기 2/3로 축소(사용자 요청): 60/56/66/62/64 → 40/37/44/41/43
 const CAPTION_POSITIONS = [
-  { x: "(w-text_w)/2", y: "h-th-80", size: 60 },
-  { x: "(w-text_w)/2", y: "80", size: 56 },
-  { x: "60", y: "h-th-90", size: 66 },
-  { x: "w-text_w-60", y: "h-th-90", size: 62 },
-  { x: "(w-text_w)/2", y: "(h-th)/2", size: 64 },
+  { x: "(w-text_w)/2", y: "h-th-80", size: 40 },
+  { x: "(w-text_w)/2", y: "80", size: 37 },
+  { x: "60", y: "h-th-90", size: 44 },
+  { x: "w-text_w-60", y: "h-th-90", size: 41 },
+  { x: "(w-text_w)/2", y: "(h-th)/2", size: 43 },
 ];
 
 async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, weights, captionBeats, captionFontKey, captionColor) {
