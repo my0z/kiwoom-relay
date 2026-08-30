@@ -515,7 +515,7 @@ const CAPTION_POSITIONS = [
   { x: "(w-text_w)/2", y: "(h-th)/2", size: 43 },
 ];
 
-async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, weights, captionBeats, captionFontKey, captionColor) {
+async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, shortOutputKeys, weights, captionBeats, captionFontKey, captionColor) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), `render-${jobId}-`));
   const setProgress = (stage, percent) => {
     const prev = renderJobs.get(jobId) || {};
@@ -831,6 +831,137 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, w
       }
     }
 
+    // [2026-08-30 22:55] ---------- 숏츠(세로 9:16) 렌더링 — 본편 하나에서 최대 3개(도입/중간/결론) ----------
+    // 이미 실측된 음성·자막 타이밍·이미지를 재활용해 서로 다른 구간 3곳을 세로(720x1280, 중앙 크롭)로 잘라냄.
+    // 구간 경계는 전부 문장(=음성 조각) 경계라 말이 중간에 끊기지 않음. 각 구간 57초 이내(숏츠 60초 상한 안쪽).
+    // 숏츠 실패는 본편 발행을 막지 않음(로그만 남기고 건너뜀). 세그먼트 실측 모드에서만 생성.
+    const shortsDone = []; // 실제로 R2에 올라간 숏츠 키들(순서 = 도입, 중간, 결론)
+    if (Array.isArray(shortOutputKeys) && shortOutputKeys.length && audioPath && realTimeline && realTimeline.segmentCount) {
+      const SHORT_LIMIT_SEC = 57;
+      const total = audioDurationSec;
+      // 모든 문장(비트) 경계 시각을 정렬해 모음 — 구간 시작/끝은 항상 이 경계 위에서만 고름
+      const bounds = [0];
+      realTimeline.perImageBeatTimes.forEach((times) => times.forEach((t) => bounds.push(t.end)));
+      bounds.sort((a, b) => a - b);
+      const endBoundFor = (sT) => { // sT에서 시작해 57초 안에 끝나는 마지막 문장 경계
+        let e = 0;
+        for (const b of bounds) if (b > sT + 1 && b <= sT + SHORT_LIMIT_SEC && b > e) e = b;
+        return e;
+      };
+      const startBoundNear = (t) => { // t 이전(같음 포함)의 가장 늦은 문장 경계
+        let s = 0;
+        for (const b of bounds) if (b <= t && b > s) s = b;
+        return s;
+      };
+      // 후보 구간: ① 도입(0~) ② 중간(전체의 40% 지점부터) ③ 결론(끝에서 57초 앞 경계부터 끝까지)
+      const candidates = [
+        { label: "도입", sT: 0, eT: endBoundFor(0) },
+        (() => { const sT = startBoundNear(total * 0.4); return { label: "중간", sT, eT: endBoundFor(sT) }; })(),
+        (() => { const sT = startBoundNear(Math.max(0, total - SHORT_LIMIT_SEC) + 0.01) || startBoundNear(total * 0.75); return { label: "결론", sT, eT: total }; })(),
+      ];
+      // 너무 짧거나(15초 미만) 이미 채택된 구간과 크게 겹치면 건너뜀(짧은 본편에서 세 구간이 뭉치는 경우)
+      const regions = [];
+      for (const c of candidates) {
+        if (!c || c.eT - c.sT < 15 || c.eT - c.sT > SHORT_LIMIT_SEC + 1) continue;
+        const overlaps = regions.some((r) => Math.min(r.eT, c.eT) - Math.max(r.sT, c.sT) > (c.eT - c.sT) * 0.5);
+        if (!overlaps) regions.push(c);
+      }
+      for (let ri = 0; ri < regions.length && ri < shortOutputKeys.length; ri++) {
+        const { label, sT, eT } = regions[ri];
+        const outKey = shortOutputKeys[ri];
+        try {
+          setProgress(`숏츠 렌더링 중 (${ri + 1}/${regions.length})`, 86 + ri);
+          // 이 구간에 걸치는 이미지들 — 구간 밖으로 삐져나온 앞뒤는 잘라냄
+          const shortImgIdx = [];
+          const sSpans = [];
+          const sStarts = []; // 각 이미지의 구간 내 실제 시작(비트 로컬 시각 계산용)
+          realTimeline.imageSpans.forEach((span, i) => {
+            const rs = Math.max(span.start, sT);
+            const re = Math.min(span.end, eT);
+            if (re - rs > 0.15) {
+              shortImgIdx.push(i);
+              sSpans.push(Math.max(0.3, re - rs));
+              sStarts.push(rs);
+            }
+          });
+          if (!shortImgIdx.length) continue;
+          const sDur = sSpans.slice();
+          const sFades = [];
+          for (let j = 0; j < sDur.length - 1; j++) sFades.push(Math.max(0.05, Math.min(XFADE_DUR, sDur[j] * 0.4, sDur[j + 1] * 0.4)));
+          for (let j = 0; j < sDur.length - 1; j++) sDur[j] += sFades[j];
+          const sInputs = [];
+          shortImgIdx.forEach((g, j) => {
+            if (mediaIsClip[g]) sInputs.push("-stream_loop", "-1", "-t", String(sDur[j].toFixed(2)), "-i", imagePaths[g]);
+            else sInputs.push("-loop", "1", "-t", String(sDur[j].toFixed(2)), "-i", imagePaths[g]);
+          });
+          const sChains = shortImgIdx.map((g, j) => {
+            // 세로 꽉 채움: 비율 유지로 확대 후 중앙 크롭(가로 원본의 좌우가 잘려나감 — 숏츠 표준 연출)
+            let chain = `[${j}:v]fps=25,scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,setsar=1,eq=contrast=1.06:saturation=1.12:brightness=0.02:gamma=1.02`;
+            const beats = fontAvailable && Array.isArray(captionBeats) ? (captionBeats[g] || []) : [];
+            const realTimes = realTimeline.perImageBeatTimes[g];
+            const imgLocalBase = sStarts[j]; // 이 이미지 입력의 t=0이 전체 타임라인에서 어디인지
+            beats.forEach((beat, bi) => {
+              const text = (beat.text || "").trim();
+              const real = realTimes && realTimes[bi];
+              if (!text || !real || real.end <= sT + 0.05 || real.start >= eT - 0.05) return; // 구간 밖 문장
+              const st = CAPTION_POSITIONS[(beat.styleIndex || 0) % CAPTION_POSITIONS.length];
+              const bs = Math.max(0, Math.max(real.start, sT) - imgLocalBase);
+              const be = Math.max(bs + 0.2, Math.min(real.end, eT) - imgLocalBase);
+              const capFile = path.join(tmpDir, `scap-${ri}-${g}-${bi}.txt`);
+              fs.writeFileSync(capFile, text, "utf8");
+              chain += `,drawtext=fontfile=${resolvedFontPath}:textfile=${capFile}:fontsize=${st.size}:fontcolor=${captionColorFF}:` +
+                `borderw=8:bordercolor=black:box=0:line_spacing=12:x=${st.x}:y=${st.y}:` +
+                `enable='between(t,${bs.toFixed(2)},${be.toFixed(2)})'`;
+            });
+            return `${chain}[sv${j}]`;
+          }).join(";");
+          let sFilter;
+          let sMap = "[outv]";
+          if (shortImgIdx.length === 1) {
+            sFilter = sChains;
+            sMap = "[sv0]";
+          } else {
+            let prevLabel = "sv0";
+            let cumulative = sDur[0];
+            const parts = [];
+            for (let j = 1; j < shortImgIdx.length; j++) {
+              const dur = sFades[j - 1];
+              const offset = Math.max(0, cumulative - dur);
+              const outLabel = j === shortImgIdx.length - 1 ? "outv" : `sx${j}`;
+              parts.push(`[${prevLabel}][sv${j}]xfade=transition=fade:duration=${dur.toFixed(2)}:offset=${offset.toFixed(2)}[${outLabel}]`);
+              prevLabel = outLabel;
+              cumulative += sDur[j] - dur;
+            }
+            sFilter = `${sChains};${parts.join(";")}`;
+          }
+          sInputs.push("-ss", sT.toFixed(2), "-t", (eT - sT).toFixed(2), "-i", audioPath); // 음성도 같은 구간만(wav라 초 단위 정확)
+          sFilter += `;[${shortImgIdx.length}:a]loudnorm=I=-16:TP=-1.5:LRA=11[anorm]`;
+          const shortPath = path.join(tmpDir, `short-${ri}.mp4`);
+          await runFfmpeg([
+            "-y", ...sInputs,
+            "-filter_complex", sFilter,
+            "-map", sMap, "-map", "[anorm]", "-c:a", "aac", "-shortest",
+            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", // [2026-08-30 23:00] 숏츠는 파일이 작아 veryfast로 시간 절약
+            shortPath,
+          ], eT - sT, (p) => setProgress(`숏츠 렌더링 중 (${ri + 1}/${regions.length})`, 86 + ri + Math.round(p / 100)));
+          if (await verifyOutputHasAudio(shortPath)) {
+            await r2Client.send(new PutObjectCommand({
+              Bucket: R2_BUCKET,
+              Key: outKey,
+              Body: fs.readFileSync(shortPath),
+              ContentType: "video/mp4",
+            }));
+            shortsDone.push(outKey);
+            console.log(`[render:${jobId}] 숏츠(${label}) 저장: ${outKey} (${sT.toFixed(1)}~${eT.toFixed(1)}s, 이미지 ${shortImgIdx.length}장)`);
+          } else {
+            console.log(`[render:${jobId}] 숏츠(${label}) 오디오 검증 실패 — 이 숏츠만 건너뜀`);
+          }
+        } catch (e) {
+          console.log(`[render:${jobId}] 숏츠(${label}) 렌더링 실패(본편은 정상 진행): ${e.message}`);
+        }
+      }
+    }
+
     setProgress("업로드 중", 90);
     const videoBuffer = fs.readFileSync(outputPath);
     await r2Client.send(new PutObjectCommand({
@@ -840,8 +971,8 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, w
       ContentType: "video/mp4",
     }));
 
-    renderJobs.set(jobId, { status: "done", stage: "완료", percent: 100, r2Key: outputKey, startedAt: renderJobs.get(jobId)?.startedAt || Date.now() });
-    console.log(`[render:${jobId}] 완료, R2 저장: ${outputKey}`);
+    renderJobs.set(jobId, { status: "done", stage: "완료", percent: 100, r2Key: outputKey, shortKeys: shortsDone, shortKey: shortsDone[0] || null, startedAt: renderJobs.get(jobId)?.startedAt || Date.now() });
+    console.log(`[render:${jobId}] 완료, R2 저장: ${outputKey}${shortsDone.length ? ` + 숏츠 ${shortsDone.length}개` : ''}`);
   } catch (e) {
     renderJobs.set(jobId, { status: "failed", stage: "실패", percent: 0, error: e.message, startedAt: renderJobs.get(jobId)?.startedAt || Date.now() });
     console.log(`[render:${jobId}] 실패: ${e.message}`);
@@ -2057,6 +2188,10 @@ const server = http.createServer((req, res) => {
       // 세그먼트별 음성 원본 목록 — 있으면 각각의 실제 길이를 재서 이어붙이고 자막 타이밍을 실측으로 맞춤
       const audioSegments = Array.isArray(body.audioSegments) ? body.audioSegments.filter((u) => typeof u === "string") : null;
       const outputKey = body.outputKey;
+      // [2026-08-30 22:55] 숏츠 출력 키: 배열(최대 3개, 도입/중간/결론) — 옛 워커가 단일 문자열로 보내도 배열로 수용
+      const shortOutputKeys = Array.isArray(body.shortOutputKeys)
+        ? body.shortOutputKeys.filter((k) => typeof k === "string").slice(0, 3)
+        : (typeof body.shortOutputKey === "string" ? [body.shortOutputKey] : null);
       const weights = Array.isArray(body.weights) ? body.weights.filter((w) => typeof w === "number") : null;
       const captionBeats = Array.isArray(body.captionBeats) ? body.captionBeats : null;
       // 이 영상 전체에 고정으로 쓸 자막 폰트 키/색 — Worker가 영상당 하나씩 랜덤으로 뽑아서 넘겨줌.
@@ -2070,7 +2205,7 @@ const server = http.createServer((req, res) => {
       const jobId = crypto.randomUUID();
       renderJobs.set(jobId, { status: "processing", stage: "대기열 대기 중", percent: 0, startedAt: Date.now() });
       // 큐에 넣고 기다리지 않고 바로 응답 — 앞에 진행 중인 렌더링이 있으면 그거 끝나야 시작됨(VM 자원 보호)
-      enqueueRender(() => runRender(jobId, images, audioUrl, audioSegments, outputKey, weights, captionBeats, captionFontKey, captionColor));
+      enqueueRender(() => runRender(jobId, images, audioUrl, audioSegments, outputKey, shortOutputKeys, weights, captionBeats, captionFontKey, captionColor));
       res.writeHead(202, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: true, jobId }));
     });
