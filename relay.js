@@ -493,6 +493,27 @@ const CAPTION_FONT_PATHS = {
     "/usr/local/share/fonts/CuteFont-Regular.ttf",
     "/usr/share/fonts/truetype/custom/CuteFont-Regular.ttf",
   ]),
+  // [2026-08-30 23:31] 예쁜 폰트 5종 추가(사용자 요청, 두꺼운 폰트 제외) — worker.js CAPTION_FONT_CHOICES와 키 일치, TTF는 VM 설치 필요
+  stylish: resolveFontPath([
+    "/usr/local/share/fonts/Stylish-Regular.ttf",
+    "/usr/share/fonts/truetype/custom/Stylish-Regular.ttf",
+  ]),
+  yeonsung: resolveFontPath([
+    "/usr/local/share/fonts/YeonSung-Regular.ttf",
+    "/usr/share/fonts/truetype/custom/YeonSung-Regular.ttf",
+  ]),
+  gugi: resolveFontPath([
+    "/usr/local/share/fonts/Gugi-Regular.ttf",
+    "/usr/share/fonts/truetype/custom/Gugi-Regular.ttf",
+  ]),
+  nanumbrush: resolveFontPath([
+    "/usr/local/share/fonts/NanumBrushScript-Regular.ttf",
+    "/usr/share/fonts/truetype/custom/NanumBrushScript-Regular.ttf",
+  ]),
+  sunflower: resolveFontPath([
+    "/usr/local/share/fonts/Sunflower-Light.ttf", // Sunflower는 Regular 없이 Light/Medium/Bold — 얇은 Light 사용
+    "/usr/share/fonts/truetype/custom/Sunflower-Light.ttf",
+  ]),
 };
 // 요청받은 폰트 키가 이 VM에 실제로 설치돼있지 않으면(아직 다운로드 전 등) 있는 것 중 아무거나로 폴백 —
 // 폰트 없다고 자막 자체를 통째로 스킵하던 예전 방식보다 훨씬 덜 아쉬움.
