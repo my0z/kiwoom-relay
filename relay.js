@@ -342,6 +342,85 @@ async function computeRealBeatTimeline(audioPath, audioDuration, captionBeatsPer
   return { perImageBeatTimes, imageSpans, anchoredCount, boundaryCount: boundaries.length };
 }
 
+// ---------- 세그먼트 음성 기반 "실측" 자막 타이밍 ----------
+// Worker가 나레이션을 문장 몇 개씩 묶은 세그먼트 단위로 따로 합성해 보내주면(audioSegments),
+// 여기서 각 조각의 실제 길이를 잰 뒤 이어붙임 — 세그먼트 경계의 시각이 "측정값"이라 자막이 어긋날 수가 없음.
+// (전체를 한 번에 합성한 파일에서 무음을 감지해 맞추는 방식은 사람 같은 TTS의 숨소리 때문에 불안정했음.)
+
+function runFfmpegQuiet(args) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn("ffmpeg", ["-y", ...args]);
+    let stderr = "";
+    proc.stderr.on("data", (d) => { stderr += d.toString(); });
+    proc.on("error", (err) => reject(new Error(`ffmpeg 실행 실패: ${err.message}`)));
+    proc.on("close", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`ffmpeg 종료코드 ${code}: ${stderr.slice(-400)}`));
+    });
+  });
+}
+
+// 다운로드된 세그먼트 mp3들을 → (24kHz 모노 wav + 세그먼트 사이 0.35초 쉼 패딩) → 하나로 이어붙임.
+// 반환: { audioPath(narration.wav), segStarts[k](세그먼트 k의 시작 시각, 실측), totalDur }
+// 패딩 "후" 파일을 ffprobe로 재기 때문에 segStarts는 이어붙인 결과와 정확히 일치함(wav=PCM이라 오차 없음).
+const SEGMENT_PAUSE_SEC = 0.35; // 문장 사이 자연스러운 쉼 — 따로 합성된 조각을 그냥 붙이면 너무 급하게 들림
+async function prepareSegmentedNarration(tmpDir, segmentPaths) {
+  const wavPaths = [];
+  const segDurs = [];
+  for (let k = 0; k < segmentPaths.length; k++) {
+    const wav = path.join(tmpDir, `seg-${k}.wav`);
+    const padArgs = k < segmentPaths.length - 1 ? ["-af", `apad=pad_dur=${SEGMENT_PAUSE_SEC}`] : [];
+    await runFfmpegQuiet(["-i", segmentPaths[k], ...padArgs, "-ar", "24000", "-ac", "1", wav]);
+    wavPaths.push(wav);
+    segDurs.push(await getAudioDurationSec(wav));
+  }
+  const listFile = path.join(tmpDir, "seg-list.txt");
+  fs.writeFileSync(listFile, wavPaths.map((p) => `file '${p}'`).join("\n"), "utf8");
+  const audioPath = path.join(tmpDir, "narration.wav");
+  await runFfmpegQuiet(["-f", "concat", "-safe", "0", "-i", listFile, "-c", "copy", audioPath]);
+  const segStarts = [];
+  let cum = 0;
+  for (const d of segDurs) { segStarts.push(cum); cum += d; }
+  return { audioPath, segStarts, totalDur: cum };
+}
+
+// 세그먼트 실측 시각(segStarts) 기반으로 모든 비트의 시작/끝을 계산 — computeRealBeatTimeline과 같은
+// 반환 형태. 각 비트는 worker가 실어준 segIndex(그 문장이 합성된 세그먼트 번호)로 자기 세그먼트의
+// 실측 구간 [segStarts[k], segStarts[k+1])에 배정되고, 그 안에서만 글자수 비례로 나뉨 — 세그먼트가
+// 짧아서(90~220자) 남은 추정 오차는 티가 안 나고, 경계는 측정값이라 누적 자체가 불가능.
+function computeSegmentBeatTimeline(captionBeatsPerImage, segStarts, audioDuration) {
+  if (!Array.isArray(captionBeatsPerImage) || !captionBeatsPerImage.length) return null;
+  if (captionBeatsPerImage.some((beats) => !Array.isArray(beats) || !beats.length)) return null;
+  const flat = [];
+  captionBeatsPerImage.forEach((beats, imgIndex) => {
+    beats.forEach((beat, beatIndex) => {
+      flat.push({ imgIndex, beatIndex, weight: Math.max(Number(beat.weight) || 0, 0.0001), segIndex: beat.segIndex });
+    });
+  });
+  // 모든 비트에 유효한 세그먼트 번호가 있어야 함(옛 Worker가 보낸 요청엔 없음 → 폴백)
+  if (flat.some((b) => !Number.isInteger(b.segIndex) || b.segIndex < 0 || b.segIndex >= segStarts.length)) return null;
+  // 세그먼트별 비트 묶음 — 비어있는 세그먼트가 있으면 타임라인에 구멍이 생기므로 폴백(정상 흐름에선 없음)
+  const bySeg = segStarts.map(() => []);
+  for (const b of flat) bySeg[b.segIndex].push(b);
+  if (bySeg.some((arr) => !arr.length)) return null;
+
+  const perImageBeatTimes = captionBeatsPerImage.map((beats) => new Array(beats.length));
+  for (let k = 0; k < bySeg.length; k++) {
+    const segStart = segStarts[k];
+    const segEnd = k + 1 < segStarts.length ? segStarts[k + 1] : audioDuration;
+    const segDur = Math.max(0.05, segEnd - segStart);
+    const sumW = bySeg[k].reduce((a, b) => a + b.weight, 0) || 1;
+    let t = segStart;
+    for (const b of bySeg[k]) {
+      const dur = (b.weight / sumW) * segDur;
+      perImageBeatTimes[b.imgIndex][b.beatIndex] = { start: t, end: t + dur };
+      t += dur;
+    }
+  }
+  const imageSpans = perImageBeatTimes.map((times) => ({ start: times[0].start, end: times[times.length - 1].end }));
+  return { perImageBeatTimes, imageSpans, segmentCount: segStarts.length };
+}
+
 // 자막용 폰트 4종을 각각 개별로 찾아둠(예전엔 하나만 골라서 전체에 썼는데, 이제 영상마다 Worker가
 // 정해준 폰트 키 하나로 고정해서 씀 — worker.js의 CAPTION_FONT_CHOICES와 key가 일치해야 함).
 // CAPTION_FONT_PATH 환경변수를 지정하면 모든 키가 그 폰트 하나로 강제됨(예전 동작 유지용 이스케이프 해치).
@@ -388,7 +467,7 @@ const CAPTION_POSITIONS = [
   { x: "(w-text_w)/2", y: "(h-th)/2", size: 64 },
 ];
 
-async function runRender(jobId, images, audioUrl, outputKey, weights, captionBeats, captionFontKey, captionColor) {
+async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, weights, captionBeats, captionFontKey, captionColor) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), `render-${jobId}-`));
   const setProgress = (stage, percent) => {
     const prev = renderJobs.get(jobId) || {};
@@ -406,44 +485,75 @@ async function runRender(jobId, images, audioUrl, outputKey, weights, captionBea
       imagePaths.push(dest);
       setProgress("이미지 다운로드 중", 5 + Math.round((i + 1) / images.length * 15)); // 5~20%
     }
+    // ---- 음성 확보: 세그먼트(실측 타이밍)가 최우선, 없거나 실패하면 통짜 mp3(추정 타이밍) ----
     let audioPath = null;
-    if (audioUrl) {
+    let audioDurationSec = null;
+    let segStarts = null; // 세그먼트별 시작 시각(실측) — 자막 타이밍의 기준점
+    if (Array.isArray(audioSegmentUrls) && audioSegmentUrls.length) {
+      try {
+        setProgress("음성 세그먼트 다운로드 중", 21);
+        const segPaths = [];
+        for (let k = 0; k < audioSegmentUrls.length; k++) {
+          const dest = path.join(tmpDir, `seg-src-${k}.mp3`);
+          await downloadToFile(audioSegmentUrls[k], dest);
+          segPaths.push(dest);
+        }
+        setProgress("음성 세그먼트 결합 중", 23);
+        const prepared = await prepareSegmentedNarration(tmpDir, segPaths);
+        audioPath = prepared.audioPath;
+        audioDurationSec = prepared.totalDur;
+        segStarts = prepared.segStarts;
+      } catch (e) {
+        console.log(`[render:${jobId}] 세그먼트 음성 준비 실패(통짜 mp3로 폴백): ${e.message}`);
+        audioPath = null;
+        segStarts = null;
+      }
+    }
+    if (!audioPath && audioUrl) {
       setProgress("음성 다운로드 중", 22);
       audioPath = path.join(tmpDir, "narration.mp3");
       await downloadToFile(audioUrl, audioPath);
     }
 
     setProgress("영상 길이 계산 중", 25);
-    // 오디오 길이를 먼저 한 번만 재서(ffprobe) 실제-무음-구간 타이밍 계산과 폴백 계산 둘 다에 재사용함.
-    let audioDurationSec = null;
-    if (audioPath) {
+    if (audioPath && !audioDurationSec) {
       try { audioDurationSec = await getAudioDurationSec(audioPath); } catch (e) { console.log(`[render:${jobId}] 오디오 길이 확인 실패: ${e.message}`); }
     }
-    // 문장 사이 실제 무음 구간으로 자막 타이밍을 정확히 맞춰봄 — 글자수 비율 추정 대신 진짜 쉬는 지점을 써서
-    // "자막이 일정 시간 지나면 음성이랑 안 맞는"(추정 오차 누적) 문제를 근본적으로 없앰. 감지가 신뢰할 수
-    // 없으면(문장 경계 개수 불일치 등) null이 와서 아래 fallback(글자수 비율 추정)으로 자동 전환됨.
+    // 자막 타이밍 우선순위: ① 세그먼트 실측(정확, 추정 없음) ② 무음 감지 정렬(구버전 요청 하위호환)
+    // ③ 글자수 비율 추정(최후 폴백). ①이 있으면 ②는 아예 시도하지 않음.
     let realTimeline = null;
     if (audioPath && audioDurationSec && Array.isArray(captionBeats)) {
-      try {
-        realTimeline = await computeRealBeatTimeline(audioPath, audioDurationSec, captionBeats, weights);
-      } catch (e) {
-        console.log(`[render:${jobId}] 실제 무음 구간 타이밍 계산 실패, 글자수 비율 추정으로 폴백: ${e.message}`);
-        realTimeline = null;
+      if (segStarts) {
+        realTimeline = computeSegmentBeatTimeline(captionBeats, segStarts, audioDurationSec);
+      }
+      if (!realTimeline) {
+        try {
+          realTimeline = await computeRealBeatTimeline(audioPath, audioDurationSec, captionBeats, weights);
+        } catch (e) {
+          console.log(`[render:${jobId}] 무음 구간 타이밍 계산 실패, 글자수 비율 추정으로 폴백: ${e.message}`);
+          realTimeline = null;
+        }
       }
       console.log(`[render:${jobId}] 자막 타이밍: ${realTimeline
-        ? `실제 무음 구간 앵커링(문장 경계 ${realTimeline.boundaryCount}개 중 ${realTimeline.anchoredCount}개 실측, 나머지 보간)`
+        ? (realTimeline.segmentCount
+          ? `세그먼트 실측(${realTimeline.segmentCount}개 조각, 경계 전부 측정값)`
+          : `무음 구간 앵커링(문장 경계 ${realTimeline.boundaryCount}개 중 ${realTimeline.anchoredCount}개 실측, 나머지 보간)`)
         : '글자수 비율 추정(폴백)'}`);
     }
     const durations = realTimeline
       ? realTimeline.imageSpans.map((span) => Math.max(0.3, span.end - span.start))
       : await computeImageDurations(imagePaths.length, audioPath, weights, audioDurationSec);
-    // 전환(xfade)이 일어날 때마다 그 이미지 이후의 실제 화면 타이밍이 계획보다 조금씩 앞으로 당겨짐 —
-    // 마지막 이미지 하나에만 보정을 몰아주면 총 길이는 맞아도 중간 지점들은 계속 어긋난 채로 누적됨(끝으로
-    // 갈수록 자막이 빨라지는 원인). 전환이 걸리는 "매 이미지"(마지막 제외)에 그때그때 보정해야
-    // 중간에도 밀리지 않고 항상 정확히 맞음.
-    const XFADE_DUR = 0.6; // 전환 길이(초) — 이미지 최소길이(1.5초)의 40% 캡에 걸려서 사실상 항상 이 값 그대로 적용됨
+    // 전환(xfade) 보정: 전환마다 다음 이미지의 시작이 겹침(fade 길이)만큼 당겨지므로, "그 전환의 실제
+    // fade 길이"를 왼쪽 이미지 노출시간에 더해줘야 이후 모든 이미지/자막의 벽시계 타이밍이 계획과 정확히
+    // 일치함. 예전엔 고정 XFADE_DUR을 더한 뒤 실제 fade는 min()으로 줄어들 수 있어서(짧은 컷) 그 차이만큼
+    // 뒤 이미지들이 늦어지는 미세 드리프트가 있었음 — fade를 먼저 확정하고 그 값을 그대로 더해서 해결.
+    const XFADE_DUR = 0.6; // 전환 길이 상한(초)
+    const xfadeDurs = [];
     if (durations.length > 1) {
-      for (let i = 0; i < durations.length - 1; i++) durations[i] += XFADE_DUR;
+      for (let i = 0; i < durations.length - 1; i++) {
+        xfadeDurs.push(Math.max(0.05, Math.min(XFADE_DUR, durations[i] * 0.4, durations[i + 1] * 0.4)));
+      }
+      for (let i = 0; i < durations.length - 1; i++) durations[i] += xfadeDurs[i];
     }
     const totalDurationSec = durations.reduce((a, b) => a + b, 0);
     // 이 영상 전체에 쓸 폰트/색을 하나로 확정 — Worker가 골라서 넘겨준 값(위치도 이제 비트마다 안 바뀌고
@@ -508,7 +618,7 @@ async function runRender(jobId, images, audioUrl, outputKey, weights, captionBea
       let cumulative = durations[0];
       const xfadeParts = [];
       for (let i = 1; i < imagePaths.length; i++) {
-        const dur = Math.min(XFADE_DUR, durations[i - 1] * 0.4, durations[i] * 0.4);
+        const dur = xfadeDurs[i - 1]; // 위에서 확정한 값 그대로 — durations[i-1]에 이미 더해져 있어 offset이 정확히 맞음
         const offset = Math.max(0, cumulative - dur);
         const outLabel = i === imagePaths.length - 1 ? "outv" : `vx${i}`;
         xfadeParts.push(`[${prevLabel}][v${i}]xfade=transition=fade:duration=${dur.toFixed(2)}:offset=${offset.toFixed(2)}[${outLabel}]`);
@@ -530,7 +640,7 @@ async function runRender(jobId, images, audioUrl, outputKey, weights, captionBea
       const bgmInputStart = imagePaths.length;
       // totalDurationSec은 전환 보정 때문에 실제 최종 영상 길이보다 살짝 크게 잡혀있음 — 페이드아웃이
       // 영상 끝나기 전에 끝나도록 실제 길이(전환으로 줄어드는 만큼 뺀 값) 기준으로 계산
-      const xfadeLoss = durations.length > 1 ? (durations.length - 1) * XFADE_DUR : 0;
+      const xfadeLoss = xfadeDurs.reduce((a, b) => a + b, 0);
       const finalVideoLengthSec = totalDurationSec - xfadeLoss;
       bgmFreqs.forEach((f) => {
         inputArgs.push("-f", "lavfi", "-i", `sine=frequency=${f}:duration=${totalDurationSec.toFixed(2)}`);
@@ -1790,6 +1900,8 @@ const server = http.createServer((req, res) => {
       }
       const images = Array.isArray(body.images) ? body.images : [];
       const audioUrl = body.audioUrl || null;
+      // 세그먼트별 음성 원본 목록 — 있으면 각각의 실제 길이를 재서 이어붙이고 자막 타이밍을 실측으로 맞춤
+      const audioSegments = Array.isArray(body.audioSegments) ? body.audioSegments.filter((u) => typeof u === "string") : null;
       const outputKey = body.outputKey;
       const weights = Array.isArray(body.weights) ? body.weights.filter((w) => typeof w === "number") : null;
       const captionBeats = Array.isArray(body.captionBeats) ? body.captionBeats : null;
@@ -1804,7 +1916,7 @@ const server = http.createServer((req, res) => {
       const jobId = crypto.randomUUID();
       renderJobs.set(jobId, { status: "processing", stage: "대기열 대기 중", percent: 0, startedAt: Date.now() });
       // 큐에 넣고 기다리지 않고 바로 응답 — 앞에 진행 중인 렌더링이 있으면 그거 끝나야 시작됨(VM 자원 보호)
-      enqueueRender(() => runRender(jobId, images, audioUrl, outputKey, weights, captionBeats, captionFontKey, captionColor));
+      enqueueRender(() => runRender(jobId, images, audioUrl, audioSegments, outputKey, weights, captionBeats, captionFontKey, captionColor));
       res.writeHead(202, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: true, jobId }));
     });
