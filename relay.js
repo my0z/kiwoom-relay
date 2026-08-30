@@ -139,8 +139,9 @@ function verifyOutputHasAudio(filePath) {
 }
 
 // 이미지별 노출시간(초) 배열 계산 — weights(자막 글자수 비율)가 있으면 오디오 실길이에 비례 배분,
-// 없거나 개수가 안 맞으면 기존처럼 고정 길이(RENDER_IMAGE_DURATION_SEC)로 폴백
-async function computeImageDurations(imageCount, audioPath, weights) {
+// 없거나 개수가 안 맞으면 기존처럼 고정 길이(RENDER_IMAGE_DURATION_SEC)로 폴백.
+// precomputedDuration: 호출부에서 이미 ffprobe로 재둔 오디오 길이가 있으면 넘겨서 중복 ffprobe 호출을 피함.
+async function computeImageDurations(imageCount, audioPath, weights, precomputedDuration) {
   // 음성이 없어도 자막 분량(weights)에 비례해서 노출시간을 나눠줌 — 안 그러면 이미지당 고정 시간 안에
   // 문장이 몇 개든 욱여넣게 돼서 자막이 순식간에 지나가버림.
   const hasWeights = Array.isArray(weights) && weights.length === imageCount;
@@ -153,19 +154,113 @@ async function computeImageDurations(imageCount, audioPath, weights) {
     return weights.map((w) => Math.max(MIN_SEC, (w / sumWeights) * totalSec));
   }
 
-  let audioDuration;
-  try {
-    audioDuration = await getAudioDurationSec(audioPath);
-  } catch (e) {
-    console.log(`오디오 길이 확인 실패, 고정 길이로 폴백: ${e.message}`);
-    const totalSec = imageCount * RENDER_IMAGE_DURATION_SEC;
-    if (!hasWeights) return Array(imageCount).fill(RENDER_IMAGE_DURATION_SEC);
-    return weights.map((w) => Math.max(MIN_SEC, (w / sumWeights) * totalSec));
+  let audioDuration = Number.isFinite(precomputedDuration) && precomputedDuration > 0 ? precomputedDuration : null;
+  if (!audioDuration) {
+    try {
+      audioDuration = await getAudioDurationSec(audioPath);
+    } catch (e) {
+      console.log(`오디오 길이 확인 실패, 고정 길이로 폴백: ${e.message}`);
+      const totalSec = imageCount * RENDER_IMAGE_DURATION_SEC;
+      if (!hasWeights) return Array(imageCount).fill(RENDER_IMAGE_DURATION_SEC);
+      return weights.map((w) => Math.max(MIN_SEC, (w / sumWeights) * totalSec));
+    }
   }
   if (!hasWeights) {
     return Array(imageCount).fill(audioDuration / imageCount);
   }
   return weights.map((w) => Math.max(MIN_SEC, (w / sumWeights) * audioDuration));
+}
+
+// 문장 사이 무음(쉬는) 구간을 실제 음성 파일에서 찾음 — 글자수 비율 추정 대신 진짜 쉬는 지점을 알아내서
+// 자막 타이밍을 정확히 맞추기 위함. ffmpeg의 silencedetect 필터가 stderr로
+// "silence_start: 12.34" / "silence_end: 12.87 | silence_duration: 0.53" 형식으로 찍어줌.
+function detectSilenceGaps(audioPath, noiseDb = -30, minDurSec = 0.12) {
+  return new Promise((resolve) => {
+    const proc = spawn("ffmpeg", [
+      "-i", audioPath,
+      "-af", `silencedetect=noise=${noiseDb}dB:d=${minDurSec}`,
+      "-f", "null", "-",
+    ]);
+    let stderr = "";
+    proc.stderr.on("data", (d) => { stderr += d.toString(); });
+    proc.on("error", () => resolve([]));
+    proc.on("close", () => {
+      const starts = [...stderr.matchAll(/silence_start:\s*(-?[\d.]+)/g)].map((m) => parseFloat(m[1]));
+      const ends = [...stderr.matchAll(/silence_end:\s*(-?[\d.]+)/g)].map((m) => parseFloat(m[1]));
+      const gaps = [];
+      for (let i = 0; i < Math.min(starts.length, ends.length); i++) {
+        if (Number.isFinite(starts[i]) && Number.isFinite(ends[i]) && ends[i] > starts[i]) {
+          gaps.push({ start: starts[i], end: ends[i] });
+        }
+      }
+      resolve(gaps);
+    });
+  });
+}
+
+// captionBeats(이미지별 자막 비트 배열)를 한 줄로 펼쳐서, 오디오 전체를 하나의 타임라인으로 보고 각 비트의
+// 실제 시작/끝 시각(초, 오디오 처음부터 기준)을 계산함. 글자수 비율 추정("문장이 쌓일수록 자막이 점점
+// 밀리는" 원인)과 달리, 문장 경계마다 실제 무음 위치로 다시 맞춰지기 때문에 오차가 문장 하나 분량으로만
+// 국한되고 영상 전체에 걸쳐 누적되지 않음. 감지된 무음 개수가 예상 문장 경계 개수와 정확히 안 맞으면(TTS가
+// 무음을 안 두는 경우 등) null을 반환해서 호출부가 기존 글자수 비율 추정으로 안전하게 되돌아가게 함.
+async function computeRealBeatTimeline(audioPath, audioDuration, captionBeatsPerImage) {
+  if (!audioPath || !Array.isArray(captionBeatsPerImage) || !captionBeatsPerImage.length) return null;
+  // 이미지마다 비트가 최소 1개는 있어야 이미지별 시작 시각을 앵커링할 수 있음 — 하나라도 비어있으면 폴백.
+  if (captionBeatsPerImage.some((beats) => !Array.isArray(beats) || !beats.length)) return null;
+
+  const flat = []; // { imgIndex, beatIndex, weight, isSentenceEnd } — 재생 순서 그대로 펼친 배열
+  captionBeatsPerImage.forEach((beats, imgIndex) => {
+    beats.forEach((beat, beatIndex) => {
+      flat.push({ imgIndex, beatIndex, weight: Math.max(Number(beat.weight) || 0, 0.0001), isSentenceEnd: !!beat.isSentenceEnd });
+    });
+  });
+
+  const expectedGapCount = flat.filter((b) => b.isSentenceEnd).length - 1; // 마지막 문장 뒤엔 쉼 필요없음
+  if (expectedGapCount <= 0) return null; // 문장이 1개뿐이면 추정이랑 차이가 없음 — 그냥 폴백
+
+  let gaps;
+  try {
+    gaps = await detectSilenceGaps(audioPath);
+  } catch (e) {
+    return null;
+  }
+  // 파일 시작/끝 0.2초 근처의 무음은 문장 사이 쉼이 아니라 파일 자체 여백일 가능성이 높아서 제외
+  const EDGE_MARGIN = 0.2;
+  const filtered = gaps
+    .filter((g) => g.start > EDGE_MARGIN && g.end < audioDuration - EDGE_MARGIN)
+    .sort((a, b) => a.start - b.start);
+
+  if (filtered.length !== expectedGapCount) return null; // 개수 안 맞으면 신뢰 못함 — 폴백
+
+  // anchors: [0, gap0.end, gap1.end, ..., audioDuration] — 문장 s는 [anchors[s], anchors[s+1]) 구간을 씀.
+  // 무음 구간(gap.start~gap.end) 동안은 이전 문장 자막이 그대로 떠 있다가, 다음 문장 음성이 실제로
+  // 시작하는 gap.end 시점에 정확히 다음 자막으로 바뀜(빈 화면 없이, 미리 안 바뀌게).
+  const anchors = [0, ...filtered.map((g) => g.end), audioDuration];
+
+  const perImageBeatTimes = captionBeatsPerImage.map((beats) => new Array(beats.length));
+  let sentenceStartFlatIdx = 0;
+  let anchorIdx = 0;
+  for (let i = 0; i < flat.length; i++) {
+    if (!flat[i].isSentenceEnd) continue;
+    const sentenceBeats = flat.slice(sentenceStartFlatIdx, i + 1);
+    const segStart = anchors[anchorIdx];
+    const segEnd = anchors[anchorIdx + 1];
+    const segDur = Math.max(0.05, segEnd - segStart);
+    const sumW = sentenceBeats.reduce((a, b) => a + b.weight, 0) || 1;
+    let t = segStart;
+    sentenceBeats.forEach((b) => {
+      const dur = (b.weight / sumW) * segDur;
+      const start = t;
+      const end = t + dur;
+      t = end;
+      perImageBeatTimes[b.imgIndex][b.beatIndex] = { start, end };
+    });
+    sentenceStartFlatIdx = i + 1;
+    anchorIdx++;
+  }
+
+  const imageSpans = perImageBeatTimes.map((times) => ({ start: times[0].start, end: times[times.length - 1].end }));
+  return { perImageBeatTimes, imageSpans };
 }
 
 // 자막용 폰트 4종을 각각 개별로 찾아둠(예전엔 하나만 골라서 전체에 썼는데, 이제 영상마다 Worker가
@@ -240,7 +335,27 @@ async function runRender(jobId, images, audioUrl, outputKey, weights, captionBea
     }
 
     setProgress("영상 길이 계산 중", 25);
-    const durations = await computeImageDurations(imagePaths.length, audioPath, weights);
+    // 오디오 길이를 먼저 한 번만 재서(ffprobe) 실제-무음-구간 타이밍 계산과 폴백 계산 둘 다에 재사용함.
+    let audioDurationSec = null;
+    if (audioPath) {
+      try { audioDurationSec = await getAudioDurationSec(audioPath); } catch (e) { console.log(`[render:${jobId}] 오디오 길이 확인 실패: ${e.message}`); }
+    }
+    // 문장 사이 실제 무음 구간으로 자막 타이밍을 정확히 맞춰봄 — 글자수 비율 추정 대신 진짜 쉬는 지점을 써서
+    // "자막이 일정 시간 지나면 음성이랑 안 맞는"(추정 오차 누적) 문제를 근본적으로 없앰. 감지가 신뢰할 수
+    // 없으면(문장 경계 개수 불일치 등) null이 와서 아래 fallback(글자수 비율 추정)으로 자동 전환됨.
+    let realTimeline = null;
+    if (audioPath && audioDurationSec && Array.isArray(captionBeats)) {
+      try {
+        realTimeline = await computeRealBeatTimeline(audioPath, audioDurationSec, captionBeats);
+      } catch (e) {
+        console.log(`[render:${jobId}] 실제 무음 구간 타이밍 계산 실패, 글자수 비율 추정으로 폴백: ${e.message}`);
+        realTimeline = null;
+      }
+      console.log(`[render:${jobId}] 자막 타이밍: ${realTimeline ? '실제 무음 구간 기준(정확)' : '글자수 비율 추정(폴백)'}`);
+    }
+    const durations = realTimeline
+      ? realTimeline.imageSpans.map((span) => Math.max(0.3, span.end - span.start))
+      : await computeImageDurations(imagePaths.length, audioPath, weights, audioDurationSec);
     // 전환(xfade)이 일어날 때마다 그 이미지 이후의 실제 화면 타이밍이 계획보다 조금씩 앞으로 당겨짐 —
     // 마지막 이미지 하나에만 보정을 몰아주면 총 길이는 맞아도 중간 지점들은 계속 어긋난 채로 누적됨(끝으로
     // 갈수록 자막이 빨라지는 원인). 전환이 걸리는 "매 이미지"(마지막 제외)에 그때그때 보정해야
@@ -277,13 +392,19 @@ async function runRender(jobId, images, audioUrl, outputKey, weights, captionBea
       let chain = `[${i}:v]scale=1280:720:flags=lanczos,setsar=1,eq=contrast=1.06:saturation=1.12:brightness=0.02:gamma=1.02`;
       const beats = fontAvailable && Array.isArray(captionBeats) ? (captionBeats[i] || []) : [];
       if (beats.length) {
+        // realTimeline이 있으면(문장 경계가 실제 무음 구간과 정확히 맞아떨어진 경우) 그 실제 초 단위 시각을
+        // 그대로 씀 — 이미지 자체 타임라인(각 -loop 1 입력은 0초부터 시작) 기준으로 바꾸려고 이미지 시작
+        // 시각(imgRealStart)을 빼줌. 없으면 예전처럼 글자수 비율로 이미지 노출시간(durations[i])을 나눔.
+        const realTimes = realTimeline ? realTimeline.perImageBeatTimes[i] : null;
+        const imgRealStart = realTimeline ? realTimeline.imageSpans[i].start : 0;
         const sumWeight = beats.reduce((a, b) => a + (b.weight || 1), 0) || 1;
         let t = 0;
         beats.forEach((beat, bi) => {
           const text = (beat.text || "").trim();
-          const beatDur = Math.max(0.3, (beat.weight / sumWeight) * durations[i]);
-          const start = t;
-          const end = t + beatDur;
+          const real = realTimes && realTimes[bi];
+          const start = real ? (real.start - imgRealStart) : t;
+          const beatDur = real ? Math.max(0.3, real.end - real.start) : Math.max(0.3, (beat.weight / sumWeight) * durations[i]);
+          const end = start + beatDur;
           t = end;
           if (!text) return;
           const capFile = path.join(tmpDir, `cap-${i}-${bi}.txt`);
