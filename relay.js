@@ -180,8 +180,8 @@ function resolveVideoFontPath(fontKey) {
   return (fontKey && CAPTION_FONT_PATHS[fontKey]) || FALLBACK_FONT_PATH;
 }
 
-// 자막 "위치" 5종 순환 — 예전과 동일하게 유지. 폰트/색은 여기서 빠지고 영상 하나당 하나로 고정(runRender 인자로 받음).
-// styleIndex는 Worker(worker.js)가 계산해서 넘겨줌, 여기선 같은 인덱스 규칙으로 매칭만 함.
+// 자막 "위치" 후보 5개 — 이제 비트마다 순환하지 않고, Worker(worker.js)가 영상 하나당 하나를 골라서
+// 모든 비트에 같은 styleIndex로 넣어 보냄(폰트/색과 동일하게 영상 전체 고정). 여기선 그 인덱스로 매칭만 함.
 const CAPTION_POSITIONS = [
   { x: "(w-text_w)/2", y: "h-th-80", size: 60 },
   { x: "(w-text_w)/2", y: "80", size: 56 },
@@ -226,7 +226,8 @@ async function runRender(jobId, images, audioUrl, outputKey, weights, captionBea
       for (let i = 0; i < durations.length - 1; i++) durations[i] += XFADE_DUR;
     }
     const totalDurationSec = durations.reduce((a, b) => a + b, 0);
-    // 이 영상 전체에 쓸 폰트/색을 하나로 확정 — Worker가 골라서 넘겨준 값(위치만 비트마다 순환, 폰트·색은 고정).
+    // 이 영상 전체에 쓸 폰트/색을 하나로 확정 — Worker가 골라서 넘겨준 값(위치도 이제 비트마다 안 바뀌고
+    // 영상 하나당 하나로 고정 — captionBeats의 styleIndex가 전부 동일한 값으로 옴).
     const resolvedFontPath = resolveVideoFontPath(captionFontKey);
     const fontAvailable = !!resolvedFontPath && fs.existsSync(resolvedFontPath);
     if (!fontAvailable) {
