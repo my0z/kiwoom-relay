@@ -46,7 +46,7 @@ const renderJobs = new Map();
 setInterval(() => {
   const cutoff = Date.now() - 30 * 60 * 1000;
   for (const [id, job] of renderJobs) {
-    if (job.startedAt < cutoff && job.status !== "processing") renderJobs.delete(id);
+    if (job.status !== "processing" && (job.completedAt || job.startedAt) < cutoff) renderJobs.delete(id);
   }
 }, 5 * 60 * 1000);
 
@@ -992,10 +992,10 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, s
       ContentType: "video/mp4",
     }));
 
-    renderJobs.set(jobId, { status: "done", stage: "완료", percent: 100, r2Key: outputKey, shortKeys: shortsDone, shortKey: shortsDone[0] || null, startedAt: renderJobs.get(jobId)?.startedAt || Date.now() });
+    renderJobs.set(jobId, { status: "done", stage: "완료", percent: 100, r2Key: outputKey, shortKeys: shortsDone, shortKey: shortsDone[0] || null, startedAt: renderJobs.get(jobId)?.startedAt || Date.now(), completedAt: Date.now() });
     console.log(`[render:${jobId}] 완료, R2 저장: ${outputKey}${shortsDone.length ? ` + 숏츠 ${shortsDone.length}개` : ''}`);
   } catch (e) {
-    renderJobs.set(jobId, { status: "failed", stage: "실패", percent: 0, error: e.message, startedAt: renderJobs.get(jobId)?.startedAt || Date.now() });
+    renderJobs.set(jobId, { status: "failed", stage: "실패", percent: 0, error: e.message, startedAt: renderJobs.get(jobId)?.startedAt || Date.now(), completedAt: Date.now() });
     console.log(`[render:${jobId}] 실패: ${e.message}`);
   } finally {
     fs.rm(tmpDir, { recursive: true, force: true }, () => {});
@@ -2244,6 +2244,45 @@ const server = http.createServer((req, res) => {
       status: processingJobs.length > 0 ? "rendering" : "idle",
       processingJobCount: processingJobs.length,
       totalJobsInMemory: renderJobs.size,
+    }));
+    return;
+  }
+
+  // [2026-08-31 00:33] Memory cleanup — 렌더링 전에 호출해서 오래된 작업 제거 + 가비지 컬렉션 강제 실행
+  if (req.url === "/cleanup" && req.method === "POST") {
+    const beforeJobCount = renderJobs.size;
+    const cutoff = Date.now() - 30 * 60 * 1000; // 30분 이상 된 완료/실패 작업만
+    let removedCount = 0;
+    for (const [id, job] of renderJobs) {
+      // 완료/실패된 작업 중 30분 이상 지난 것만 정리 (processing은 절대 안 건드림)
+      if (job.status !== "processing" && (job.completedAt || job.startedAt) < cutoff) {
+        renderJobs.delete(id);
+        removedCount++;
+      }
+    }
+    // Node.js 가비지 컬렉션 강제 실행 (--expose-gc 플래그가 필요)
+    if (global.gc) {
+      try {
+        global.gc();
+      } catch (e) {
+        // gc() 실패는 무시 (플래그 미설정 또는 에러)
+      }
+    }
+    const memUsage = process.memoryUsage();
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      ok: true,
+      cleaned: {
+        jobsRemoved: removedCount,
+        jobsRemainingInMemory: renderJobs.size,
+        beforeCount: beforeJobCount,
+      },
+      memory: {
+        heapUsedMb: Math.round(memUsage.heapUsed / 1024 / 1024),
+        heapTotalMb: Math.round(memUsage.heapTotal / 1024 / 1024),
+        rssMemMb: Math.round(memUsage.rss / 1024 / 1024),
+      },
+      timestamp: new Date().toISOString(),
     }));
     return;
   }
