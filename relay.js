@@ -12,7 +12,7 @@ const PORT = process.env.PORT || 8787;
 const RELAY_SECRET = process.env.RELAY_SECRET;
 const KIWOOM_REAL_HOST = "api.kiwoom.com";
 
-// ---------- 영상 렌더링 (life.news용, ffmpeg 무료 대체) — 작업: 2026-08-30 20:13 ----------
+// ---------- 영상 렌더링 (life.news용, ffmpeg 무료 대체) — 작업: 2026-08-30 20:46 ----------
 // Shotstack/Rendobar 같은 외부 유료 렌더링 서비스 대신, 이미 상시 가동 중인 이 VM에서
 // ffmpeg로 이미지+음성을 mp4로 합성 -> R2에 직접 업로드. R2 버킷은 Worker와 동일한 걸 써서
 // Worker는 그냥 자기 R2 바인딩으로 읽기만 하면 됨(중계 다운로드 불필요).
@@ -449,28 +449,39 @@ function resolveFontPath(candidates) {
   }
   return candidates.find((p) => fs.existsSync(p)) || null;
 }
+// [2026-08-30 20:46] 두꺼운 폰트(도현/검은고딕) 제거 + 예쁜 폰트 4종 추가 — worker.js CAPTION_FONT_CHOICES와 key 일치.
+// 신규 폰트 TTF는 VM에 설치 필요(설치 안 돼 있으면 FALLBACK_FONT_PATH로 자동 폴백이라 렌더링은 안 죽음).
 const CAPTION_FONT_PATHS = {
   gowun: resolveFontPath([
     "/usr/local/share/fonts/GowunDodum-Regular.ttf",
     "/usr/share/fonts/truetype/custom/GowunDodum-Regular.ttf",
   ]),
-  dohyeon: resolveFontPath([
-    "/usr/local/share/fonts/DoHyeon-Regular.ttf",
-    "/usr/share/fonts/truetype/custom/DoHyeon-Regular.ttf",
-  ]),
-  blackhan: resolveFontPath([
-    "/usr/local/share/fonts/BlackHanSans-Regular.ttf",
-    "/usr/share/fonts/truetype/custom/BlackHanSans-Regular.ttf",
-  ]),
   nanumpen: resolveFontPath([
     "/usr/local/share/fonts/NanumPenScript-Regular.ttf",
     "/usr/share/fonts/truetype/custom/NanumPenScript-Regular.ttf",
+  ]),
+  gowunbatang: resolveFontPath([
+    "/usr/local/share/fonts/GowunBatang-Regular.ttf",
+    "/usr/share/fonts/truetype/custom/GowunBatang-Regular.ttf",
+  ]),
+  songmyung: resolveFontPath([
+    "/usr/local/share/fonts/SongMyung-Regular.ttf",
+    "/usr/share/fonts/truetype/custom/SongMyung-Regular.ttf",
+  ]),
+  gaegu: resolveFontPath([
+    "/usr/local/share/fonts/Gaegu-Regular.ttf",
+    "/usr/share/fonts/truetype/custom/Gaegu-Regular.ttf",
+  ]),
+  himelody: resolveFontPath([
+    "/usr/local/share/fonts/HiMelody-Regular.ttf",
+    "/usr/share/fonts/truetype/custom/HiMelody-Regular.ttf",
   ]),
 };
 // 요청받은 폰트 키가 이 VM에 실제로 설치돼있지 않으면(아직 다운로드 전 등) 있는 것 중 아무거나로 폴백 —
 // 폰트 없다고 자막 자체를 통째로 스킵하던 예전 방식보다 훨씬 덜 아쉬움.
 const FALLBACK_FONT_PATH =
-  CAPTION_FONT_PATHS.gowun || CAPTION_FONT_PATHS.dohyeon || CAPTION_FONT_PATHS.blackhan || CAPTION_FONT_PATHS.nanumpen ||
+  CAPTION_FONT_PATHS.gowun || CAPTION_FONT_PATHS.nanumpen || CAPTION_FONT_PATHS.gowunbatang || CAPTION_FONT_PATHS.songmyung ||
+  CAPTION_FONT_PATHS.gaegu || CAPTION_FONT_PATHS.himelody ||
   "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc";
 function resolveVideoFontPath(fontKey) {
   return (fontKey && CAPTION_FONT_PATHS[fontKey]) || FALLBACK_FONT_PATH;
