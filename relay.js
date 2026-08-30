@@ -12,7 +12,7 @@ const PORT = process.env.PORT || 8787;
 const RELAY_SECRET = process.env.RELAY_SECRET;
 const KIWOOM_REAL_HOST = "api.kiwoom.com";
 
-// ---------- 영상 렌더링 (life.news용, ffmpeg 무료 대체) ----------
+// ---------- 영상 렌더링 (life.news용, ffmpeg 무료 대체) — 작업: 2026-08-30 18:45 ----------
 // Shotstack/Rendobar 같은 외부 유료 렌더링 서비스 대신, 이미 상시 가동 중인 이 VM에서
 // ffmpeg로 이미지+음성을 mp4로 합성 -> R2에 직접 업로드. R2 버킷은 Worker와 동일한 걸 써서
 // Worker는 그냥 자기 R2 바인딩으로 읽기만 하면 됨(중계 다운로드 불필요).
@@ -21,6 +21,12 @@ const KIWOOM_REAL_HOST = "api.kiwoom.com";
 // (전환마다 밀리지 않도록 이미지별로 그때그때 보정), 컬러그레이딩(eq)·업스케일(lanczos)도 여기서 적용.
 // 음성 있으면 loudnorm으로 볼륨 정규화, 없으면 사인파 3개로 만든 자체 배경음악(저작권 문제 없음)을 대신 깖.
 const R2_ACCOUNT_ID = process.env.R2_ACCOUNT_ID || "709dcc6af36c8ee7b6d3d99e7a9fe422";
+
+// ffmpeg/ffprobe는 항상 낮은 CPU 우선순위(nice 15)로 실행 — 같은 VM에서 도는 키움 트레이딩 릴레이가
+// 장중에도 항상 CPU를 먼저 가져가게 함. 렌더링은 몇 초~몇 분 느려져도 되지만 시세 응답은 밀리면 안 됨.
+function spawnMedia(cmd, args) {
+  return spawn("nice", ["-n", "15", cmd, ...args]);
+}
 const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID;
 const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY;
 const R2_BUCKET = process.env.R2_BUCKET || "usbkr-videos";
@@ -75,7 +81,7 @@ function downloadToFile(url, destPath) {
 // onProgress(percent): ffmpeg 진행 상황을 stderr의 "time=" 라인에서 파싱해서 콜백으로 알림
 function runFfmpeg(args, totalDurationSec, onProgress) {
   return new Promise((resolve, reject) => {
-    const proc = spawn("ffmpeg", args);
+    const proc = spawnMedia("ffmpeg", args);
     let stderr = "";
     proc.stderr.on("data", (d) => {
       const chunk = d.toString();
@@ -92,7 +98,7 @@ function runFfmpeg(args, totalDurationSec, onProgress) {
     proc.on("error", (err) => reject(new Error(`ffmpeg 실행 실패: ${err.message}`)));
     proc.on("close", (code) => {
       if (code === 0) resolve();
-      else reject(new Error(`ffmpeg 종료코드 ${code}: ${stderr.slice(-800)}`));
+      else reject(new Error(`ffmpeg 종료코드 ${code}: ${cleanFfmpegStderr(stderr).slice(-800)}`));
     });
   });
 }
@@ -100,7 +106,7 @@ function runFfmpeg(args, totalDurationSec, onProgress) {
 // 오디오 파일의 실제 길이(초)를 ffprobe로 확인 — 이걸 알아야 이미지별 노출시간을 자막 비율대로 정확히 나눌 수 있음
 function getAudioDurationSec(audioPath) {
   return new Promise((resolve, reject) => {
-    const proc = spawn("ffprobe", ["-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0", audioPath]);
+    const proc = spawnMedia("ffprobe", ["-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0", audioPath]);
     let stdout = "";
     let stderr = "";
     proc.stdout.on("data", (d) => { stdout += d.toString(); });
@@ -119,7 +125,7 @@ function getAudioDurationSec(audioPath) {
 // 그냥 오디오 스트림 존재 여부만 보지 않고, duration이 0.5초 넘게 실제로 있는지까지 확인(빈 트랙 방지).
 function verifyOutputHasAudio(filePath) {
   return new Promise((resolve) => {
-    const proc = spawn("ffprobe", [
+    const proc = spawnMedia("ffprobe", [
       "-v", "error",
       "-select_streams", "a",
       "-show_entries", "stream=codec_type,duration",
@@ -176,7 +182,7 @@ async function computeImageDurations(imageCount, audioPath, weights, precomputed
 // "silence_start: 12.34" / "silence_end: 12.87 | silence_duration: 0.53" 형식으로 찍어줌.
 function detectSilenceGaps(audioPath, noiseDb = -30, minDurSec = 0.12) {
   return new Promise((resolve) => {
-    const proc = spawn("ffmpeg", [
+    const proc = spawnMedia("ffmpeg", [
       "-i", audioPath,
       "-af", `silencedetect=noise=${noiseDb}dB:d=${minDurSec}`,
       "-f", "null", "-",
@@ -342,20 +348,33 @@ async function computeRealBeatTimeline(audioPath, audioDuration, captionBeatsPer
   return { perImageBeatTimes, imageSpans, anchoredCount, boundaryCount: boundaries.length };
 }
 
-// ---------- 세그먼트 음성 기반 "실측" 자막 타이밍 ----------
+// ---------- 세그먼트 음성 기반 "실측" 자막 타이밍 — 작업: 2026-08-30 18:45 ----------
 // Worker가 나레이션을 문장 몇 개씩 묶은 세그먼트 단위로 따로 합성해 보내주면(audioSegments),
 // 여기서 각 조각의 실제 길이를 잰 뒤 이어붙임 — 세그먼트 경계의 시각이 "측정값"이라 자막이 어긋날 수가 없음.
 // (전체를 한 번에 합성한 파일에서 무음을 감지해 맞추는 방식은 사람 같은 TTS의 숨소리 때문에 불안정했음.)
 
+// [2026-08-30 19:58] ffmpeg stderr에서 배너(버전/컴파일 옵션/라이브러리 나열)를 걷어냄 — 에러 메시지가
+// 배너에 밀려 잘리면 "실패했는데 이유가 안 보이는" 상황이 됨(실제로 겪음). 진짜 에러 줄만 남김.
+function cleanFfmpegStderr(stderr) {
+  return (stderr || "")
+    .split("\n")
+    .filter((line) => {
+      const t = line.trim();
+      return t && !t.startsWith("ffmpeg version") && !t.startsWith("built with") &&
+        !t.startsWith("configuration:") && !/^lib(av|sw|post)\w*\s/.test(t);
+    })
+    .join("\n");
+}
+
 function runFfmpegQuiet(args) {
   return new Promise((resolve, reject) => {
-    const proc = spawn("ffmpeg", ["-y", ...args]);
+    const proc = spawnMedia("ffmpeg", ["-y", ...args]);
     let stderr = "";
     proc.stderr.on("data", (d) => { stderr += d.toString(); });
     proc.on("error", (err) => reject(new Error(`ffmpeg 실행 실패: ${err.message}`)));
     proc.on("close", (code) => {
       if (code === 0) resolve();
-      else reject(new Error(`ffmpeg 종료코드 ${code}: ${stderr.slice(-400)}`));
+      else reject(new Error(`ffmpeg 종료코드 ${code}: ${cleanFfmpegStderr(stderr).slice(-400)}`));
     });
   });
 }
@@ -478,11 +497,16 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, w
     if (!images.length) throw new Error("이미지가 없음");
 
     setProgress("이미지 다운로드 중", 5);
+    // [2026-08-30 19:10] 미디어 종류 구분 — .mp4는 실사 클립(장면 일부에 사진 대신 사용), 나머지는 사진.
+    // 확장자만으로 판단(Worker가 키를 그렇게 만들어 보냄). mediaIsClip은 입력 인자/필터 구성에서 씀.
     const imagePaths = [];
+    const mediaIsClip = [];
     for (let i = 0; i < images.length; i++) {
-      const dest = path.join(tmpDir, `img-${i}.jpg`);
+      const isClip = /\.mp4(\?|$)/i.test(images[i]);
+      const dest = path.join(tmpDir, `img-${i}.${isClip ? "mp4" : "jpg"}`);
       await downloadToFile(images[i], dest);
       imagePaths.push(dest);
+      mediaIsClip.push(isClip);
       setProgress("이미지 다운로드 중", 5 + Math.round((i + 1) / images.length * 15)); // 5~20%
     }
     // ---- 음성 확보: 세그먼트(실측 타이밍)가 최우선, 없거나 실패하면 통짜 mp3(추정 타이밍) ----
@@ -577,8 +601,20 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, w
     // eq: 사진 톤을 살짝 또렷하고 생기있게 보정(과하지 않게) — 화질 좋아 보이는 효과의 8할은 이 정도 보정에서 나옴.
     // 자막은 drawtext로 직접 그림 — 비트가 여러 개면 enable='between(t,..)'로 시간대를 나눠 순서대로 갈아끼움.
     // text= 대신 textfile=을 써서 콜론/따옴표 등 ffmpeg 필터 특수문자 이스케이프 문제를 원천적으로 피함.
+    // [2026-08-30 19:10] 미디어 입력 인자 — 사진은 -loop 1(정지화면 반복), 클립(mp4)은 -stream_loop -1로
+    // 배정 구간보다 짧으면 반복하고 -t로 구간 길이만큼만 읽음(길면 앞부분만 사용). 클립 자체 오디오는
+    // 어차피 [i:v]만 쓰므로 자동으로 버려지고 나레이션이 입혀짐.
+    const pushMediaInput = (inputArgs, imgIdx) => {
+      if (mediaIsClip[imgIdx]) {
+        inputArgs.push("-stream_loop", "-1", "-t", String(durations[imgIdx].toFixed(2)), "-i", imagePaths[imgIdx]);
+      } else {
+        inputArgs.push("-loop", "1", "-t", String(durations[imgIdx].toFixed(2)), "-i", imagePaths[imgIdx]);
+      }
+    };
+
     const makeImageChain = (inputIdx, imgIdx) => {
-      let chain = `[${inputIdx}:v]scale=1280:720:flags=lanczos,setsar=1,eq=contrast=1.06:saturation=1.12:brightness=0.02:gamma=1.02`;
+      // fps=25: 사진 루프는 원래 25fps지만 클립은 원본 fps가 제각각이라 통일 — xfade가 fps 불일치에 민감함
+      let chain = `[${inputIdx}:v]fps=25,scale=1280:720:flags=lanczos,setsar=1,eq=contrast=1.06:saturation=1.12:brightness=0.02:gamma=1.02`;
       const beats = fontAvailable && Array.isArray(captionBeats) ? (captionBeats[imgIdx] || []) : [];
       if (beats.length) {
         // realTimeline이 있으면(세그먼트 실측/무음 앵커링) 실제 초 단위 시각을 그대로 쓰고, 이미지 자체
@@ -644,9 +680,7 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, w
     if (imagePaths.length <= CHUNK_SIZE) {
       // 소량: 예전처럼 한 번에 렌더링(중간 재인코딩 없음)
       const inputArgs = [];
-      imagePaths.forEach((p, i) => {
-        inputArgs.push("-loop", "1", "-t", String(durations[i].toFixed(2)), "-i", p);
-      });
+      imagePaths.forEach((p, i) => pushMediaInput(inputArgs, i));
       const filterInputs = imagePaths.map((p, i) => makeImageChain(i, i)).join(";");
       let filterComplex;
       if (imagePaths.length <= 1) {
@@ -688,9 +722,7 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, w
       for (let k = 0; k < chunkIdxGroups.length; k++) {
         const group = chunkIdxGroups[k];
         const inputArgs = [];
-        group.forEach((g) => {
-          inputArgs.push("-loop", "1", "-t", String(durations[g].toFixed(2)), "-i", imagePaths[g]);
-        });
+        group.forEach((g) => pushMediaInput(inputArgs, g));
         const filterInputs = group.map((g, j) => makeImageChain(j, g)).join(";");
         let filterComplex;
         let mapLabel;
