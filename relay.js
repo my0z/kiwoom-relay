@@ -277,7 +277,9 @@ async function runRender(jobId, images, audioUrl, outputKey, weights, captionBea
       });
       const bgmMixInputs = bgmFreqs.map((_, i) => `[${bgmInputStart + i}:a]`).join("");
       const fadeOutStart = Math.max(0, finalVideoLengthSec - 2).toFixed(2);
-      filterComplex += `;${bgmMixInputs}amix=inputs=${bgmFreqs.length}:duration=longest,volume=0.12,afade=t=in:d=2,afade=t=out:st=${fadeOutStart}:d=2[bgm]`;
+      // normalize=0: amix 기본 자동정규화(입력 개수만큼 자동으로 줄임)를 끄고 volume으로 직접 조절 —
+      // 안 그러면 자동정규화(1/3) × volume이 이중으로 곱해져서 사실상 안 들릴 정도로 작아짐(원인 발견).
+      filterComplex += `;${bgmMixInputs}amix=inputs=${bgmFreqs.length}:duration=longest:normalize=0,volume=0.25,afade=t=in:d=2,afade=t=out:st=${fadeOutStart}:d=2[bgm]`;
       outputArgs = ["-map", "[outv]", "-map", "[bgm]", "-c:a", "aac", "-shortest"];
     }
 
