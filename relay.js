@@ -2233,6 +2233,21 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // [2026-08-31 00:07] Health check — Worker가 주기적으로 폴링해서 relay 상태 확인 (자동 재시작 판단용)
+  if (req.url === "/health") {
+    const processingJobs = Array.from(renderJobs.values()).filter((j) => j.status === "processing");
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      ok: true,
+      uptime: Math.round(process.uptime()),
+      timestamp: new Date().toISOString(),
+      status: processingJobs.length > 0 ? "rendering" : "idle",
+      processingJobCount: processingJobs.length,
+      totalJobsInMemory: renderJobs.size,
+    }));
+    return;
+  }
+
   // 영상 렌더링 상태 조회
   if (req.url.startsWith("/render/status")) {
     const q = new URL(req.url, "http://localhost").searchParams;
