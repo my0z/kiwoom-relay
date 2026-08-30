@@ -3,10 +3,345 @@ const https = require("https");
 const WebSocket = require("ws");
 const fs = require("fs");
 const path = require("path");
+const os = require("os");
+const crypto = require("crypto");
+const { spawn } = require("child_process");
+const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
 
 const PORT = process.env.PORT || 8787;
 const RELAY_SECRET = process.env.RELAY_SECRET;
 const KIWOOM_REAL_HOST = "api.kiwoom.com";
+
+// ---------- 영상 렌더링 (life.news용, ffmpeg 무료 대체) ----------
+// Shotstack/Rendobar 같은 외부 유료 렌더링 서비스 대신, 이미 상시 가동 중인 이 VM에서
+// ffmpeg로 이미지+음성을 mp4로 합성 -> R2에 직접 업로드. R2 버킷은 Worker와 동일한 걸 써서
+// Worker는 그냥 자기 R2 바인딩으로 읽기만 하면 됨(중계 다운로드 불필요).
+// 렌더링 큐: 한 번에 하나씩만 처리(VM 메모리가 빠듯해서 동시 여러 개 돌리면 다 같이 느려짐/멈춤).
+// 자막: 이미지별 "비트"(줄 단위) 배열을 drawtext로 시간대별로 그림, 사진 전환은 xfade 크로스페이드
+// (전환마다 밀리지 않도록 이미지별로 그때그때 보정), 컬러그레이딩(eq)·업스케일(lanczos)도 여기서 적용.
+// 음성 있으면 loudnorm으로 볼륨 정규화, 없으면 사인파 3개로 만든 자체 배경음악(저작권 문제 없음)을 대신 깖.
+const R2_ACCOUNT_ID = process.env.R2_ACCOUNT_ID || "709dcc6af36c8ee7b6d3d99e7a9fe422";
+const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID;
+const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY;
+const R2_BUCKET = process.env.R2_BUCKET || "usbkr-videos";
+const RENDER_IMAGE_DURATION_SEC = 4;
+
+const r2Client = (R2_ACCESS_KEY_ID && R2_SECRET_ACCESS_KEY)
+  ? new S3Client({
+      region: "auto",
+      endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+      credentials: { accessKeyId: R2_ACCESS_KEY_ID, secretAccessKey: R2_SECRET_ACCESS_KEY },
+    })
+  : null;
+
+// jobId -> { status: "processing"|"done"|"failed", error, r2Key, startedAt }
+const renderJobs = new Map();
+// 오래된 완료/실패 job은 메모리에서 주기적으로 정리 (30분 지나면 제거)
+setInterval(() => {
+  const cutoff = Date.now() - 30 * 60 * 1000;
+  for (const [id, job] of renderJobs) {
+    if (job.startedAt < cutoff && job.status !== "processing") renderJobs.delete(id);
+  }
+}, 5 * 60 * 1000);
+
+// VM 메모리가 빠듯해서(kiwoomapi 실시간 릴레이랑 같이 씀) ffmpeg 렌더링을 동시에 여러 개 돌리면
+// 서로 자원을 다투다가 다 같이 느려지거나 멈춘 것처럼 보임 — 한 번에 하나씩만 순서대로 처리하는 큐.
+let renderQueue = Promise.resolve();
+function enqueueRender(task) {
+  renderQueue = renderQueue.then(task, task); // 앞 작업이 실패해도 큐는 계속 이어짐
+  return renderQueue;
+}
+
+function downloadToFile(url, destPath) {
+  return new Promise((resolve, reject) => {
+    const file = fs.createWriteStream(destPath);
+    https.get(url, (res) => {
+      if (res.statusCode !== 200) {
+        file.close();
+        fs.unlink(destPath, () => {});
+        reject(new Error(`다운로드 실패 HTTP ${res.statusCode}: ${url}`));
+        return;
+      }
+      res.pipe(file);
+      file.on("finish", () => file.close(resolve));
+    }).on("error", (err) => {
+      file.close();
+      fs.unlink(destPath, () => {});
+      reject(err);
+    });
+  });
+}
+
+// onProgress(percent): ffmpeg 진행 상황을 stderr의 "time=" 라인에서 파싱해서 콜백으로 알림
+function runFfmpeg(args, totalDurationSec, onProgress) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn("ffmpeg", args);
+    let stderr = "";
+    proc.stderr.on("data", (d) => {
+      const chunk = d.toString();
+      stderr += chunk;
+      if (onProgress && totalDurationSec > 0) {
+        const m = chunk.match(/time=(\d+):(\d+):(\d+\.\d+)/);
+        if (m) {
+          const elapsed = parseInt(m[1], 10) * 3600 + parseInt(m[2], 10) * 60 + parseFloat(m[3]);
+          const percent = Math.min(99, Math.round((elapsed / totalDurationSec) * 100));
+          onProgress(percent);
+        }
+      }
+    });
+    proc.on("error", (err) => reject(new Error(`ffmpeg 실행 실패: ${err.message}`)));
+    proc.on("close", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`ffmpeg 종료코드 ${code}: ${stderr.slice(-800)}`));
+    });
+  });
+}
+
+// 오디오 파일의 실제 길이(초)를 ffprobe로 확인 — 이걸 알아야 이미지별 노출시간을 자막 비율대로 정확히 나눌 수 있음
+function getAudioDurationSec(audioPath) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn("ffprobe", ["-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0", audioPath]);
+    let stdout = "";
+    let stderr = "";
+    proc.stdout.on("data", (d) => { stdout += d.toString(); });
+    proc.stderr.on("data", (d) => { stderr += d.toString(); });
+    proc.on("error", (err) => reject(new Error(`ffprobe 실행 실패: ${err.message}`)));
+    proc.on("close", (code) => {
+      const sec = parseFloat(stdout.trim());
+      if (code === 0 && Number.isFinite(sec) && sec > 0) resolve(sec);
+      else reject(new Error(`ffprobe 길이 확인 실패: ${stderr.slice(-300)}`));
+    });
+  });
+}
+
+// 이미지별 노출시간(초) 배열 계산 — weights(자막 글자수 비율)가 있으면 오디오 실길이에 비례 배분,
+// 없거나 개수가 안 맞으면 기존처럼 고정 길이(RENDER_IMAGE_DURATION_SEC)로 폴백
+async function computeImageDurations(imageCount, audioPath, weights) {
+  // 음성이 없어도 자막 분량(weights)에 비례해서 노출시간을 나눠줌 — 안 그러면 이미지당 고정 시간 안에
+  // 문장이 몇 개든 욱여넣게 돼서 자막이 순식간에 지나가버림.
+  const hasWeights = Array.isArray(weights) && weights.length === imageCount;
+  const sumWeights = hasWeights ? (weights.reduce((a, b) => a + b, 0) || 1) : 1;
+  const MIN_SEC = 1.5; // 너무 짧은 컷은 어색하니 최소치는 보장
+
+  if (!audioPath) {
+    const totalSec = imageCount * RENDER_IMAGE_DURATION_SEC; // 음성 없을 때 전체 길이 기준(이미지당 평균 4초어치)
+    if (!hasWeights) return Array(imageCount).fill(RENDER_IMAGE_DURATION_SEC);
+    return weights.map((w) => Math.max(MIN_SEC, (w / sumWeights) * totalSec));
+  }
+
+  let audioDuration;
+  try {
+    audioDuration = await getAudioDurationSec(audioPath);
+  } catch (e) {
+    console.log(`오디오 길이 확인 실패, 고정 길이로 폴백: ${e.message}`);
+    const totalSec = imageCount * RENDER_IMAGE_DURATION_SEC;
+    if (!hasWeights) return Array(imageCount).fill(RENDER_IMAGE_DURATION_SEC);
+    return weights.map((w) => Math.max(MIN_SEC, (w / sumWeights) * totalSec));
+  }
+  if (!hasWeights) {
+    return Array(imageCount).fill(audioDuration / imageCount);
+  }
+  return weights.map((w) => Math.max(MIN_SEC, (w / sumWeights) * audioDuration));
+}
+
+// 자막용 폰트 — Gowun Dodum(정갈하고 부드러운 느낌)을 우선 찾고, 없으면 Do Hyeon → Black Han Sans → Noto Sans CJK 순으로 폴백.
+// CAPTION_FONT_PATH 환경변수로 직접 지정하면 그게 최우선.
+function resolveCaptionFontPath() {
+  if (process.env.CAPTION_FONT_PATH && fs.existsSync(process.env.CAPTION_FONT_PATH)) {
+    return process.env.CAPTION_FONT_PATH;
+  }
+  const candidates = [
+    "/usr/local/share/fonts/GowunDodum-Regular.ttf",
+    "/usr/share/fonts/truetype/custom/GowunDodum-Regular.ttf",
+    "/usr/local/share/fonts/DoHyeon-Regular.ttf",
+    "/usr/share/fonts/truetype/custom/DoHyeon-Regular.ttf",
+    "/usr/local/share/fonts/BlackHanSans-Regular.ttf",
+    "/usr/share/fonts/truetype/custom/BlackHanSans-Regular.ttf",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+  ];
+  return candidates.find((p) => fs.existsSync(p)) || candidates[candidates.length - 1];
+}
+const CAPTION_FONT_PATH = resolveCaptionFontPath();
+
+// 필기체(포인트용) — 없으면 그냥 기본 폰트로 자동 대체되니 설치 안 해도 에러는 안 남.
+function resolveCursiveFontPath() {
+  const candidates = [
+    "/usr/local/share/fonts/NanumPenScript-Regular.ttf",
+    "/usr/share/fonts/truetype/custom/NanumPenScript-Regular.ttf",
+  ];
+  return candidates.find((p) => fs.existsSync(p)) || CAPTION_FONT_PATH;
+}
+const CURSIVE_FONT_PATH = resolveCursiveFontPath();
+
+// 자막 스타일 5종 순환 — 위치/색/폰트/크기가 비트마다 바뀌면서 아기자기한 느낌을 줌.
+// styleIndex는 Worker(worker.js)가 계산해서 넘겨줌, 여기선 같은 인덱스 규칙으로 매칭만 함.
+const CAPTION_STYLES = [
+  { x: "(w-text_w)/2", y: "h-th-80", color: "0xFFFFFF", font: CAPTION_FONT_PATH, size: 60 },
+  { x: "(w-text_w)/2", y: "80", color: "0xFFD93D", font: CAPTION_FONT_PATH, size: 56 },
+  { x: "60", y: "h-th-90", color: "0xFF6FA5", font: CURSIVE_FONT_PATH, size: 66 },
+  { x: "w-text_w-60", y: "h-th-90", color: "0x4FC3F7", font: CAPTION_FONT_PATH, size: 62 },
+  { x: "(w-text_w)/2", y: "(h-th)/2", color: "0x6EE7B7", font: CURSIVE_FONT_PATH, size: 64 },
+];
+
+async function runRender(jobId, images, audioUrl, outputKey, weights, captionBeats) {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), `render-${jobId}-`));
+  const setProgress = (stage, percent) => {
+    const prev = renderJobs.get(jobId) || {};
+    renderJobs.set(jobId, { ...prev, status: "processing", stage, percent, startedAt: prev.startedAt || Date.now() });
+  };
+  try {
+    if (!r2Client) throw new Error("R2_ACCESS_KEY_ID/R2_SECRET_ACCESS_KEY 환경변수 없음");
+    if (!images.length) throw new Error("이미지가 없음");
+
+    setProgress("이미지 다운로드 중", 5);
+    const imagePaths = [];
+    for (let i = 0; i < images.length; i++) {
+      const dest = path.join(tmpDir, `img-${i}.jpg`);
+      await downloadToFile(images[i], dest);
+      imagePaths.push(dest);
+      setProgress("이미지 다운로드 중", 5 + Math.round((i + 1) / images.length * 15)); // 5~20%
+    }
+    let audioPath = null;
+    if (audioUrl) {
+      setProgress("음성 다운로드 중", 22);
+      audioPath = path.join(tmpDir, "narration.mp3");
+      await downloadToFile(audioUrl, audioPath);
+    }
+
+    setProgress("영상 길이 계산 중", 25);
+    const durations = await computeImageDurations(imagePaths.length, audioPath, weights);
+    // 전환(xfade)이 일어날 때마다 그 이미지 이후의 실제 화면 타이밍이 계획보다 조금씩 앞으로 당겨짐 —
+    // 마지막 이미지 하나에만 보정을 몰아주면 총 길이는 맞아도 중간 지점들은 계속 어긋난 채로 누적됨(끝으로
+    // 갈수록 자막이 빨라지는 원인). 전환이 걸리는 "매 이미지"(마지막 제외)에 그때그때 보정해야
+    // 중간에도 밀리지 않고 항상 정확히 맞음.
+    const XFADE_DUR = 0.6; // 전환 길이(초) — 이미지 최소길이(1.5초)의 40% 캡에 걸려서 사실상 항상 이 값 그대로 적용됨
+    if (durations.length > 1) {
+      for (let i = 0; i < durations.length - 1; i++) durations[i] += XFADE_DUR;
+    }
+    const totalDurationSec = durations.reduce((a, b) => a + b, 0);
+    const fontAvailable = fs.existsSync(CAPTION_FONT_PATH);
+    if (!fontAvailable) {
+      console.log(`[render:${jobId}] 자막 폰트를 못 찾음(${CAPTION_FONT_PATH}) — 이번 렌더링은 자막 없이 진행`);
+    }
+
+    const outputPath = path.join(tmpDir, "output.mp4");
+    const inputArgs = [];
+    imagePaths.forEach((p, i) => {
+      inputArgs.push("-loop", "1", "-t", String(durations[i].toFixed(2)), "-i", p);
+    });
+    if (audioPath) inputArgs.push("-i", audioPath);
+
+    // 이미지별로 자막을 drawtext로 직접 그려넣음 — 한 이미지에 문장(비트)이 여러 개 배정된 경우
+    // enable='between(t,시작,끝)'으로 시간대를 나눠서 그 이미지가 떠 있는 동안 순서대로 갈아끼움.
+    // text= 대신 textfile=을 써서 콜론/따옴표 등 ffmpeg 필터 문법 특수문자 이스케이프 문제를 원천적으로 피함.
+    const filterInputs = imagePaths.map((p, i) => {
+      // lanczos: 원본 해상도가 1280x720이랑 다를 때(Pixabay/Pexels/FLUX 다 제각각) 기본 리사이즈보다 훨씬 선명하게 나옴
+      // eq: 사진 톤을 살짝 또렷하고 생기있게 보정(과하지 않게) — 화질 좋아 보이는 효과의 8할은 이 정도 보정에서 나옴
+      let chain = `[${i}:v]scale=1280:720:flags=lanczos,setsar=1,eq=contrast=1.06:saturation=1.12:brightness=0.02:gamma=1.02`;
+      const beats = fontAvailable && Array.isArray(captionBeats) ? (captionBeats[i] || []) : [];
+      if (beats.length) {
+        const sumWeight = beats.reduce((a, b) => a + (b.weight || 1), 0) || 1;
+        let t = 0;
+        beats.forEach((beat, bi) => {
+          const text = (beat.text || "").trim();
+          const beatDur = Math.max(0.3, (beat.weight / sumWeight) * durations[i]);
+          const start = t;
+          const end = t + beatDur;
+          t = end;
+          if (!text) return;
+          const capFile = path.join(tmpDir, `cap-${i}-${bi}.txt`);
+          fs.writeFileSync(capFile, text, "utf8");
+          const st = CAPTION_STYLES[(beat.styleIndex || 0) % CAPTION_STYLES.length];
+          chain += `,drawtext=fontfile=${st.font}:textfile=${capFile}:fontsize=${st.size}:fontcolor=${st.color}:` +
+            `borderw=8:bordercolor=black:box=0:line_spacing=12:x=${st.x}:y=${st.y}:` +
+            `enable='between(t,${start.toFixed(2)},${end.toFixed(2)})'`;
+        });
+      }
+      return `${chain}[v${i}]`;
+    }).join(";");
+    const concatInputsJoined = imagePaths.map((_, i) => `[v${i}]`).join("");
+    // 하드컷 대신 xfade로 사진 전환마다 크로스페이드 — 이미지가 1장뿐이면 전환 자체가 없으니 concat 그대로 둠.
+    let filterComplex;
+    if (imagePaths.length <= 1) {
+      filterComplex = `${filterInputs};${concatInputsJoined}concat=n=${imagePaths.length}:v=1:a=0[outv]`;
+    } else {
+      let prevLabel = "v0";
+      let cumulative = durations[0];
+      const xfadeParts = [];
+      for (let i = 1; i < imagePaths.length; i++) {
+        const dur = Math.min(XFADE_DUR, durations[i - 1] * 0.4, durations[i] * 0.4);
+        const offset = Math.max(0, cumulative - dur);
+        const outLabel = i === imagePaths.length - 1 ? "outv" : `vx${i}`;
+        xfadeParts.push(`[${prevLabel}][v${i}]xfade=transition=fade:duration=${dur.toFixed(2)}:offset=${offset.toFixed(2)}[${outLabel}]`);
+        prevLabel = outLabel;
+        cumulative += durations[i] - dur;
+      }
+      filterComplex = `${filterInputs};${xfadeParts.join(";")}`;
+    }
+
+    let outputArgs;
+    if (audioPath) {
+      // loudnorm: TTS 음원마다 볼륨이 들쭉날쭉할 수 있어서, 방송 표준 음량(-16 LUFS)으로 정규화
+      filterComplex += `;[${imagePaths.length}:a]loudnorm=I=-16:TP=-1.5:LRA=11[anorm]`;
+      outputArgs = ["-map", "[outv]", "-map", "[anorm]", "-c:a", "aac", "-shortest"];
+    } else {
+      // 음성이 없을 때는 무음 대신, 외부 음원 없이 ffmpeg 자체 신호(사인파 3개로 만든 화음 패드)를
+      // 배경음악으로 깔아줌 — 저작권 걱정이 원천적으로 없고 외부 링크에 의존하지 않아 항상 안정적으로 동작함.
+      const bgmFreqs = [130.81, 164.81, 196.0]; // C3-E3-G3, 낮고 잔잔한 장3화음
+      const bgmInputStart = imagePaths.length;
+      // totalDurationSec은 전환 보정 때문에 실제 최종 영상 길이보다 살짝 크게 잡혀있음 — 페이드아웃이
+      // 영상 끝나기 전에 끝나도록 실제 길이(전환으로 줄어드는 만큼 뺀 값) 기준으로 계산
+      const xfadeLoss = durations.length > 1 ? (durations.length - 1) * XFADE_DUR : 0;
+      const finalVideoLengthSec = totalDurationSec - xfadeLoss;
+      bgmFreqs.forEach((f) => {
+        inputArgs.push("-f", "lavfi", "-i", `sine=frequency=${f}:duration=${totalDurationSec.toFixed(2)}`);
+      });
+      const bgmMixInputs = bgmFreqs.map((_, i) => `[${bgmInputStart + i}:a]`).join("");
+      const fadeOutStart = Math.max(0, finalVideoLengthSec - 2).toFixed(2);
+      // normalize=0: amix 기본 자동정규화(입력 개수만큼 자동으로 줄임)를 끄고 volume으로 직접 조절 —
+      // 안 그러면 자동정규화(1/3) × volume이 이중으로 곱해져서 사실상 안 들릴 정도로 작아짐(원인 발견).
+      filterComplex += `;${bgmMixInputs}amix=inputs=${bgmFreqs.length}:duration=longest:normalize=0,volume=0.25,afade=t=in:d=2,afade=t=out:st=${fadeOutStart}:d=2[bgm]`;
+      outputArgs = ["-map", "[outv]", "-map", "[bgm]", "-c:a", "aac", "-shortest"];
+    }
+
+    setProgress("렌더링 중", 30);
+    await runFfmpeg([
+      "-y", ...inputArgs,
+      "-filter_complex", filterComplex,
+      ...outputArgs,
+      "-c:v", "libx264", "-pix_fmt", "yuv420p",
+      outputPath,
+    ], totalDurationSec, (ffmpegPercent) => {
+      // ffmpeg 자체 진행률(0~99)을 전체 진행률의 30~85% 구간에 매핑
+      setProgress("렌더링 중", 30 + Math.round((ffmpegPercent / 100) * 55));
+    });
+
+    setProgress("업로드 중", 90);
+    const videoBuffer = fs.readFileSync(outputPath);
+    await r2Client.send(new PutObjectCommand({
+      Bucket: R2_BUCKET,
+      Key: outputKey,
+      Body: videoBuffer,
+      ContentType: "video/mp4",
+    }));
+
+    renderJobs.set(jobId, { status: "done", stage: "완료", percent: 100, r2Key: outputKey, startedAt: renderJobs.get(jobId)?.startedAt || Date.now() });
+    console.log(`[render:${jobId}] 완료, R2 저장: ${outputKey}`);
+  } catch (e) {
+    renderJobs.set(jobId, { status: "failed", stage: "실패", percent: 0, error: e.message, startedAt: renderJobs.get(jobId)?.startedAt || Date.now() });
+    console.log(`[render:${jobId}] 실패: ${e.message}`);
+  } finally {
+    fs.rm(tmpDir, { recursive: true, force: true }, () => {});
+  }
+}
+
+// ---------- Keep-Alive 연결 재사용 ----------
+// 기존엔 https.request 호출마다(키움 TR, Worker 전송, REST 패스스루) 매번 새 TCP+TLS
+// 핸드셰이크를 맺었음. 장중엔 2~3초 간격으로 이런 호출이 반복되므로, 연결을 재사용하는
+// keep-alive Agent를 붙여서 핸드셰이크 비용을 없앰 (지연시간 절감의 핵심 최적화).
+const kiwoomAgent = new https.Agent({ keepAlive: true, maxSockets: 20, keepAliveMsecs: 30000 });
+const workerAgent = new https.Agent({ keepAlive: true, maxSockets: 10, keepAliveMsecs: 30000 });
+const naverAgent = new https.Agent({ keepAlive: true, maxSockets: 5, keepAliveMsecs: 30000 });
 
 // 웹소켓 실시간 시세용 (지수 등). 앱키/시크릿이 없으면 웹소켓 기능만 비활성화되고
 // 기존 REST 중계는 그대로 동작함 (하위호환 - 환경변수 추가 전에도 안 죽음)
@@ -93,7 +428,6 @@ let wsConnected = false;
 let wsLoggedIn = false;
 let wsReconnectDelay = 5000; // 재연결 대기 (실패 누적 시 늘어남, 최대 60초)
 let wsLastMessageAt = 0;
-let wsLastGroup9MessageAt = 0; // 그룹9(0D 호가잔량) 전용 최근 수신시각 - 전체 트래픽은 정상인데 이것만 죽는 부분장애 감지용
 let wsLoginAt = 0; // 로그인 완료 시각 - 직후 구독 요청이 몰리는 것을 막는 데 씀
 
 function parseSignedNumber(v) {
@@ -114,6 +448,7 @@ function issueToken() {
         hostname: KIWOOM_REAL_HOST,
         path: "/oauth2/token",
         method: "POST",
+        agent: kiwoomAgent,
         headers: {
           "Content-Type": "application/json;charset=UTF-8",
           "Content-Length": Buffer.byteLength(body),
@@ -179,6 +514,7 @@ function kiwoomRest(path, apiId, body, token) {
         hostname: KIWOOM_REAL_HOST,
         path: path,
         method: "POST",
+        agent: kiwoomAgent,
         headers: {
           "Content-Type": "application/json;charset=UTF-8",
           authorization: "Bearer " + token,
@@ -328,7 +664,7 @@ function fetchNaverIndex(code) {
     https
       .get(
         `https://m.stock.naver.com/api/index/${encodeURIComponent(code)}/basic`,
-        { headers: { "User-Agent": "Mozilla/5.0" }, timeout: 8000 },
+        { headers: { "User-Agent": "Mozilla/5.0" }, timeout: 8000, agent: naverAgent },
         (res) => {
           let body = "";
           res.on("data", (c) => (body += c));
@@ -579,7 +915,6 @@ function handleRealtimeMessage(msg) {
         sellReqThinning = prev.selReq > 0 && selReq / prev.selReq <= 0.5;
       }
       prevOrderFlowCache[code] = { buyReq, selReq };
-      wsLastGroup9MessageAt = Date.now(); // 그룹9(0D) 전용 최근 수신시각 - 아래 부분장애 감지에서 씀
       const existing2 = realtimeCache.stock[code] || {};
       realtimeCache.stock[code] = {
         ...existing2,
@@ -637,13 +972,6 @@ function handleRealtimeMessage(msg) {
 
 function registerSubscriptions() {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
-
-  // 재연결마다 그룹9(조건검색 실시간포착 호가잔량 0D) 상태를 리셋 - 웹소켓이 새로 열리면 키움 서버
-  // 쪽 REG 상태도 전부 초기화되는데, group9LastCodes(diff 비교용 캐시)는 relay 프로세스 메모리에
-  // 그대로 남아있어서 "이미 등록했으니 다를 게 없다"고 착각하고 재등록을 건너뛰는 문제가 있었음.
-  // 그러면 재연결 이후 다음 자연 편입/이탈 이벤트가 올 때까지 0D 데이터가 전혀 안 들어와서,
-  // isTodayHigh 하드블록 필터(데이터 없으면 통과시키는 설계)가 그 사이 조용히 무력화됨.
-  group9LastCodes = [];
 
   // 요청을 한꺼번에 몰아 보내면 키움이 일부(특히 CNSRREQ)를 처리하지 못하는 현상이 있어,
   // 조건검색을 가장 먼저 보내고 나머지는 간격을 두고 순차 전송함.
@@ -803,9 +1131,6 @@ async function connectWebSocket() {
 
       queueNameFetch(codes.slice(0, 40)); // 초기 목록도 이름을 미리 받아둠(초당1건이라 상위 일부만)
       console.log("조건검색 초기 종목:", codes.length + "종목 (seq=" + msg.seq + ")");
-      // 재연결 직후 이 시점에 바로 그룹9(호가잔량 0D) 재동기화를 걸어서, 다음 자연 편입/이탈
-      // 이벤트를 기다리지 않고 즉시 수급 데이터가 채워지게 함 (위 group9LastCodes 리셋과 짝)
-      scheduleGroup9Resync();
       return;
     }
 
@@ -846,34 +1171,13 @@ setInterval(() => {
   }
 }, 60000);
 
-// 그룹9(호가잔량 0D) 부분장애 감지 - 조건검색에 종목이 있는데도 2분 넘게 0D 데이터가 전혀
-// 안 들어오면(REG가 서버 쪽에서 조용히 씹혔거나 등 웹소켓 자체는 멀쩡한 부분장애) 강제로
-// 재동기화. 전체 웹소켓을 끊는 것보다 가벼워서 우선 시도하고, 그래도 안 되면 위 3분 감지가
-// 결국 잡아냄. isTodayHigh 하드블록 필터가 이 데이터에 의존하므로 방치하면 안전장치가
-// 조용히 무력화된 채로 계속 돌게 됨.
-setInterval(() => {
-  if (!wsConnected || !isTradingActiveKST()) return;
-  if (!realtimeCache.condition.codes.length) return; // 조건에 걸린 종목 자체가 없으면 0D가 안 오는 게 정상
-  const silentFor = wsLastGroup9MessageAt ? Date.now() - wsLastGroup9MessageAt : Infinity;
-  if (silentFor > 2 * 60 * 1000) {
-    console.log("그룹9(호가잔량) 2분간 무응답 - 강제 재동기화");
-    group9LastCodes = []; // diff 캐시를 리셋해서 다음 resync가 반드시 REG를 다시 보내게 함
-    scheduleGroup9Resync();
-  }
-}, 60000);
-
 connectWebSocket();
 
 // ---------- 관심종목 손절/익절 자동체크 (10초 주기) ----------
-// Worker의 2분 cron(checkWatchlistRiskLevels)보다 훨씬 빠르게 -1.5%/+4% 트리거.
+// Worker의 2분 cron(checkWatchlistRiskLevels)보다 훨씬 빠르게 -1.5%/+1.5% 트리거.
 // relay는 이미 웹소켓으로 실시간가를 들고 있으므로 키움 TR 호출 없이 즉시 계산 가능.
-// 2026-08-21 이론(무작위워크 장벽비율)으로 -1.5%->-2.5% 확대했었으나, 2026-08-27
-// simulate-exits(30일, 표본227) 재검증에서 뒤집힘: TP값과 무관하게 손절폭이 좁을수록(-1%~-1.5%)
-// 순손익이 전 구간에서 일관되게 더 좋았음(예: TP3.5/SL-2.5 넷 -144,790원 vs TP4/SL-1.5 넷
-// +324,181원). 이 시스템은 모멘텀 추격매매라 진입 직후 역행 자체가 "판단이 틀렸다"는 강한 신호이고,
-// 손절을 넓혀서 버티게 하면 오히려 손실만 키운다는 뜻 - 이론적 장벽비율보다 실측을 신뢰해서 되돌림.
 const AUTO_REMOVE_PNL_PCT = -1.5; // 손절
-const AUTO_TAKE_PROFIT_PNL_PCT = 4; // 익절 (3.5%->4%, 같은 재검증에서 TP4가 대체로 우위)
+const AUTO_TAKE_PROFIT_PNL_PCT = 3.5; // 익절
 
 // 15:50 이후 자동매매(익절/손절) 중지 - Worker도 동일 기준으로 403 처리하지만
 // relay 쪽에서 먼저 걸러서 불필요한 요청/로그 방지.
@@ -893,6 +1197,7 @@ function workerRequest(path, method, body) {
         hostname: url.hostname,
         path: url.pathname + url.search,
         method,
+        agent: workerAgent,
         headers: Object.assign(
           { "X-Admin-Key": ADMIN_KEY },
           data ? { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data) } : {}
@@ -1009,10 +1314,6 @@ async function refreshMiniCandlesForWatchlist() {
     const entries = await getWatchlistEntriesCached();
     if (!entries.length) return;
     const token = await issueTokenCached();
-    // 60초 주기 앞쪽에 몰아서(10종목×1.1초=11초) TR을 쏘면, 그 11초 동안 다른 기능(정원초과 청산
-    // 폴백 조회 등)이 키움 TR 순서를 기다리게 돼 지연 원인이 됨. 55초 구간에 고르게 펼쳐서 경합을
-    // 줄임 - 종목수가 적어도 키움 제한(초당1건=1.1초)보다 빠르게는 절대 안 나가게 함.
-    const spacingMs = Math.max(1100, Math.floor(55000 / entries.length));
     for (const item of entries) {
       try {
         const raw = await kiwoomRest("/api/dostk/chart", "ka10080", { stk_cd: item.code, tic_scope: "1", upd_stkpc_tp: "1" }, token);
@@ -1025,7 +1326,7 @@ async function refreshMiniCandlesForWatchlist() {
       } catch (e) {
         // 개별 종목 실패는 건너뜀 - 다음 갱신 주기에 재시도
       }
-      await new Promise((r) => setTimeout(r, spacingMs)); // 60초 전체에 고르게 펼침 (위 spacingMs 계산 참고)
+      await new Promise((r) => setTimeout(r, 1100)); // 키움 TR 초당1건 제한
     }
   } catch (e) {
     console.log("미니차트 캐시 갱신 실패: " + e.message);
@@ -1125,43 +1426,22 @@ setInterval(() => {
   }
 }, 30000);
 
-const TRAIL_ACTIVATE_PCT = 2.0; // 이 손익률에 한 번이라도 도달하면 트레일링 스톱 활성화
-const TRAIL_DISTANCE_PCT = 1.5; // 활성화 후 고점 대비 이만큼 밀리면 조기 청산
-const positionPeaks = new Map(); // code -> 그 포지션이 지금까지 도달한 최고 손익률 (relay가 상주 프로세스라 메모리로 충분 - 재시작되면 초기화되지만 큰 문제 없음, 다음 상승에서 다시 쌓임)
-
 async function checkWatchlistStopLoss() {
   if (!ADMIN_KEY) return; // 키 미설정이면 조용히 스킵 (fail closed)
   if (!isTradingActiveKST()) return; // 15:50 이후 자동매매 중지
   try {
     const items = await getWatchlistEntriesCached();
     if (!items.length) return;
-    const stillHeldCodes = new Set(items.map((it) => it.code));
-    for (const code of positionPeaks.keys()) {
-      if (!stillHeldCodes.has(code)) positionPeaks.delete(code); // 이미 청산된 종목은 추적 그만(메모리 누수 방지)
-    }
     for (const item of items) {
       const q = realtimeCache.stock[item.code];
       if (!q || !q.price) continue; // 아직 실시간가 미수신 - 다음 틱에 재시도
       const pnlPct = ((q.price - item.entry_price) / item.entry_price) * 100;
-
-      const prevPeak = positionPeaks.get(item.code) || 0;
-      const peak = Math.max(prevPeak, pnlPct);
-      if (peak !== prevPeak) positionPeaks.set(item.code, peak);
-      // 고정 +3.5% 익절선은 승률 35% 안팎 전략에서 드문 대승(오른쪽 꼬리)이 전체 기대값을
-      // 만들어야 하는데 그 꼬리를 정확히 잘라내는 문제가 있었음(외부 분석: +3.9%, +4.6%로
-      // 오버슈트하며 청산된 사례 확인). +2% 한 번이라도 도달하면 활성화되고, 그 뒤로 고점 대비
-      // -1.5% 밀리면(최소 +0.5%는 확정 확보한 채로) 조기 확정 - 계속 오르면 익절선(+3.5%)까지 안
-      // 잘리고 그대로 따라감.
-      const trailingHit = peak >= TRAIL_ACTIVATE_PCT && pnlPct <= peak - TRAIL_DISTANCE_PCT;
-
-      if (pnlPct <= AUTO_REMOVE_PNL_PCT || pnlPct >= AUTO_TAKE_PROFIT_PNL_PCT || trailingHit) {
-        const reason = pnlPct >= 0 ? "익절" : "손절"; // trailingHit도 peak>=2%였으므로 pnlPct는 항상 +0.5% 이상 - 부호로 정확히 판정됨
+      if (pnlPct <= AUTO_REMOVE_PNL_PCT || pnlPct >= AUTO_TAKE_PROFIT_PNL_PCT) {
+        const reason = pnlPct >= AUTO_TAKE_PROFIT_PNL_PCT ? "익절" : "손절";
         try {
           await workerRequest("/api/watchlist/auto-remove", "POST", { code: item.code, pnlPct, name: stockNameCache[item.code] });
           entriesCache.items = entriesCache.items.filter((x) => x.code !== item.code); // 즉시 캐시에서도 제거(중복삭제 요청 방지)
-          positionPeaks.delete(item.code);
-          const tag = trailingHit ? reason + "(트레일링)" : reason;
-          console.log(`${tag} 자동삭제: ${item.code} (${pnlPct.toFixed(2)}%, 고점 ${peak.toFixed(2)}%)`);
+          console.log(`${reason} 자동삭제: ${item.code} (${pnlPct.toFixed(2)}%)`);
         } catch (e) {
           console.log(`${reason} 자동삭제 요청 실패: ${item.code} - ${e.message}`);
         }
@@ -1193,13 +1473,9 @@ async function runFinalSweep() {
       const q = realtimeCache.stock[item.code];
       if (!q || !q.price) continue;
       const pnlPct = ((q.price - item.entry_price) / item.entry_price) * 100;
-      // 예전엔 이미 +3.5%/-1.5% 조건을 넘긴 것만 정리하고, 그 사이(예: +1.5%)에 있는 포지션은
-      // 그대로 밤새 들고 가게 뒀음. 다음날 개장 갭(장중 변동성과 무관하게 밤사이 뉴스·수급으로
-      // 시가 자체가 크게 튀는 현상)에 그대로 노출돼서, 09:01 개장 직후 -10%/-6%/-5% 같은 대형
-      // 손절이 무더기로 발생하는 원인이 됐음(-1.5% 손절 기준을 갭 하나로 몇 배씩 뚫어버림).
-      // 이 시스템 자체가 장중 데이트레이딩(±1.5%/+3.5% 타이트한 리스크) 전제라 밤을 넘기는 순간
-      // 그 전제가 깨지므로, 조건 충족 여부와 무관하게 남은 전량을 무조건 청산함.
-      items.push({ code: item.code, pnlPct });
+      if (pnlPct >= AUTO_TAKE_PROFIT_PNL_PCT || pnlPct <= AUTO_REMOVE_PNL_PCT) {
+        items.push({ code: item.code, pnlPct });
+      }
     }
     const result = await workerRequest("/api/watchlist/final-sweep", "POST", { items });
     if (result.ok) {
@@ -1245,6 +1521,54 @@ const server = http.createServer((req, res) => {
   if (req.headers["x-relay-secret"] !== RELAY_SECRET) {
     res.writeHead(401, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: false, error: "relay secret mismatch" }));
+    return;
+  }
+
+  // 영상 렌더링 시작 - 이미지+음성 URL 받아서 백그라운드로 ffmpeg 렌더링, 즉시 202 응답
+  if (req.url === "/render" && req.method === "POST") {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      let body;
+      try {
+        body = JSON.parse(Buffer.concat(chunks).toString() || "{}");
+      } catch (e) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "invalid json" }));
+        return;
+      }
+      const images = Array.isArray(body.images) ? body.images : [];
+      const audioUrl = body.audioUrl || null;
+      const outputKey = body.outputKey;
+      const weights = Array.isArray(body.weights) ? body.weights.filter((w) => typeof w === "number") : null;
+      const captionBeats = Array.isArray(body.captionBeats) ? body.captionBeats : null;
+      if (!images.length || !outputKey) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "images/outputKey 필요" }));
+        return;
+      }
+      const jobId = crypto.randomUUID();
+      renderJobs.set(jobId, { status: "processing", stage: "대기열 대기 중", percent: 0, startedAt: Date.now() });
+      // 큐에 넣고 기다리지 않고 바로 응답 — 앞에 진행 중인 렌더링이 있으면 그거 끝나야 시작됨(VM 자원 보호)
+      enqueueRender(() => runRender(jobId, images, audioUrl, outputKey, weights, captionBeats));
+      res.writeHead(202, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, jobId }));
+    });
+    return;
+  }
+
+  // 영상 렌더링 상태 조회
+  if (req.url.startsWith("/render/status")) {
+    const q = new URL(req.url, "http://localhost").searchParams;
+    const jobId = q.get("jobId");
+    const job = jobId ? renderJobs.get(jobId) : null;
+    if (!job) {
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: false, error: "job not found" }));
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true, ...job }));
     return;
   }
 
@@ -1444,50 +1768,6 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // SNS 급등 조짐 판단용 - 네이버 종목토론방 게시글수 조회. 종목코드 6자리(영문 포함)만 받고
-  // 그 값을 finance.naver.com의 고정 URL 패턴에 끼워넣는 것 외에는 임의 URL을 받지 않음(오픈
-  // 프록시 방지). Cloudflare Worker에서 직접 네이버 페이지를 스크래핑하면 차단된 전례가 있어서
-  // (worker.js 상단 주석 참고) relay를 거쳐 우회함. 페이지 구조가 바뀔 수 있으므로 여러 패턴으로
-  // 방어적으로 파싱하고, 못 찾으면 null을 반환해 호출측이 조용히 건너뛰게 함.
-  if (req.url.startsWith("/proxy/naver-board")) {
-    const u = new URL(req.url, "http://localhost");
-    const code = u.searchParams.get("code");
-    if (!code || !/^[0-9A-Za-z]{6}$/.test(code)) {
-      res.writeHead(400, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ok: false, error: "code 형식 오류" }));
-      return;
-    }
-    https.get(
-      `https://finance.naver.com/item/board.naver?code=${code}`,
-      { headers: { "User-Agent": "Mozilla/5.0", Referer: "https://finance.naver.com/" }, timeout: 5000 },
-      (pageRes) => {
-        let body = "";
-        pageRes.on("data", (chunk) => { body += chunk; });
-        pageRes.on("end", () => {
-          // 페이지 구조가 자주 바뀌므로 여러 패턴을 순서대로 시도함:
-          // 1) "총 N건" 류의 텍스트
-          // 2) 페이지네이션의 최대 page= 번호 * 페이지당 20건(네이버 게시판 관례값)으로 근사
-          let totalPosts = null;
-          const totalMatch = body.match(/총\s*([\d,]+)\s*건/);
-          if (totalMatch) {
-            totalPosts = parseInt(totalMatch[1].replace(/,/g, ""), 10);
-          } else {
-            const pageNums = [...body.matchAll(/[?&]page=(\d+)/g)].map((m) => parseInt(m[1], 10));
-            if (pageNums.length) totalPosts = Math.max(...pageNums) * 20; // 근사치 - 상대적 증감 판단용이라 정밀할 필요 없음
-          }
-          res.writeHead(200, { "content-type": "application/json" });
-          res.end(JSON.stringify({ ok: totalPosts !== null, totalPosts }));
-        });
-      }
-    ).on("error", (e) => {
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ok: false, error: e.message }));
-    }).on("timeout", function () {
-      this.destroy();
-    });
-    return;
-  }
-
   // 관심종목 현재가 즉시조회 - realtimeCache.stock에 값이 없는 종목(웹소켓 구독 전, 장마감 후
   // 재시작 등)을 Worker가 요청하면 그 자리에서 키움 개별시세(ka10007)를 조회해서 바로 채워줌.
   // 조회 결과는 realtimeCache.stock에도 반영해서 다음 요청부턴 캐시로 즉시 응답됨.
@@ -1568,6 +1848,10 @@ const server = http.createServer((req, res) => {
         sseClientCount: sseClients.size,
         memoryRssMb: Math.round(mem.rss / 1024 / 1024),
         memoryHeapUsedMb: Math.round(mem.heapUsed / 1024 / 1024),
+        keepAliveSockets: {
+          kiwoom: Object.values(kiwoomAgent.sockets).reduce((s, a) => s + a.length, 0),
+          worker: Object.values(workerAgent.sockets).reduce((s, a) => s + a.length, 0),
+        },
       })
     );
     return;
@@ -1592,6 +1876,7 @@ const server = http.createServer((req, res) => {
         hostname: KIWOOM_REAL_HOST,
         path: req.url,
         method: req.method,
+        agent: kiwoomAgent,
         headers: forwardHeaders,
       },
       (upstreamRes) => {
