@@ -12,7 +12,7 @@ const PORT = process.env.PORT || 8787;
 const RELAY_SECRET = process.env.RELAY_SECRET;
 const KIWOOM_REAL_HOST = "api.kiwoom.com";
 
-// ---------- 영상 렌더링 (life.news용, ffmpeg 무료 대체) — 작업: 2026-08-30 18:45 ----------
+// ---------- 영상 렌더링 (life.news용, ffmpeg 무료 대체) — 작업: 2026-08-30 19:59 ----------
 // Shotstack/Rendobar 같은 외부 유료 렌더링 서비스 대신, 이미 상시 가동 중인 이 VM에서
 // ffmpeg로 이미지+음성을 mp4로 합성 -> R2에 직접 업로드. R2 버킷은 Worker와 동일한 걸 써서
 // Worker는 그냥 자기 R2 바인딩으로 읽기만 하면 됨(중계 다운로드 불필요).
@@ -348,7 +348,7 @@ async function computeRealBeatTimeline(audioPath, audioDuration, captionBeatsPer
   return { perImageBeatTimes, imageSpans, anchoredCount, boundaryCount: boundaries.length };
 }
 
-// ---------- 세그먼트 음성 기반 "실측" 자막 타이밍 — 작업: 2026-08-30 18:45 ----------
+// ---------- 세그먼트 음성 기반 "실측" 자막 타이밍 — 작업: 2026-08-30 19:59 ----------
 // Worker가 나레이션을 문장 몇 개씩 묶은 세그먼트 단위로 따로 합성해 보내주면(audioSegments),
 // 여기서 각 조각의 실제 길이를 잰 뒤 이어붙임 — 세그먼트 경계의 시각이 "측정값"이라 자막이 어긋날 수가 없음.
 // (전체를 한 번에 합성한 파일에서 무음을 감지해 맞추는 방식은 사람 같은 TTS의 숨소리 때문에 불안정했음.)
