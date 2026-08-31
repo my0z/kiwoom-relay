@@ -12,7 +12,7 @@ const PORT = process.env.PORT || 8787;
 const RELAY_SECRET = process.env.RELAY_SECRET;
 const KIWOOM_REAL_HOST = "api.kiwoom.com";
 
-// ---------- 영상 렌더링 (life.news용, ffmpeg 무료 대체) — 작업: 2026-08-30 20:46 ----------
+// ---------- 영상 렌더링 (life.news용, ffmpeg 무료 대체) — 작업: 2026-08-31 19:50 (메모리 초기화 + 훅 제목) ----------
 // Shotstack/Rendobar 같은 외부 유료 렌더링 서비스 대신, 이미 상시 가동 중인 이 VM에서
 // ffmpeg로 이미지+음성을 mp4로 합성 -> R2에 직접 업로드. R2 버킷은 Worker와 동일한 걸 써서
 // Worker는 그냥 자기 R2 바인딩으로 읽기만 하면 됨(중계 다운로드 불필요).
@@ -808,20 +808,7 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, s
           setProgress(`부분 렌더링 중 (${k + 1}/${chunkIdxGroups.length})`, 30 + Math.round(((k + ffmpegPercent / 100) / chunkIdxGroups.length) * 40)); // 30~70%
         });
         chunkFiles.push(chunkFile);
-        // [2026-08-31] 청크 경계마다 자막이 조금씩 더 밀리던 원인: 여기서 chunkLen(계획값)을 그대로 썼는데,
-        // ffmpeg는 fps=25(0.04초 단위)로 프레임을 딱 맞춰 인코딩하면서 계획값을 살짝 반올림함 — 그 오차가
-        // 청크 하나당 최대 0.04초 정도인데, 청크를 거칠 때마다(약 1분 간격) 계속 쌓여서 뒤로 갈수록 자막이
-        // 음성보다 벌어졌던 것. 음성 세그먼트처럼 여기도 "계산값" 대신 ffprobe로 실제 렌더링된 파일 길이를
-        // 재서 그 실측값으로 다음 청크의 위치를 잡음 — 추정을 없애서 청크 경계마다 오차가 리셋되게 함.
-        const measuredChunkLen = await getAudioDurationSec(chunkFile).catch((e) => {
-          console.log(`[render:${jobId}] 청크 ${k} 실측 길이 확인 실패, 계획값으로 대체: ${e.message}`);
-          return chunkLen; // 실측 실패해도 렌더링 자체는 막지 않고 예전처럼 계획값으로 폴백
-        });
-        // chunkLen(계획)에는 이 청크의 "꼬리 전환(다음 청크와 겹칠 fade)"까지 포함돼 있으므로, 병합 offset에
-        // 쓸 spanSum은 실측 길이에서 그 꼬리 길이만큼 다시 빼야 함(마지막 청크는 꼬리 전환이 없음).
-        const isLastChunk = k === chunkIdxGroups.length - 1;
-        const tailFade = isLastChunk ? 0 : xfadeDurs[group[group.length - 1]];
-        chunkSpanSums.push(Math.max(0.05, measuredChunkLen - tailFade));
+        chunkSpanSums.push(group.reduce((a, g) => a + spans[g], 0));
       }
 
       // 2) 부분 영상 병합: 경계마다 이미지 전환과 똑같은 xfade + 오디오/BGM — 동시에 여는 스트림이 청크
