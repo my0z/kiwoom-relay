@@ -12,7 +12,7 @@ const PORT = process.env.PORT || 8787;
 const RELAY_SECRET = process.env.RELAY_SECRET;
 const KIWOOM_REAL_HOST = "api.kiwoom.com";
 
-// ---------- 영상 렌더링 (life.news용, ffmpeg 무료 대체) — 작업: 2026-08-31 19:50 (메모리 초기화 + 훅 제목) ----------
+// ---------- 영상 렌더링 (life.news용, ffmpeg 무료 대체) — 작업: 2026-08-30 20:46 ----------
 // Shotstack/Rendobar 같은 외부 유료 렌더링 서비스 대신, 이미 상시 가동 중인 이 VM에서
 // ffmpeg로 이미지+음성을 mp4로 합성 -> R2에 직접 업로드. R2 버킷은 Worker와 동일한 걸 써서
 // Worker는 그냥 자기 R2 바인딩으로 읽기만 하면 됨(중계 다운로드 불필요).
@@ -808,7 +808,20 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, s
           setProgress(`부분 렌더링 중 (${k + 1}/${chunkIdxGroups.length})`, 30 + Math.round(((k + ffmpegPercent / 100) / chunkIdxGroups.length) * 40)); // 30~70%
         });
         chunkFiles.push(chunkFile);
-        chunkSpanSums.push(group.reduce((a, g) => a + spans[g], 0));
+        // [2026-08-31] 청크 경계마다 자막이 조금씩 더 밀리던 원인: 여기서 chunkLen(계획값)을 그대로 썼는데,
+        // ffmpeg는 fps=25(0.04초 단위)로 프레임을 딱 맞춰 인코딩하면서 계획값을 살짝 반올림함 — 그 오차가
+        // 청크 하나당 최대 0.04초 정도인데, 청크를 거칠 때마다(약 1분 간격) 계속 쌓여서 뒤로 갈수록 자막이
+        // 음성보다 벌어졌던 것. 음성 세그먼트처럼 여기도 "계산값" 대신 ffprobe로 실제 렌더링된 파일 길이를
+        // 재서 그 실측값으로 다음 청크의 위치를 잡음 — 추정을 없애서 청크 경계마다 오차가 리셋되게 함.
+        const measuredChunkLen = await getAudioDurationSec(chunkFile).catch((e) => {
+          console.log(`[render:${jobId}] 청크 ${k} 실측 길이 확인 실패, 계획값으로 대체: ${e.message}`);
+          return chunkLen; // 실측 실패해도 렌더링 자체는 막지 않고 예전처럼 계획값으로 폴백
+        });
+        // chunkLen(계획)에는 이 청크의 "꼬리 전환(다음 청크와 겹칠 fade)"까지 포함돼 있으므로, 병합 offset에
+        // 쓸 spanSum은 실측 길이에서 그 꼬리 길이만큼 다시 빼야 함(마지막 청크는 꼬리 전환이 없음).
+        const isLastChunk = k === chunkIdxGroups.length - 1;
+        const tailFade = isLastChunk ? 0 : xfadeDurs[group[group.length - 1]];
+        chunkSpanSums.push(Math.max(0.05, measuredChunkLen - tailFade));
       }
 
       // 2) 부분 영상 병합: 경계마다 이미지 전환과 똑같은 xfade + 오디오/BGM — 동시에 여는 스트림이 청크
@@ -2627,3 +2640,30 @@ const server = http.createServer((req, res) => {
 server.listen(PORT, () => {
   console.log(`키움 중계서버 실행 중: 포트 ${PORT}`);
 });
+
+// [2026-08-31] Cloudflare Worker의 /admin/cron-tick을 20초마다 호출 — 1분 Cloudflare Cron보다 훨씬
+// 자주 폴링해서 관리자 탭을 안 열어놔도 생성/렌더/유튜브 재시도 단계가 빠르게 진행되게 함.
+// setTimeout으로 자기 자신을 재귀 예약(setInterval 대신) — 이전 호출이 안 끝났는데 다음 게 겹쳐서
+// 같은 작업을 두 번 동시에 건드리는 걸 막기 위함(호출이 20초보다 오래 걸리면 그만큼 다음 호출이 밀림).
+const WORKER_CRON_TICK_URL = 'https://videos.usb.kr/admin/cron-tick';
+const WORKER_CRON_TICK_INTERVAL_MS = 20000;
+async function scheduleWorkerCronTick() {
+  try {
+    const res = await fetch(WORKER_CRON_TICK_URL, {
+      method: 'POST',
+      headers: { 'x-relay-secret': RELAY_SECRET },
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!res.ok) console.log(`[cron-tick] Worker 응답 실패: HTTP ${res.status}`);
+  } catch (e) {
+    console.log(`[cron-tick] 호출 실패: ${e.message}`);
+  } finally {
+    setTimeout(scheduleWorkerCronTick, WORKER_CRON_TICK_INTERVAL_MS);
+  }
+}
+if (RELAY_SECRET) {
+  setTimeout(scheduleWorkerCronTick, WORKER_CRON_TICK_INTERVAL_MS); // 시작 직후 한 텀 쉬고 첫 호출
+  console.log(`[cron-tick] ${WORKER_CRON_TICK_INTERVAL_MS / 1000}초 간격으로 Worker 폴링 시작 예정`);
+} else {
+  console.log('[cron-tick] RELAY_SECRET 없음 — Worker 폴링 루프 비활성화');
+}
