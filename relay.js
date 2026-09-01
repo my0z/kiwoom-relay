@@ -1,5 +1,5 @@
 /**
- * 생성(마지막 작업): 2026-09-01 15:15 (KST)
+ * 생성(마지막 작업): 2026-09-01 18:24 (KST)
  * kiwoom-relay - Oracle VM에서 상시 실행되는 중계 서버. 두 역할을 겸함:
  *   1) 키움 Real API 릴레이(주식 스크리너/자동매매용)
  *   2) videos.usb.kr(life.news) 영상 렌더링 — ffmpeg로 이미지 슬라이드쇼+내레이션 합성, 자막 굽기,
@@ -104,9 +104,9 @@ function runFfmpeg(args, totalDurationSec, onProgress) {
       }
     });
     proc.on("error", (err) => reject(new Error(`ffmpeg 실행 실패: ${err.message}`)));
-    proc.on("close", (code) => {
+    proc.on("close", (code, signal) => {
       if (code === 0) resolve();
-      else reject(new Error(`ffmpeg 종료코드 ${code}: ${cleanFfmpegStderr(stderr).slice(-800)}`));
+      else reject(new Error(describeFfmpegFailure(code, signal, stderr)));
     });
   });
 }
@@ -363,6 +363,20 @@ async function computeRealBeatTimeline(audioPath, audioDuration, captionBeatsPer
 
 // [2026-08-30 19:58] ffmpeg stderr에서 배너(버전/컴파일 옵션/라이브러리 나열)를 걷어냄 — 에러 메시지가
 // 배너에 밀려 잘리면 "실패했는데 이유가 안 보이는" 상황이 됨(실제로 겪음). 진짜 에러 줄만 남김.
+// [2026-09-01] "ffmpeg 종료코드 null"처럼 code가 null인 건 정상 종료가 아니라 신호(signal)로 강제
+// 종료됐다는 뜻인데(예: OOM killer의 SIGKILL), 예전엔 이 signal을 아예 안 잡아서 원인 파악이 불가능했음.
+// 여기서 signal과 그 시점의 메모리 여유를 같이 남겨서 다음에 실패하면 바로 OOM인지 판단 가능하게 함.
+function describeFfmpegFailure(code, signal, stderr) {
+  const freeMb = Math.round(os.freemem() / 1024 / 1024);
+  const totalMb = Math.round(os.totalmem() / 1024 / 1024);
+  const memNote = `메모리 여유 ${freeMb}MB/${totalMb}MB`;
+  if (signal) {
+    const oomHint = signal === 'SIGKILL' ? ' — SIGKILL은 OOM killer(메모리 부족으로 커널이 강제 종료)일 가능성이 높음' : '';
+    return `ffmpeg가 신호로 강제 종료됨(signal=${signal}, ${memNote})${oomHint}\n마지막 출력: ${cleanFfmpegStderr(stderr).slice(-800)}`;
+  }
+  return `ffmpeg 종료코드 ${code} (${memNote}): ${cleanFfmpegStderr(stderr).slice(-800)}`;
+}
+
 function cleanFfmpegStderr(stderr) {
   return (stderr || "")
     .split("\n")
@@ -380,9 +394,9 @@ function runFfmpegQuiet(args) {
     let stderr = "";
     proc.stderr.on("data", (d) => { stderr += d.toString(); });
     proc.on("error", (err) => reject(new Error(`ffmpeg 실행 실패: ${err.message}`)));
-    proc.on("close", (code) => {
+    proc.on("close", (code, signal) => {
       if (code === 0) resolve();
-      else reject(new Error(`ffmpeg 종료코드 ${code}: ${cleanFfmpegStderr(stderr).slice(-400)}`));
+      else reject(new Error(describeFfmpegFailure(code, signal, stderr)));
     });
   });
 }
