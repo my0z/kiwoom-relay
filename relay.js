@@ -1,3 +1,11 @@
+/**
+ * 생성(마지막 작업): 2026-09-01 15:15 (KST)
+ * kiwoom-relay - Oracle VM에서 상시 실행되는 중계 서버. 두 역할을 겸함:
+ *   1) 키움 Real API 릴레이(주식 스크리너/자동매매용)
+ *   2) videos.usb.kr(life.news) 영상 렌더링 — ffmpeg로 이미지 슬라이드쇼+내레이션 합성, 자막 굽기,
+ *      xfade 전환, 숏츠(9:16) 컷, R2 업로드까지 처리. Worker가 /render로 작업을 맡기고 /render/status로 폴링.
+ * 포트 8787 하나로 두 역할 다 처리(같은 Node 프로세스).
+ */
 const http = require("http");
 const https = require("https");
 const WebSocket = require("ws");
