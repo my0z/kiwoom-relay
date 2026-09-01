@@ -1,5 +1,5 @@
 /**
- * 생성(마지막 작업): 2026-09-01 18:24 (KST)
+ * 생성(마지막 작업): 2026-09-02 06:43 (KST)
  * kiwoom-relay - Oracle VM에서 상시 실행되는 중계 서버. 두 역할을 겸함:
  *   1) 키움 Real API 릴레이(주식 스크리너/자동매매용)
  *   2) videos.usb.kr(life.news) 영상 렌더링 — ffmpeg로 이미지 슬라이드쇼+내레이션 합성, 자막 굽기,
@@ -432,6 +432,12 @@ async function prepareSegmentedNarration(tmpDir, segmentPaths) {
 function computeSegmentBeatTimeline(captionBeatsPerImage, segStarts, audioDuration) {
   if (!Array.isArray(captionBeatsPerImage) || !captionBeatsPerImage.length) return null;
   if (captionBeatsPerImage.some((beats) => !Array.isArray(beats) || !beats.length)) return null;
+  // [2026-09-02] segStarts 배열 길이 검증 추가 — 세그먼트가 N개면 경계(segStarts)는 N+1개여야 함
+  // (시작 경계 + N-1개 사이 경계 + 끝 경계). 이걸 무시하고 진행하면 segStarts[k+1] 접근에서 undefined가 나올 수 있음.
+  if (!Array.isArray(segStarts) || segStarts.length !== captionBeatsPerImage.length + 1) {
+    console.log(`[computeSegmentBeatTimeline] 배열 길이 불일치: captionBeatsPerImage=${captionBeatsPerImage.length}, segStarts=${segStarts?.length || 'null'} (기대값: ${captionBeatsPerImage.length + 1})`);
+    return null;
+  }
   const flat = [];
   captionBeatsPerImage.forEach((beats, imgIndex) => {
     beats.forEach((beat, beatIndex) => {
@@ -439,16 +445,16 @@ function computeSegmentBeatTimeline(captionBeatsPerImage, segStarts, audioDurati
     });
   });
   // 모든 비트에 유효한 세그먼트 번호가 있어야 함(옛 Worker가 보낸 요청엔 없음 → 폴백)
-  if (flat.some((b) => !Number.isInteger(b.segIndex) || b.segIndex < 0 || b.segIndex >= segStarts.length)) return null;
+  if (flat.some((b) => !Number.isInteger(b.segIndex) || b.segIndex < 0 || b.segIndex >= segStarts.length - 1)) return null;
   // 세그먼트별 비트 묶음 — 비어있는 세그먼트가 있으면 타임라인에 구멍이 생기므로 폴백(정상 흐름에선 없음)
-  const bySeg = segStarts.map(() => []);
+  const bySeg = Array.from({length: captionBeatsPerImage.length}, () => []);
   for (const b of flat) bySeg[b.segIndex].push(b);
   if (bySeg.some((arr) => !arr.length)) return null;
 
   const perImageBeatTimes = captionBeatsPerImage.map((beats) => new Array(beats.length));
   for (let k = 0; k < bySeg.length; k++) {
     const segStart = segStarts[k];
-    const segEnd = k + 1 < segStarts.length ? segStarts[k + 1] : audioDuration;
+    const segEnd = segStarts[k + 1];
     const segDur = Math.max(0.05, segEnd - segStart);
     const sumW = bySeg[k].reduce((a, b) => a + b.weight, 0) || 1;
     let t = segStart;
