@@ -1027,7 +1027,7 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, s
       ContentType: "video/mp4",
     }));
 
-    renderJobs.set(jobId, { status: "done", stage: "완료", percent: 100, r2Key: outputKey, shortKeys: shortsDone, shortKey: shortsDone[0] || null, startedAt: renderJobs.get(jobId)?.startedAt || Date.now(), completedAt: Date.now() });
+    renderJobs.set(jobId, { status: "done", stage: "완료", percent: 100, r2Key: outputKey, shortKeys: shortsDone, shortKey: shortsDone[0] || null, durationSec: Math.round(audioDurationSec || 0), startedAt: renderJobs.get(jobId)?.startedAt || Date.now(), completedAt: Date.now() }); // [2026-09-01] durationSec 추가 — 관리자 목록에 "몇 분짜리"로 표시
     console.log(`[render:${jobId}] 완료, R2 저장: ${outputKey}${shortsDone.length ? ` + 숏츠 ${shortsDone.length}개` : ''}`);
   } catch (e) {
     renderJobs.set(jobId, { status: "failed", stage: "실패", percent: 0, error: e.message, startedAt: renderJobs.get(jobId)?.startedAt || Date.now(), completedAt: Date.now() });
