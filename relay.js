@@ -1,6 +1,5 @@
 /**
- * 생성(마지막 작업): 2026-09-02 21:35 (KST) — 쇼츠 후보가 하나도 조건을 못 넘겨도 최소 하나는
- * 인스타사이즈(9:16)로 무조건 나오게 최후 폴백 추가
+ * 생성(마지막 작업): 2026-09-02 21:38 (KST) — 쇼츠 최후 폴백도 0초가 아니라 AI 하이라이트 시작점을 우선 사용
  * kiwoom-relay - Oracle VM에서 상시 실행되는 중계 서버. 두 역할을 겸함:
  *   1) 키움 Real API 릴레이(주식 스크리너/자동매매용)
  *   2) videos.usb.kr(life.news) 영상 렌더링 — ffmpeg로 이미지 슬라이드쇼+내레이션 합성, 자막 굽기,
@@ -940,12 +939,12 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, s
         const overlaps = regions.some((r) => Math.min(r.eT, c.eT) - Math.max(r.sT, c.sT) > (c.eT - c.sT) * 0.5);
         if (!overlaps) regions.push(c);
       }
-      // [2026-09-02 21:35] 후보가 하나도 조건을 못 넘으면(15초 미만/겹침 등) 쇼츠를 아예 안 만들고
-      // 넘어가던 게 문제였음 — 무조건 하나는 나오게, 처음부터 57초(또는 그 안 가장 가까운 문장 경계)까지를
-      // 그대로 인스타사이즈(9:16)로 잘라서 씀. 15초 미만이어도(아주 짧은 본편) 이 최후 보장분은 예외로 통과시킴.
+      // [2026-09-02 21:38] 폴백도 처음(0초)부터가 아니라, 있으면 AI가 고른 하이라이트 시작점을 그대로
+      // 씀 — highlightSegRange가 필터(15초 미만 등)에 걸려 후보에서 빠졌어도 시작점 자체는 여전히 유효함.
       if (!regions.length) {
-        const fallbackEnd = endBoundFor(0) || Math.min(total, SHORT_LIMIT_SEC);
-        if (fallbackEnd > 1) regions.push({ label: "기본(인스타사이즈)", sT: 0, eT: fallbackEnd });
+        const fallbackStart = highlightValid ? segStarts[highlightSegRange.start] : 0;
+        const fallbackEnd = endBoundFor(fallbackStart) || Math.min(total, fallbackStart + SHORT_LIMIT_SEC);
+        if (fallbackEnd > fallbackStart + 1) regions.push({ label: "기본(인스타사이즈)", sT: fallbackStart, eT: fallbackEnd });
       }
       for (let ri = 0; ri < regions.length && ri < shortOutputKeys.length; ri++) {
         const { label, sT, eT } = regions[ri];
