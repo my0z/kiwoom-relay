@@ -1,5 +1,5 @@
 /**
- * 생성(마지막 작업): 2026-09-02 12:44 (KST)
+ * 생성(마지막 작업): 2026-09-02 21:05 (KST) — 쇼츠 하이라이트 구간(highlightSegRange) 지원 추가
  * kiwoom-relay - Oracle VM에서 상시 실행되는 중계 서버. 두 역할을 겸함:
  *   1) 키움 Real API 릴레이(주식 스크리너/자동매매용)
  *   2) videos.usb.kr(life.news) 영상 렌더링 — ffmpeg로 이미지 슬라이드쇼+내레이션 합성, 자막 굽기,
@@ -564,7 +564,7 @@ const CAPTION_POSITIONS = [
   { x: "(w-text_w)/2", y: "(h-th)/2", size: 43 },
 ];
 
-async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, shortOutputKeys, weights, captionBeats, captionFontKey, captionColor) {
+async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, shortOutputKeys, weights, captionBeats, captionFontKey, captionColor, highlightSegRange) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), `render-${jobId}-`));
   const setProgress = (stage, percent) => {
     const prev = renderJobs.get(jobId) || {};
@@ -893,11 +893,13 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, s
       }
     }
 
-    // [2026-08-30 22:55] ---------- 숏츠(세로 9:16) 렌더링 — 본편 하나에서 최대 3개(도입/중간/결론) ----------
-    // 이미 실측된 음성·자막 타이밍·이미지를 재활용해 서로 다른 구간 3곳을 세로(720x1280, 중앙 크롭)로 잘라냄.
+    // [2026-08-30 22:55] ---------- 숏츠(세로 9:16) 렌더링 ----------
+    // [2026-09-02 21:05] highlightSegRange(Worker가 AI로 고른 하이라이트 문장 구간)가 오면 그 구간
+    // 하나만 사용 — 없으면(구버전 재시도 등) 예전처럼 도입/중간/결론 후보 로직으로 폴백.
+    // 이미 실측된 음성·자막 타이밍·이미지를 재활용해 구간을 세로(720x1280, 중앙 크롭)로 잘라냄.
     // 구간 경계는 전부 문장(=음성 조각) 경계라 말이 중간에 끊기지 않음. 각 구간 57초 이내(숏츠 60초 상한 안쪽).
     // 숏츠 실패는 본편 발행을 막지 않음(로그만 남기고 건너뜀). 세그먼트 실측 모드에서만 생성.
-    const shortsDone = []; // 실제로 R2에 올라간 숏츠 키들(순서 = 도입, 중간, 결론)
+    const shortsDone = []; // 실제로 R2에 올라간 숏츠 키들
     if (Array.isArray(shortOutputKeys) && shortOutputKeys.length && audioPath && realTimeline && realTimeline.segmentCount) {
       const SHORT_LIMIT_SEC = 57;
       const total = audioDurationSec;
@@ -915,13 +917,22 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, s
         for (const b of bounds) if (b <= t && b > s) s = b;
         return s;
       };
-      // 후보 구간: ① 도입(0~) ② 중간(전체의 40% 지점부터) ③ 결론(끝에서 57초 앞 경계부터 끝까지)
-      const candidates = [
-        { label: "도입", sT: 0, eT: endBoundFor(0) },
-        (() => { const sT = startBoundNear(total * 0.4); return { label: "중간", sT, eT: endBoundFor(sT) }; })(),
-        (() => { const sT = startBoundNear(Math.max(0, total - SHORT_LIMIT_SEC) + 0.01) || startBoundNear(total * 0.75); return { label: "결론", sT, eT: total }; })(),
-      ];
-      // 너무 짧거나(15초 미만) 이미 채택된 구간과 크게 겹치면 건너뜀(짧은 본편에서 세 구간이 뭉치는 경우)
+      // [2026-09-02 21:05] highlightSegRange가 유효하면(segStarts 배열 범위 안) 그 구간 하나만 사용.
+      // segStarts는 세그먼트(=문장) 실측 시작 시각 배열이라 highlightSegRange.start 인덱스로 바로 시작
+      // 시각을 얻을 수 있음 — endBoundFor로 57초 상한 안에서 가장 가까운 문장 경계까지 잡음.
+      const highlightValid = highlightSegRange
+        && Number.isInteger(highlightSegRange.start)
+        && Array.isArray(segStarts)
+        && highlightSegRange.start >= 0
+        && highlightSegRange.start < segStarts.length - 1;
+      const candidates = highlightValid
+        ? [{ label: "하이라이트", sT: segStarts[highlightSegRange.start], eT: endBoundFor(segStarts[highlightSegRange.start]) }]
+        : [
+            { label: "도입", sT: 0, eT: endBoundFor(0) },
+            (() => { const sT = startBoundNear(total * 0.4); return { label: "중간", sT, eT: endBoundFor(sT) }; })(),
+            (() => { const sT = startBoundNear(Math.max(0, total - SHORT_LIMIT_SEC) + 0.01) || startBoundNear(total * 0.75); return { label: "결론", sT, eT: total }; })(),
+          ];
+      // 너무 짧거나(15초 미만) 이미 채택된 구간과 크게 겹치면 건너뜀(짧은 본편에서 구간이 뭉치는 경우)
       const regions = [];
       for (const c of candidates) {
         if (!c || c.eT - c.sT < 15 || c.eT - c.sT > SHORT_LIMIT_SEC + 1) continue;
@@ -2259,6 +2270,10 @@ const server = http.createServer((req, res) => {
       // 이 영상 전체에 고정으로 쓸 자막 폰트 키/색 — Worker가 영상당 하나씩 랜덤으로 뽑아서 넘겨줌.
       const captionFontKey = typeof body.captionFontKey === "string" ? body.captionFontKey : null;
       const captionColor = typeof body.captionColor === "string" ? body.captionColor : null;
+      // [2026-09-02 21:05] highlightSegRange: Worker가 AI로 고른 쇼츠 하이라이트 문장 구간 {start,end}
+      const highlightSegRange = (body.highlightSegRange && Number.isInteger(body.highlightSegRange.start) && Number.isInteger(body.highlightSegRange.end))
+        ? { start: body.highlightSegRange.start, end: body.highlightSegRange.end }
+        : null;
       if (!images.length || !outputKey) {
         res.writeHead(400, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: false, error: "images/outputKey 필요" }));
@@ -2267,7 +2282,7 @@ const server = http.createServer((req, res) => {
       const jobId = crypto.randomUUID();
       renderJobs.set(jobId, { status: "processing", stage: "대기열 대기 중", percent: 0, startedAt: Date.now() });
       // 큐에 넣고 기다리지 않고 바로 응답 — 앞에 진행 중인 렌더링이 있으면 그거 끝나야 시작됨(VM 자원 보호)
-      enqueueRender(() => runRender(jobId, images, audioUrl, audioSegments, outputKey, shortOutputKeys, weights, captionBeats, captionFontKey, captionColor));
+      enqueueRender(() => runRender(jobId, images, audioUrl, audioSegments, outputKey, shortOutputKeys, weights, captionBeats, captionFontKey, captionColor, highlightSegRange));
       res.writeHead(202, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: true, jobId }));
     });
