@@ -1,5 +1,6 @@
 /**
- * 생성(마지막 작업): 2026-09-02 21:38 (KST) — 쇼츠 최후 폴백도 0초가 아니라 AI 하이라이트 시작점을 우선 사용
+ * 생성(마지막 작업): 2026-09-04 22:55 (KST) — 점검: highlightSegRange의 end를 무시하고 무조건 57초까지
+ * 늘리던 버그 수정(이제 AI가 정한 끝 지점을 존중, 넘을 때만 57초로 줄임) + 안 쓰는 spans 변수 정리
  * kiwoom-relay - Oracle VM에서 상시 실행되는 중계 서버. 두 역할을 겸함:
  *   1) 키움 Real API 릴레이(주식 스크리너/자동매매용)
  *   2) videos.usb.kr(life.news) 영상 렌더링 — ffmpeg로 이미지 슬라이드쇼+내레이션 합성, 자막 굽기,
@@ -670,8 +671,6 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, s
       : "0xFFFFFF";
 
     const outputPath = path.join(tmpDir, "output.mp4");
-    // spans: fade 보정 전의 순수 노출시간(합계 = 최종 영상 길이 = 음성 길이) — 청크 병합 offset 계산용
-    const spans = durations.map((d, i) => (i < durations.length - 1 ? d - xfadeDurs[i] : d));
 
     // 이미지 하나의 필터 체인(스케일+색보정+자막 drawtext)을 만드는 공용 빌더 — 한방/청크 렌더링이 같이 씀.
     // inputIdx: 이번 ffmpeg 실행 안에서의 입력 번호 / imgIdx: 영상 전체 기준 이미지 번호(자막·시간은 항상 이 기준).
@@ -917,16 +916,27 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, s
         for (const b of bounds) if (b <= t && b > s) s = b;
         return s;
       };
-      // [2026-09-02 21:05] highlightSegRange가 유효하면(segStarts 배열 범위 안) 그 구간 하나만 사용.
-      // segStarts는 세그먼트(=문장) 실측 시작 시각 배열이라 highlightSegRange.start 인덱스로 바로 시작
-      // 시각을 얻을 수 있음 — endBoundFor로 57초 상한 안에서 가장 가까운 문장 경계까지 잡음.
+      // [2026-09-02 21:05, 2026-09-04 22:55 수정] highlightSegRange가 유효하면 그 구간 하나만 사용.
+      // 버그였던 지점: end를 아예 안 보고 start부터 무조건 57초까지 늘렸음 — AI가 하이라이트로
+      // 고른 범위보다 훨씬 더 뒤(관련 없는 내용)까지 쇼츠에 딸려 들어갈 수 있었음. 이제 end로 정해진
+      // "의도한 끝"이 57초 안이면 그대로 쓰고, 넘으면 그때만 57초 상한 안에서 가장 가까운 경계로 줄임.
       const highlightValid = highlightSegRange
         && Number.isInteger(highlightSegRange.start)
+        && Number.isInteger(highlightSegRange.end)
         && Array.isArray(segStarts)
         && highlightSegRange.start >= 0
+        && highlightSegRange.end >= highlightSegRange.start
         && highlightSegRange.start < segStarts.length - 1;
-      const candidates = highlightValid
-        ? [{ label: "하이라이트", sT: segStarts[highlightSegRange.start], eT: endBoundFor(segStarts[highlightSegRange.start]) }]
+      let highlightRegion = null;
+      if (highlightValid) {
+        const hSt = segStarts[highlightSegRange.start];
+        const endIdx = Math.min(highlightSegRange.end + 1, segStarts.length - 1);
+        const intendedEnd = segStarts[endIdx];
+        const hEt = intendedEnd <= hSt + SHORT_LIMIT_SEC ? intendedEnd : endBoundFor(hSt);
+        highlightRegion = { label: "하이라이트", sT: hSt, eT: hEt };
+      }
+      const candidates = highlightRegion
+        ? [highlightRegion]
         : [
             { label: "도입", sT: 0, eT: endBoundFor(0) },
             (() => { const sT = startBoundNear(total * 0.4); return { label: "중간", sT, eT: endBoundFor(sT) }; })(),
@@ -942,7 +952,7 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, s
       // [2026-09-02 21:38] 폴백도 처음(0초)부터가 아니라, 있으면 AI가 고른 하이라이트 시작점을 그대로
       // 씀 — highlightSegRange가 필터(15초 미만 등)에 걸려 후보에서 빠졌어도 시작점 자체는 여전히 유효함.
       if (!regions.length) {
-        const fallbackStart = highlightValid ? segStarts[highlightSegRange.start] : 0;
+        const fallbackStart = highlightRegion ? highlightRegion.sT : 0;
         const fallbackEnd = endBoundFor(fallbackStart) || Math.min(total, fallbackStart + SHORT_LIMIT_SEC);
         if (fallbackEnd > fallbackStart + 1) regions.push({ label: "기본(인스타사이즈)", sT: fallbackStart, eT: fallbackEnd });
       }
