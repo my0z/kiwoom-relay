@@ -1,7 +1,6 @@
 /**
- * 생성(마지막 작업): 2026-09-04 22:55 (KST) — 점검: highlightSegRange의 end를 무시하고 무조건 57초까지
- * 늘리던 버그 수정(이제 AI가 정한 끝 지점을 존중, 넘을 때만 57초로 줄임) + 안 쓰는 spans 변수 정리
- * kiwoom-relay - Oracle VM에서 상시 실행되는 중계 서버. 두 역할을 겸함:
+ * 생성(마지막 작업): 2026-09-06 00:30 (KST) — 자막 폰트 30% 확대 + 화면 밖으로 안 잘리게 line_spacing도 조정
+ * relay - Oracle VM에서 상시 실행되는 중계 서버. 두 역할을 겸함:
  *   1) 키움 Real API 릴레이(주식 스크리너/자동매매용)
  *   2) videos.usb.kr(life.news) 영상 렌더링 — ffmpeg로 이미지 슬라이드쇼+내레이션 합성, 자막 굽기,
  *      xfade 전환, 숏츠(9:16) 컷, R2 업로드까지 처리. Worker가 /render로 작업을 맡기고 /render/status로 폴링.
@@ -556,13 +555,14 @@ function resolveVideoFontPath(fontKey) {
 
 // 자막 "위치" 후보 5개 — 이제 비트마다 순환하지 않고, Worker(worker.js)가 영상 하나당 하나를 골라서
 // 모든 비트에 같은 styleIndex로 넣어 보냄(폰트/색과 동일하게 영상 전체 고정). 여기선 그 인덱스로 매칭만 함.
-// [2026-08-30 20:13] 자막 크기 2/3로 축소(사용자 요청): 60/56/66/62/64 → 40/37/44/41/43
+// [2026-08-30 20:13] 자막 크기 2/3로 축소했었는데, [2026-09-06 00:30] 30% 다시 키움(사용자 요청) —
+// 동시에 worker.js의 wrapCaptionLines 줄당 글자수를 20→15로 줄여서 큰 폰트로도 화면 밖으로 안 잘리게 함.
 const CAPTION_POSITIONS = [
-  { x: "(w-text_w)/2", y: "h-th-80", size: 40 },
-  { x: "(w-text_w)/2", y: "80", size: 37 },
-  { x: "60", y: "h-th-90", size: 44 },
-  { x: "w-text_w-60", y: "h-th-90", size: 41 },
-  { x: "(w-text_w)/2", y: "(h-th)/2", size: 43 },
+  { x: "(w-text_w)/2", y: "h-th-80", size: 52 },
+  { x: "(w-text_w)/2", y: "80", size: 48 },
+  { x: "60", y: "h-th-90", size: 57 },
+  { x: "w-text_w-60", y: "h-th-90", size: 53 },
+  { x: "(w-text_w)/2", y: "(h-th)/2", size: 56 },
 ];
 
 async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, shortOutputKeys, weights, captionBeats, captionFontKey, captionColor, highlightSegRange) {
@@ -713,7 +713,7 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, s
           fs.writeFileSync(capFile, text, "utf8");
           const st = CAPTION_POSITIONS[(beat.styleIndex || 0) % CAPTION_POSITIONS.length];
           chain += `,drawtext=fontfile=${resolvedFontPath}:textfile=${capFile}:fontsize=${st.size}:fontcolor=${captionColorFF}:` +
-            `borderw=8:bordercolor=black:box=0:line_spacing=12:x=${st.x}:y=${st.y}:` +
+            `borderw=8:bordercolor=black:box=0:line_spacing=16:x=${st.x}:y=${st.y}:` +
             `enable='between(t,${start.toFixed(2)},${end.toFixed(2)})'`;
         });
       }
@@ -1000,7 +1000,7 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, s
               const capFile = path.join(tmpDir, `scap-${ri}-${g}-${bi}.txt`);
               fs.writeFileSync(capFile, text, "utf8");
               chain += `,drawtext=fontfile=${resolvedFontPath}:textfile=${capFile}:fontsize=${st.size}:fontcolor=${captionColorFF}:` +
-                `borderw=8:bordercolor=black:box=0:line_spacing=12:x=${st.x}:y=${st.y}:` +
+                `borderw=8:bordercolor=black:box=0:line_spacing=16:x=${st.x}:y=${st.y}:` +
                 `enable='between(t,${bs.toFixed(2)},${be.toFixed(2)})'`;
             });
             return `${chain}[sv${j}]`;
