@@ -1,8 +1,7 @@
 /**
- * 생성(마지막 작업): 2026-09-06 22:00 (KST) — 진짜 원인 발견/수정: PIL 우회 적용 후에도 자막이
- * 네모(□)로 깨지던 게 남아있었던 이유 — fonttools로 실측 검사해보니 songmyung/gaegu/cutefont/
- * yeonsung/gugi/sunflower 6개 폰트가 완성형 한글 11,172자 중 2,350자(21%)만 담고 있었음(자주
- * 쓰는 "울" 등도 없음). CAPTION_FONT_PATHS에서 6개 제거, 100% 커버리지인 9개만 남김
+ * 생성(마지막 작업): 2026-09-06 22:15 (KST) — 자막 PNG 렌더링을 execFileSync(동기)에서 spawn 기반
+ * 비동기로 전환 — 동기 방식이면 그리는 몇 초 동안 Node 이벤트 루프 전체가 멈춰서 /render/status
+ * 폴링 응답도 못 나가고(진행 메시지가 뚝뚝 끊겨 보이던 원인) 키움 실시간 중계까지 같이 멈췄음
  * relay - Oracle VM에서 상시 실행되는 중계 서버. 두 역할을 겸함:
  *   1) 키움 Real API 릴레이(주식 스크리너/자동매매용)
  *   2) videos.usb.kr(life.news) 영상 렌더링 — ffmpeg로 이미지 슬라이드쇼+내레이션 합성, 자막 굽기,
@@ -16,7 +15,7 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
-const { spawn, execFileSync } = require("child_process");
+const { spawn } = require("child_process");
 const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
 
 const PORT = process.env.PORT || 8787;
@@ -636,19 +635,33 @@ function queueCaptionPng(requests, text, fontFile, fontSize, colorHexFF, canvasW
   });
 }
 // 큐에 쌓인 자막 PNG 요청을 파이썬 프로세스 1번으로 전부 그림 — ffmpeg 실행 직전에 호출.
+// [2026-09-06 22:15] 진짜 원인 발견/수정 — execFileSync(동기)를 쓰면 자막을 그리는 그 몇 초 동안
+// Node 이벤트 루프 전체가 멈춰서, /render/status 폴링 응답도 못 나가고(진행 메시지가 뚝뚝 끊겨
+// 보이던 원인) 키움 실시간 중계까지 같이 멈췄음. spawn 기반 비동기 방식으로 바꿔서 그 동안에도
+// 서버가 다른 요청에 계속 응답할 수 있게 함.
 function flushCaptionPngBatch(requests, tmpDir, jobId, label) {
-  if (!requests.length) return;
+  if (!requests.length) return Promise.resolve();
   const manifestPath = path.join(tmpDir, `caption-manifest-${label}-${Date.now()}.json`);
   fs.writeFileSync(manifestPath, JSON.stringify(requests), "utf8");
-  try {
-    execFileSync("python3", [CAPTION_RENDER_SCRIPT, manifestPath], { stdio: ["ignore", "ignore", "pipe"] });
-  } catch (e) {
-    // exit 2 = 일부만 실패(계속 진행), exit 1 = 전부 실패. 어느 쪽이든 실패한 파일은 overlay 단계에서
-    // ffmpeg가 입력을 못 찾아 렌더링 자체가 실패하므로, 로그만 남기고 위로 던짐(상위 catch가 처리).
-    const stderr = e.stderr ? e.stderr.toString().slice(0, 500) : e.message;
-    jlog(jobId, `[render:${jobId}] ${label} 캡션 PNG 배치 렌더링 실패: ${stderr}`);
-    throw e;
-  }
+  return new Promise((resolve, reject) => {
+    const proc = spawn("python3", [CAPTION_RENDER_SCRIPT, manifestPath]);
+    let stderr = "";
+    proc.stderr.on("data", (d) => { stderr += d.toString(); });
+    proc.on("error", (e) => {
+      jlog(jobId, `[render:${jobId}] ${label} 캡션 PNG 배치 렌더링 실행 실패: ${e.message}`);
+      reject(e);
+    });
+    proc.on("close", (code) => {
+      // exit 0 = 전부 성공, 2 = 일부만 실패(계속 진행 가능), 1 = 전부 실패
+      if (code === 0 || code === 2) {
+        if (code === 2) jlog(jobId, `[render:${jobId}] ${label} 캡션 PNG 일부 실패(계속 진행): ${stderr.slice(0, 500)}`);
+        resolve();
+      } else {
+        jlog(jobId, `[render:${jobId}] ${label} 캡션 PNG 배치 렌더링 실패: ${stderr.slice(0, 500)}`);
+        reject(new Error(`caption render exit ${code}: ${stderr.slice(0, 300)}`));
+      }
+    });
+  });
 }
 
 async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, shortOutputKeys, weights, captionBeats, captionFontKey, captionColor, highlightSegRange) {
@@ -902,7 +915,7 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, s
         }
         filterComplex = `${filterInputs};${xfadeParts.join(";")}`;
       }
-      flushCaptionPngBatch(captionRequests, tmpDir, jobId, "main"); // ffmpeg 실행 전에 자막 PNG 전부 그림
+      await flushCaptionPngBatch(captionRequests, tmpDir, jobId, "main"); // ffmpeg 실행 전에 자막 PNG 전부 그림(비동기라 그동안 서버가 안 멈춤)
       // [2026-09-06 21:00] 캡션 PNG를 추가 입력으로 붙였으니, 오디오 입력 번호는 이미지 개수가 아니라
       // extraInputCounter.count(이미지+캡션PNG 전부)부터 시작해야 함
       const audioParts = appendAudioParts(inputArgs, filterComplex, extraInputCounter.count);
@@ -954,7 +967,7 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, s
           filterComplex = `${filterInputs};${xfadeParts.join(";")}`;
           mapLabel = "[outv]";
         }
-        flushCaptionPngBatch(captionRequests, tmpDir, jobId, `chunk${k}`); // ffmpeg 실행 전에 이 청크의 자막 PNG 전부 그림
+        await flushCaptionPngBatch(captionRequests, tmpDir, jobId, `chunk${k}`); // ffmpeg 실행 전에 이 청크의 자막 PNG 전부 그림(비동기)
         const chunkFile = path.join(tmpDir, `chunk-${k}.mp4`);
         const internalFades = group.slice(0, -1).reduce((a, g) => a + xfadeDurs[g], 0);
         const chunkLen = group.reduce((a, g) => a + durations[g], 0) - internalFades;
@@ -1183,7 +1196,7 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, s
           }
           sInputs.push("-ss", sT.toFixed(2), "-t", (eT - sT).toFixed(2), "-i", audioPath); // 음성도 같은 구간만(wav라 초 단위 정확)
           sFilter += `;[${extraInputCounter.count}:a]loudnorm=I=-16:TP=-1.5:LRA=11[anorm]`;
-          flushCaptionPngBatch(captionRequests, tmpDir, jobId, `short${ri}`); // ffmpeg 실행 전에 이 숏츠의 자막 PNG 전부 그림
+          await flushCaptionPngBatch(captionRequests, tmpDir, jobId, `short${ri}`); // ffmpeg 실행 전에 이 숏츠의 자막 PNG 전부 그림(비동기)
           const shortPath = path.join(tmpDir, `short-${ri}.mp4`);
           await runFfmpeg([
             "-y", ...sInputs,
