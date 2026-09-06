@@ -1,5 +1,7 @@
 /**
- * 생성(마지막 작업): 2026-09-06 00:30 (KST) — 자막 폰트 30% 확대 + 화면 밖으로 안 잘리게 line_spacing도 조정
+ * 생성(마지막 작업): 2026-09-06 02:30 (KST) — ffmpeg 유용 옵션 추가: 최종 출력(본편+숏츠)에
+ * movflags +faststart(웹/유튜브 재생 시작 빨라짐), tune stillimage(정지이미지+자막 콘텐츠에 맞춘
+ * 화질 튜닝), 최종 병합 단계 preset faster(자원 빠듯한 VM 속도 개선, 다른 단계와 통일)
  * relay - Oracle VM에서 상시 실행되는 중계 서버. 두 역할을 겸함:
  *   1) 키움 Real API 릴레이(주식 스크리너/자동매매용)
  *   2) videos.usb.kr(life.news) 영상 렌더링 — ffmpeg로 이미지 슬라이드쇼+내레이션 합성, 자막 굽기,
@@ -782,7 +784,9 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, s
         "-y", ...inputArgs,
         "-filter_complex", audioParts.filterComplex,
         ...audioParts.outputArgs,
-        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        // [2026-09-06 02:30] preset faster(자원 빠듯한 VM에서 속도), tune stillimage(정지이미지+자막
+        // 콘텐츠에 맞춘 화질 튜닝), movflags +faststart(웹/유튜브에서 다운로드 중에도 바로 재생 시작)
+        "-c:v", "libx264", "-preset", "faster", "-tune", "stillimage", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
         outputPath,
       ], totalDurationSec, (ffmpegPercent) => {
         // ffmpeg 자체 진행률(0~99)을 전체 진행률의 30~85% 구간에 매핑
@@ -829,7 +833,7 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, s
           "-y", ...inputArgs,
           "-filter_complex", filterComplex,
           "-map", mapLabel,
-          "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p",
+          "-c:v", "libx264", "-preset", "veryfast", "-tune", "stillimage", "-crf", "16", "-pix_fmt", "yuv420p",
           chunkFile,
         ], chunkLen, (ffmpegPercent) => {
           setProgress(`부분 렌더링 중 (${k + 1}/${chunkIdxGroups.length})`, 30 + Math.round(((k + ffmpegPercent / 100) / chunkIdxGroups.length) * 40)); // 30~70%
@@ -873,7 +877,7 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, s
         "-y", ...inputArgs,
         "-filter_complex", audioParts.filterComplex,
         ...audioParts.outputArgs,
-        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-c:v", "libx264", "-preset", "faster", "-tune", "stillimage", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
         outputPath,
       ], finalLen, (ffmpegPercent) => {
         setProgress("최종 병합 중", 70 + Math.round((ffmpegPercent / 100) * 15)); // 70~85%
@@ -1031,7 +1035,7 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, s
             "-y", ...sInputs,
             "-filter_complex", sFilter,
             "-map", sMap, "-map", "[anorm]", "-c:a", "aac", "-shortest",
-            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", // [2026-08-30 23:00] 숏츠는 파일이 작아 veryfast로 시간 절약
+            "-c:v", "libx264", "-preset", "veryfast", "-tune", "stillimage", "-pix_fmt", "yuv420p", "-movflags", "+faststart", // [2026-08-30 23:00] 숏츠는 파일이 작아 veryfast로 시간 절약, [2026-09-06 02:30] stillimage 튜닝+faststart 추가
             shortPath,
           ], eT - sT, (p) => setProgress(`숏츠 렌더링 중 (${ri + 1}/${regions.length})`, 86 + ri + Math.round(p / 100)));
           if (await verifyOutputHasAudio(shortPath)) {
