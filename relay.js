@@ -1,7 +1,9 @@
 /**
- * 생성(마지막 작업): 2026-09-06 02:30 (KST) — ffmpeg 유용 옵션 추가: 최종 출력(본편+숏츠)에
- * movflags +faststart(웹/유튜브 재생 시작 빨라짐), tune stillimage(정지이미지+자막 콘텐츠에 맞춘
- * 화질 튜닝), 최종 병합 단계 preset faster(자원 빠듯한 VM 속도 개선, 다른 단계와 통일)
+ * 생성(마지막 작업): 2026-09-06 03:15 (KST) — 진짜 원인 발견/수정: computeSegmentBeatTimeline의
+ * segStarts 길이 검증이 이미지 개수(20) 기준이었는데 실제 세그먼트(문장, 60~100+개) 기준이어야 했음
+ * — 이 불일치 때문에 세그먼트 실측 타이밍이 항상 실패해서 계속 추정 모드로 폴백되고 있었고, 쇼츠는
+ * 세그먼트 실측 모드에서만 만들어져서 계속 안 만들어졌던 것. bySeg 배열도 같은 이유로 세그먼트
+ * 개수 기준으로 다시 크기 조정
  * relay - Oracle VM에서 상시 실행되는 중계 서버. 두 역할을 겸함:
  *   1) 키움 Real API 릴레이(주식 스크리너/자동매매용)
  *   2) videos.usb.kr(life.news) 영상 렌더링 — ffmpeg로 이미지 슬라이드쇼+내레이션 합성, 자막 굽기,
@@ -434,12 +436,17 @@ async function prepareSegmentedNarration(tmpDir, segmentPaths) {
 function computeSegmentBeatTimeline(captionBeatsPerImage, segStarts, audioDuration) {
   if (!Array.isArray(captionBeatsPerImage) || !captionBeatsPerImage.length) return null;
   if (captionBeatsPerImage.some((beats) => !Array.isArray(beats) || !beats.length)) return null;
-  // [2026-09-02] segStarts 배열 길이 검증 추가 — 세그먼트가 N개면 경계(segStarts)는 N+1개여야 함
-  // (시작 경계 + N-1개 사이 경계 + 끝 경계). 이걸 무시하고 진행하면 segStarts[k+1] 접근에서 undefined가 나올 수 있음.
-  if (!Array.isArray(segStarts) || segStarts.length !== captionBeatsPerImage.length + 1) {
-    console.log(`[computeSegmentBeatTimeline] 배열 길이 불일치: captionBeatsPerImage=${captionBeatsPerImage.length}, segStarts=${segStarts?.length || 'null'} (기대값: ${captionBeatsPerImage.length + 1})`);
+  // [2026-09-06 03:15] 진짜 버그 수정 — 예전엔 segStarts 길이를 "이미지 개수+1"과 비교했는데, 이미지는
+  // 20장 고정인 반면 문장(세그먼트)은 60~100개가 넘어가는 게 정상이라(splitTextIntoNChunks가 여러
+  // 문장을 한 이미지에 몰아줌) 이 비교가 사실상 항상 실패해서 세그먼트 실측 타이밍이 계속 무시되고
+  // 추정/폴백 모드로만 돌고 있었음(쇼츠가 세그먼트 실측 모드에서만 생성되는데 그래서 쇼츠가 계속 안
+  // 만들어졌던 원인). segStarts는 "세그먼트 개수+1"이어야 하는 게 맞고, 그건 segIndex 범위 검증에서
+  // 이미 확인하므로 여기서는 최소한의 배열 형태만 확인.
+  if (!Array.isArray(segStarts) || segStarts.length < 2) {
+    console.log(`[computeSegmentBeatTimeline] segStarts 형식 이상: ${segStarts?.length || 'null'}`);
     return null;
   }
+  const segCount = segStarts.length - 1;
   const flat = [];
   captionBeatsPerImage.forEach((beats, imgIndex) => {
     beats.forEach((beat, beatIndex) => {
@@ -447,9 +454,9 @@ function computeSegmentBeatTimeline(captionBeatsPerImage, segStarts, audioDurati
     });
   });
   // 모든 비트에 유효한 세그먼트 번호가 있어야 함(옛 Worker가 보낸 요청엔 없음 → 폴백)
-  if (flat.some((b) => !Number.isInteger(b.segIndex) || b.segIndex < 0 || b.segIndex >= segStarts.length - 1)) return null;
+  if (flat.some((b) => !Number.isInteger(b.segIndex) || b.segIndex < 0 || b.segIndex >= segCount)) return null;
   // 세그먼트별 비트 묶음 — 비어있는 세그먼트가 있으면 타임라인에 구멍이 생기므로 폴백(정상 흐름에선 없음)
-  const bySeg = Array.from({length: captionBeatsPerImage.length}, () => []);
+  const bySeg = Array.from({length: segCount}, () => []);
   for (const b of flat) bySeg[b.segIndex].push(b);
   if (bySeg.some((arr) => !arr.length)) return null;
 
