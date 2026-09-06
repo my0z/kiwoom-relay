@@ -1,7 +1,9 @@
 /**
- * 생성(마지막 작업): 2026-09-06 14:40 (KST) — 전환 구간이 아닌 곳(영상 시작 0.01초 등)에서도 자막이
- * 겹쳐 보이는 재현 사례가 나와서, 각 비트의 실제 계산된 시작/끝/텍스트를 로그로 남기는 진단 코드
- * 추가(문제 확인 후 제거 예정)
+ * 생성(마지막 작업): 2026-09-06 15:00 (KST) — 진짜 원인 발견/수정: 자막이 앞부분만 남고 잘려 보이던
+ * 문제 — 로그로 확인해보니 텍스트 자체는 완전했는데, "(w-text_w)/2"·"w-text_w-60"처럼 text_w(자막
+ * 실제 폭)에 의존하는 위치 계산이 여러 줄 텍스트에서 ffmpeg가 폭을 부정확하게 재는 문제가 있었음
+ * (길수록 더 오른쪽으로 밀려서 더 많이 화면 밖으로 나감 — 관찰된 비례 잘림 패턴과 일치). text_w
+ * 의존을 완전히 없애고 전부 왼쪽 고정 여백(x=40)으로 통일
  * relay - Oracle VM에서 상시 실행되는 중계 서버. 두 역할을 겸함:
  *   1) 키움 Real API 릴레이(주식 스크리너/자동매매용)
  *   2) videos.usb.kr(life.news) 영상 렌더링 — ffmpeg로 이미지 슬라이드쇼+내레이션 합성, 자막 굽기,
@@ -590,16 +592,18 @@ function resolveVideoFontPath(fontKey) {
   return (fontKey && CAPTION_FONT_PATHS[fontKey]) || FALLBACK_FONT_PATH;
 }
 
-// 자막 "위치" 후보 5개 — 이제 비트마다 순환하지 않고, Worker(worker.js)가 영상 하나당 하나를 골라서
-// 모든 비트에 같은 styleIndex로 넣어 보냄(폰트/색과 동일하게 영상 전체 고정). 여기선 그 인덱스로 매칭만 함.
-// [2026-08-30 20:13] 자막 크기 2/3로 축소했었는데, [2026-09-06 00:30] 30% 다시 키움(사용자 요청) —
-// 동시에 worker.js의 wrapCaptionLines 줄당 글자수를 20→15로 줄여서 큰 폰트로도 화면 밖으로 안 잘리게 함.
+// [2026-09-06 15:00] 진짜 원인 발견/수정 — "(w-text_w)/2"나 "w-text_w-60"처럼 text_w(자막 실제 폭)에
+// 의존하는 위치 계산이, 여러 줄(\n 포함)짜리 텍스트에서 ffmpeg가 실제 폭을 정확히 못 재는 문제가
+// 있었음. 그 결과 가운데/오른쪽 정렬 계산이 틀어져서 시작 위치가 실제보다 오른쪽으로 잡혔고, 텍스트
+// 오른쪽 상당 부분이 화면 밖으로 밀려나가 안 보였음(길수록 더 많이 밀려남 — 로그의 완전한 텍스트와
+// 실제 화면에 보이는 앞부분만 남은 결과가 정확히 이 패턴과 일치). text_w에 의존하지 않는 왼쪽 고정
+// 여백으로 전부 통일해서 이 계산 오류 자체를 없앰.
 const CAPTION_POSITIONS = [
-  { x: "(w-text_w)/2", y: "h-th-80", size: 52 },
-  { x: "(w-text_w)/2", y: "80", size: 48 },
-  { x: "60", y: "h-th-90", size: 57 },
-  { x: "w-text_w-60", y: "h-th-90", size: 53 },
-  { x: "(w-text_w)/2", y: "(h-th)/2", size: 56 },
+  { x: "40", y: "h-th-80", size: 52 },
+  { x: "40", y: "80", size: 48 },
+  { x: "40", y: "h-th-90", size: 57 },
+  { x: "40", y: "h-th-90", size: 53 },
+  { x: "40", y: "(h-th)/2", size: 56 },
 ];
 
 async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, shortOutputKeys, weights, captionBeats, captionFontKey, captionColor, highlightSegRange) {
