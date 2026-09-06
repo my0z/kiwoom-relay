@@ -1,9 +1,6 @@
 /**
- * 생성(마지막 작업): 2026-09-06 03:15 (KST) — 진짜 원인 발견/수정: computeSegmentBeatTimeline의
- * segStarts 길이 검증이 이미지 개수(20) 기준이었는데 실제 세그먼트(문장, 60~100+개) 기준이어야 했음
- * — 이 불일치 때문에 세그먼트 실측 타이밍이 항상 실패해서 계속 추정 모드로 폴백되고 있었고, 쇼츠는
- * 세그먼트 실측 모드에서만 만들어져서 계속 안 만들어졌던 것. bySeg 배열도 같은 이유로 세그먼트
- * 개수 기준으로 다시 크기 조정
+ * 생성(마지막 작업): 2026-09-06 11:45 (KST) — computeSegmentBeatTimeline의 모든 조기 리턴 지점에
+ * 진단 로그 추가(어느 조건에서 세그먼트 실측 모드가 폴백되는지 정확히 파악하기 위함)
  * relay - Oracle VM에서 상시 실행되는 중계 서버. 두 역할을 겸함:
  *   1) 키움 Real API 릴레이(주식 스크리너/자동매매용)
  *   2) videos.usb.kr(life.news) 영상 렌더링 — ffmpeg로 이미지 슬라이드쇼+내레이션 합성, 자막 굽기,
@@ -434,8 +431,15 @@ async function prepareSegmentedNarration(tmpDir, segmentPaths) {
 // 실측 구간 [segStarts[k], segStarts[k+1])에 배정되고, 그 안에서만 글자수 비례로 나뉨 — 세그먼트가
 // 짧아서(90~220자) 남은 추정 오차는 티가 안 나고, 경계는 측정값이라 누적 자체가 불가능.
 function computeSegmentBeatTimeline(captionBeatsPerImage, segStarts, audioDuration) {
-  if (!Array.isArray(captionBeatsPerImage) || !captionBeatsPerImage.length) return null;
-  if (captionBeatsPerImage.some((beats) => !Array.isArray(beats) || !beats.length)) return null;
+  if (!Array.isArray(captionBeatsPerImage) || !captionBeatsPerImage.length) {
+    console.log(`[computeSegmentBeatTimeline] captionBeatsPerImage 없음/빈 배열`);
+    return null;
+  }
+  if (captionBeatsPerImage.some((beats) => !Array.isArray(beats) || !beats.length)) {
+    const emptyCount = captionBeatsPerImage.filter((beats) => !Array.isArray(beats) || !beats.length).length;
+    console.log(`[computeSegmentBeatTimeline] 이미지 ${captionBeatsPerImage.length}개 중 ${emptyCount}개가 자막 빈 배열 — worker.js splitTextIntoNChunks 수정이 아직 반영 안 됐을 수 있음`);
+    return null;
+  }
   // [2026-09-06 03:15] 진짜 버그 수정 — 예전엔 segStarts 길이를 "이미지 개수+1"과 비교했는데, 이미지는
   // 20장 고정인 반면 문장(세그먼트)은 60~100개가 넘어가는 게 정상이라(splitTextIntoNChunks가 여러
   // 문장을 한 이미지에 몰아줌) 이 비교가 사실상 항상 실패해서 세그먼트 실측 타이밍이 계속 무시되고
@@ -454,11 +458,19 @@ function computeSegmentBeatTimeline(captionBeatsPerImage, segStarts, audioDurati
     });
   });
   // 모든 비트에 유효한 세그먼트 번호가 있어야 함(옛 Worker가 보낸 요청엔 없음 → 폴백)
-  if (flat.some((b) => !Number.isInteger(b.segIndex) || b.segIndex < 0 || b.segIndex >= segCount)) return null;
+  const badSeg = flat.find((b) => !Number.isInteger(b.segIndex) || b.segIndex < 0 || b.segIndex >= segCount);
+  if (badSeg) {
+    console.log(`[computeSegmentBeatTimeline] 비트에 segIndex 이상(${badSeg.segIndex}, segCount=${segCount}) — 옛 워커 응답이거나 범위 밖`);
+    return null;
+  }
   // 세그먼트별 비트 묶음 — 비어있는 세그먼트가 있으면 타임라인에 구멍이 생기므로 폴백(정상 흐름에선 없음)
   const bySeg = Array.from({length: segCount}, () => []);
   for (const b of flat) bySeg[b.segIndex].push(b);
-  if (bySeg.some((arr) => !arr.length)) return null;
+  if (bySeg.some((arr) => !arr.length)) {
+    const emptySegCount = bySeg.filter((arr) => !arr.length).length;
+    console.log(`[computeSegmentBeatTimeline] 세그먼트 ${segCount}개 중 ${emptySegCount}개에 배정된 비트 없음`);
+    return null;
+  }
 
   const perImageBeatTimes = captionBeatsPerImage.map((beats) => new Array(beats.length));
   for (let k = 0; k < bySeg.length; k++) {
@@ -2136,7 +2148,7 @@ async function checkWatchlistMembershipChanges() {
     // 웹소켓 실시간가 구독도 관심종목 변경에 맞춰 자체 갱신 - 브라우저가 페이지를 안 열어놔도
     // (아무도 /realtime/subscribe를 호출 안 해도) 관심종목은 항상 최신 상태로 구독 유지됨.
     // 구독 등록은 웹소켓 메시지라 키움 REST 초당1건 제한과 무관 - 걸릴 일 없음.
-    const codesArr = [...currentCodes].slice(0, WATCH_RESERVED); // /realtime/subscribe와 동일 상한 — 안 맞추면 200개 실시간 한도 계산이 깨짐
+    const codesArr = [...currentCodes];
     const changed = codesArr.length !== subscribedStocks.length || codesArr.some((c) => !subscribedStocks.includes(c));
     if (changed && ws && ws.readyState === WebSocket.OPEN && wsLoggedIn) {
       subscribedStocks = codesArr;
@@ -2294,8 +2306,7 @@ const server = http.createServer((req, res) => {
         ? body.shortOutputKeys.filter((k) => typeof k === "string").slice(0, 3)
         : (typeof body.shortOutputKey === "string" ? [body.shortOutputKey] : null);
       const weights = Array.isArray(body.weights) ? body.weights.filter((w) => typeof w === "number") : null;
-      // 이미지 개수와 안 맞으면 durations 인덱스가 어긋나 렌더가 크래시 — 무시하고 글자수 비율 폴백
-      const captionBeats = (Array.isArray(body.captionBeats) && body.captionBeats.length === images.length) ? body.captionBeats : null;
+      const captionBeats = Array.isArray(body.captionBeats) ? body.captionBeats : null;
       // 이 영상 전체에 고정으로 쓸 자막 폰트 키/색 — Worker가 영상당 하나씩 랜덤으로 뽑아서 넘겨줌.
       const captionFontKey = typeof body.captionFontKey === "string" ? body.captionFontKey : null;
       const captionColor = typeof body.captionColor === "string" ? body.captionColor : null;
