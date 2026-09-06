@@ -2136,7 +2136,7 @@ async function checkWatchlistMembershipChanges() {
     // 웹소켓 실시간가 구독도 관심종목 변경에 맞춰 자체 갱신 - 브라우저가 페이지를 안 열어놔도
     // (아무도 /realtime/subscribe를 호출 안 해도) 관심종목은 항상 최신 상태로 구독 유지됨.
     // 구독 등록은 웹소켓 메시지라 키움 REST 초당1건 제한과 무관 - 걸릴 일 없음.
-    const codesArr = [...currentCodes];
+    const codesArr = [...currentCodes].slice(0, WATCH_RESERVED); // /realtime/subscribe와 동일 상한 — 안 맞추면 200개 실시간 한도 계산이 깨짐
     const changed = codesArr.length !== subscribedStocks.length || codesArr.some((c) => !subscribedStocks.includes(c));
     if (changed && ws && ws.readyState === WebSocket.OPEN && wsLoggedIn) {
       subscribedStocks = codesArr;
@@ -2294,7 +2294,8 @@ const server = http.createServer((req, res) => {
         ? body.shortOutputKeys.filter((k) => typeof k === "string").slice(0, 3)
         : (typeof body.shortOutputKey === "string" ? [body.shortOutputKey] : null);
       const weights = Array.isArray(body.weights) ? body.weights.filter((w) => typeof w === "number") : null;
-      const captionBeats = Array.isArray(body.captionBeats) ? body.captionBeats : null;
+      // 이미지 개수와 안 맞으면 durations 인덱스가 어긋나 렌더가 크래시 — 무시하고 글자수 비율 폴백
+      const captionBeats = (Array.isArray(body.captionBeats) && body.captionBeats.length === images.length) ? body.captionBeats : null;
       // 이 영상 전체에 고정으로 쓸 자막 폰트 키/색 — Worker가 영상당 하나씩 랜덤으로 뽑아서 넘겨줌.
       const captionFontKey = typeof body.captionFontKey === "string" ? body.captionFontKey : null;
       const captionColor = typeof body.captionColor === "string" ? body.captionColor : null;
