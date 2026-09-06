@@ -1,8 +1,8 @@
 /**
- * 생성(마지막 작업): 2026-09-06 12:20 (KST) — 진짜 원인 발견/수정: genJob 동시실행 방지 락의 좁은
- * 경합 창 때문에 아주 드물게 segIndex가 segCount보다 1~2 커지는 경우가 있었음 — 예전엔 이럴 때
- * 세그먼트 실측 전체를 포기했는데, 이제 살짝(1~2) 벗어난 것만 마지막 세그먼트로 보정해서 계속
- * 실측 모드를 쓰게 함(크게 벗어나면 여전히 폴백)
+ * 생성(마지막 작업): 2026-09-06 14:20 (KST) — 진짜 원인 발견/수정: 자막이 겹쳐 보이던 문제는 타이밍
+ * 계산 버그가 아니라 이미지 전환(xfade) 구간에서 앞/뒤 이미지의 자막이 반투명하게 겹쳐 보이는
+ * 구조적 문제였음(세그먼트 실측이 정확해도 발생). 각 이미지의 전환 구간(들어오는/나가는 크로스페이드)
+ * 동안엔 자막이 아예 안 보이게 시작/끝 시각을 클램프 — 본편(makeImageChain)과 쇼츠(sChains) 둘 다 적용
  * relay - Oracle VM에서 상시 실행되는 중계 서버. 두 역할을 겸함:
  *   1) 키움 Real API 릴레이(주식 스크리너/자동매매용)
  *   2) videos.usb.kr(life.news) 영상 렌더링 — ffmpeg로 이미지 슬라이드쇼+내레이션 합성, 자막 굽기,
@@ -750,6 +750,15 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, s
       // fps=25: 사진 루프는 원래 25fps지만 클립은 원본 fps가 제각각이라 통일 — xfade가 fps 불일치에 민감함
       let chain = `[${inputIdx}:v]fps=25,scale=1280:720:flags=lanczos,setsar=1,eq=contrast=1.06:saturation=1.12:brightness=0.02:gamma=1.02`;
       const beats = fontAvailable && Array.isArray(captionBeats) ? (captionBeats[imgIdx] || []) : [];
+      // [2026-09-06 14:20] 진짜 원인 발견/수정 — 이미지마다 자막을 미리 구운 뒤 그 화면끼리 크로스페이드로
+      // 섞다 보니, 전환되는 그 짧은 순간(~0.6초)엔 앞 이미지의 자막과 뒤 이미지의 자막이 반투명하게
+      // 겹쳐서 글자가 뒤섞여 보였음(세그먼트 실측 타이밍이 정확해도 발생하는, 완전히 다른 원인이었음).
+      // 이 이미지의 로컬 타임라인에서 "전환 중"인 구간(맨 앞 xfadeDurs[imgIdx-1]초=들어오는 전환,
+      // 맨 뒤 xfadeDurs[imgIdx]초=나가는 전환)엔 자막이 아예 안 보이게 시작/끝 시각을 그 경계 안으로
+      // 밀어넣음 — 겹쳐 보일 시점 자체를 없앰(자막이 아주 짧게 비는 대신 겹침보다 훨씬 나음).
+      const incomingBlend = imgIdx > 0 ? xfadeDurs[imgIdx - 1] : 0;
+      const outgoingBlend = imgIdx < durations.length - 1 ? xfadeDurs[imgIdx] : 0;
+      const safeWindowEnd = Math.max(incomingBlend, durations[imgIdx] - outgoingBlend);
       if (beats.length) {
         // realTimeline이 있으면(세그먼트 실측/무음 앵커링) 실제 초 단위 시각을 그대로 쓰고, 이미지 자체
         // 타임라인(-loop 1 입력은 t=0부터) 기준으로 바꾸려고 이미지 시작 시각(imgRealStart)을 빼줌.
@@ -761,11 +770,15 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, s
         beats.forEach((beat, bi) => {
           const text = (beat.text || "").trim();
           const real = realTimes && realTimes[bi];
-          const start = real ? (real.start - imgRealStart) : t;
+          const rawStart = real ? (real.start - imgRealStart) : t;
           const beatDur = real ? Math.max(0.3, real.end - real.start) : Math.max(0.3, (beat.weight / sumWeight) * durations[imgIdx]);
-          const end = start + beatDur;
-          t = end;
-          if (!text) return;
+          const rawEnd = rawStart + beatDur;
+          t = rawEnd;
+          // 전환 구간 밖으로 클램프 — 겹치는 구간을 통째로 뺐을 때 시작이 끝보다 뒤로 가버리면(이 비트가
+          // 완전히 전환 구간 안에만 있던 경우) 표시할 수 없으니 건너뜀
+          const start = Math.min(Math.max(rawStart, incomingBlend), safeWindowEnd);
+          const end = Math.max(Math.min(rawEnd, safeWindowEnd), incomingBlend);
+          if (!text || end - start < 0.15) return;
           const capFile = path.join(tmpDir, `cap-${imgIdx}-${bi}.txt`);
           fs.writeFileSync(capFile, text, "utf8");
           const st = CAPTION_POSITIONS[(beat.styleIndex || 0) % CAPTION_POSITIONS.length];
@@ -1049,16 +1062,28 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, s
             const beats = fontAvailable && Array.isArray(captionBeats) ? (captionBeats[g] || []) : [];
             const realTimes = realTimeline.perImageBeatTimes[g];
             const imgLocalBase = sStarts[j]; // 이 이미지 입력의 t=0이 전체 타임라인에서 어디인지
+            // [2026-09-06 14:20] 본편과 동일한 이유로 전환 구간엔 자막이 안 보이게 클램프
+            const sIncomingBlend = j > 0 ? sFades[j - 1] : 0;
+            const sOutgoingBlend = j < sDur.length - 1 ? sFades[j] : 0;
+            const sSafeWindowEnd = Math.max(sIncomingBlend, sDur[j] - sOutgoingBlend);
             beats.forEach((beat, bi) => {
               const text = (beat.text || "").trim();
               const real = realTimes && realTimes[bi];
               if (!text || !real || real.end <= sT + 0.05 || real.start >= eT - 0.05) return; // 구간 밖 문장
               const st = CAPTION_POSITIONS[(beat.styleIndex || 0) % CAPTION_POSITIONS.length];
-              const bs = Math.max(0, Math.max(real.start, sT) - imgLocalBase);
-              const be = Math.max(bs + 0.2, Math.min(real.end, eT) - imgLocalBase);
+              // [2026-09-06 14:05] 버그 수정 — 본편(가로 1280px) 기준 폰트 크기를 쇼츠(세로 720px)에도
+              // 그대로 썼더니, 한 줄(15자) 폭이 쇼츠 프레임 폭보다 넓어져서 오른쪽이 화면 밖으로
+              // 잘려나갔음(안 보이는 것뿐, 실제로 글자가 사라진 건 아니었음). 쇼츠는 본편 대비 폭
+              // 비율(720/1280)만큼 폰트도 같이 줄여서 프레임 안에 들어오게 함.
+              const shortsFontSize = Math.round(st.size * (720 / 1280));
+              const rawBs = Math.max(0, Math.max(real.start, sT) - imgLocalBase);
+              const rawBe = Math.max(rawBs + 0.2, Math.min(real.end, eT) - imgLocalBase);
+              const bs = Math.min(Math.max(rawBs, sIncomingBlend), sSafeWindowEnd);
+              const be = Math.max(Math.min(rawBe, sSafeWindowEnd), sIncomingBlend);
+              if (be - bs < 0.15) return;
               const capFile = path.join(tmpDir, `scap-${ri}-${g}-${bi}.txt`);
               fs.writeFileSync(capFile, text, "utf8");
-              chain += `,drawtext=fontfile=${resolvedFontPath}:textfile=${capFile}:fontsize=${st.size}:fontcolor=${captionColorFF}:` +
+              chain += `,drawtext=fontfile=${resolvedFontPath}:textfile=${capFile}:fontsize=${shortsFontSize}:fontcolor=${captionColorFF}:` +
                 `borderw=8:bordercolor=black:box=0:line_spacing=16:x=${st.x}:y=${st.y}:` +
                 `enable='between(t,${bs.toFixed(2)},${be.toFixed(2)})'`;
             });
