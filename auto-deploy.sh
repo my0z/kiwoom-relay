@@ -13,7 +13,7 @@
 # 실제 폴더/서비스 이름은 relay로 바뀐 지 오래라(9/6 리네임) 이 워처 자체가 애초에 동작할 수 없었음
 # (cd 부터 실패). 실제 상태에 맞게 수정.
 
-REPO_DIR="/home/ubuntu/relay"
+REPO_DIR="/home/ubuntu/kiwoom-relay"
 SERVICE="relay"
 INTERVAL=60   # 확인 주기(초)
 
