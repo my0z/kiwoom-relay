@@ -1,6 +1,7 @@
 /**
- * 생성(마지막 작업): 2026-09-06 11:45 (KST) — computeSegmentBeatTimeline의 모든 조기 리턴 지점에
- * 진단 로그 추가(어느 조건에서 세그먼트 실측 모드가 폴백되는지 정확히 파악하기 위함)
+ * 생성(마지막 작업): 2026-09-06 12:10 (KST) — 이미지 하나가 404 등으로 다운로드 실패하면 영상 전체가
+ * 실패 처리되던 문제 수정 — 실패한 자리는 검정 화면으로 대체하고 나머지 이미지/자막 타이밍은
+ * 그대로 유지한 채 렌더링 계속 진행
  * relay - Oracle VM에서 상시 실행되는 중계 서버. 두 역할을 겸함:
  *   1) 키움 Real API 릴레이(주식 스크리너/자동매매용)
  *   2) videos.usb.kr(life.news) 영상 렌더링 — ffmpeg로 이미지 슬라이드쇼+내레이션 합성, 자막 굽기,
@@ -601,14 +602,33 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, s
     // 확장자만으로 판단(Worker가 키를 그렇게 만들어 보냄). mediaIsClip은 입력 인자/필터 구성에서 씀.
     const imagePaths = [];
     const mediaIsClip = [];
+    let failedDownloadCount = 0;
     for (let i = 0; i < images.length; i++) {
       const isClip = /\.mp4(\?|$)/i.test(images[i]);
       const dest = path.join(tmpDir, `img-${i}.${isClip ? "mp4" : "jpg"}`);
-      await downloadToFile(images[i], dest);
-      imagePaths.push(dest);
-      mediaIsClip.push(isClip);
+      try {
+        await downloadToFile(images[i], dest);
+        imagePaths.push(dest);
+        mediaIsClip.push(isClip);
+      } catch (e) {
+        // [2026-09-06 12:10] 이미지 하나가 404 등으로 못 받아졌다고 영상 전체를 실패 처리하던 문제 —
+        // 자리(자막 타이밍/이미지 개수 정렬)는 그대로 유지한 채, 그 이미지만 검정 화면으로 대체하고 계속
+        // 진행함. 배열 인덱스를 그대로 유지해야(빼면) 다른 이미지의 자막 세그먼트 매핑이 깨지므로,
+        // "빼기"가 아니라 "대체"로 처리.
+        failedDownloadCount++;
+        console.log(`[render:${jobId}] 이미지 ${i} 다운로드 실패, 검정 화면으로 대체: ${images[i]} — ${e.message}`);
+        const placeholderPath = path.join(tmpDir, `img-${i}-placeholder.jpg`);
+        try {
+          await runFfmpegQuiet(["-f", "lavfi", "-i", "color=c=black:s=1280x720", "-frames:v", "1", placeholderPath]);
+          imagePaths.push(placeholderPath);
+          mediaIsClip.push(false); // 대체 이미지는 항상 정지화면 취급(클립이었어도)
+        } catch (e2) {
+          throw new Error(`이미지 ${i} 다운로드도 실패하고 대체 화면 생성도 실패: ${e2.message}`);
+        }
+      }
       setProgress("이미지 다운로드 중", 5 + Math.round((i + 1) / images.length * 15)); // 5~20%
     }
+    if (failedDownloadCount) console.log(`[render:${jobId}] 이미지 ${images.length}개 중 ${failedDownloadCount}개를 검정 화면으로 대체함`);
     // ---- 음성 확보: 세그먼트(실측 타이밍)가 최우선, 없거나 실패하면 통짜 mp3(추정 타이밍) ----
     let audioPath = null;
     let audioDurationSec = null;
