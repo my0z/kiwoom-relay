@@ -1,7 +1,7 @@
 /**
- * 생성(마지막 작업): 2026-09-06 17:15 (KST) — NFC 정규화로도 안 잡히는 다른 패턴(멀쩡한 단어 끝에
- * 네모 붙고 그 뒤로 끊김)이 계속돼서, U+FFFD(대체문자)·폭 없는 문자·방향 제어문자·BOM까지 같이
- * 제거하는 sanitizeCaptionText로 통합 + 실제 어떤 코드포인트가 있었는지 항상 로그로 남김
+ * 생성(마지막 작업): 2026-09-06 21:20 (KST) — 자막 PNG 렌더링 최적화: 문장 하나마다 파이썬 프로세스를
+ * 새로 띄우던 것을, ffmpeg 호출 1번(본편/청크/숏츠 각각)당 파이썬 프로세스 1번으로 묶음 — 자막
+ * 요청을 큐에 모았다가 JSON 매니페스트로 한 번에 넘기고, 폰트 로딩도 캐싱해서 재사용(render_caption.py)
  * relay - Oracle VM에서 상시 실행되는 중계 서버. 두 역할을 겸함:
  *   1) 키움 Real API 릴레이(주식 스크리너/자동매매용)
  *   2) videos.usb.kr(life.news) 영상 렌더링 — ffmpeg로 이미지 슬라이드쇼+내레이션 합성, 자막 굽기,
@@ -15,7 +15,7 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
-const { spawn } = require("child_process");
+const { spawn, execFileSync } = require("child_process");
 const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
 
 const PORT = process.env.PORT || 8787;
@@ -623,30 +623,57 @@ const FALLBACK_FONT_PATH =
   CAPTION_FONT_PATHS.gowun || CAPTION_FONT_PATHS.nanumpen || CAPTION_FONT_PATHS.gowunbatang || CAPTION_FONT_PATHS.songmyung ||
   CAPTION_FONT_PATHS.gaegu || CAPTION_FONT_PATHS.himelody ||
   "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc";
-// [2026-09-06 16:05] 진짜 원인 추가 발견 — Noto CJK로 바꿔도 여전히 문제(이번엔 글자가 네모로 안 보임,
-// 폰트에 그 글자가 없는 게 아니라 파일 자체를 못 읽는 증상)여서, .ttc(여러 언어가 묶인 컬렉션 파일)를
-// ffmpeg의 drawtext가 제대로 못 다루는 것으로 추정. 한국어 전용 단일 파일(.otf)을 새로 받아 직접 지정.
-const FULL_COVERAGE_FONT_PATH = resolveFontPath([
-  "/usr/local/share/fonts/NotoSansKR-Regular.otf",
-  "/usr/share/fonts/truetype/noto/NotoSansKR-Regular.otf",
-]) || FALLBACK_FONT_PATH;
+// [2026-09-06 16:05~21:00] Noto CJK(.ttc)로 바꿔도 문제가 계속돼서 원인을 폰트로 의심했었지만,
+// 최종적으로 ffmpeg 자체의 한글 렌더링 버그로 확정됨(파이썬/PIL로 우회함 — 아래 queueCaptionPng
+// 참고). 이제 PIL이 그리므로 폰트 자체의 문제가 아니었던 게 확인돼서, 원래 쓰던 다양한 폰트
+// 선택 방식으로 복원함.
 function resolveVideoFontPath(fontKey) {
-  return FULL_COVERAGE_FONT_PATH; // TODO: 원인 확인되면 (fontKey && CAPTION_FONT_PATHS[fontKey]) || FALLBACK_FONT_PATH 로 복원
+  return (fontKey && CAPTION_FONT_PATHS[fontKey]) || FALLBACK_FONT_PATH;
 }
 
-// [2026-09-06 15:00] 진짜 원인 발견/수정 — "(w-text_w)/2"나 "w-text_w-60"처럼 text_w(자막 실제 폭)에
-// 의존하는 위치 계산이, 여러 줄(\n 포함)짜리 텍스트에서 ffmpeg가 실제 폭을 정확히 못 재는 문제가
-// 있었음. 그 결과 가운데/오른쪽 정렬 계산이 틀어져서 시작 위치가 실제보다 오른쪽으로 잡혔고, 텍스트
-// 오른쪽 상당 부분이 화면 밖으로 밀려나가 안 보였음(길수록 더 많이 밀려남 — 로그의 완전한 텍스트와
-// 실제 화면에 보이는 앞부분만 남은 결과가 정확히 이 패턴과 일치). text_w에 의존하지 않는 왼쪽 고정
-// 여백으로 전부 통일해서 이 계산 오류 자체를 없앰.
+// [2026-09-06 21:00] 진짜 원인 확정 — 순수 ffmpeg 단독 테스트(drawtext, libass 자막 둘 다)에서 한글이
+// 항상 첫 글자만 그려지고 뒤가 통째로 사라지는 걸 확인함. 폰트 교체·ffmpeg 재설치·freetype/harfbuzz
+// 재설치로도 안 고쳐졌고, 같은 폰트를 파이썬(PIL)으로 그리면 완벽하게 다 나옴 — ffmpeg 자체의 한글
+// 텍스트 렌더링(drawtext/libass) 버그로 확정. 그래서 ffmpeg가 직접 글자를 그리게 하는 방식을 버리고,
+// 자막은 파이썬(PIL)으로 미리 투명 PNG로 그려서 ffmpeg는 그 이미지를 영상 위에 얹기(overlay)만 하도록
+// 전면 변경. CAPTION_POSITIONS도 ffmpeg 표현식(text_w/th 등) 대신 파이썬이 쓸 순수 픽셀 값으로 교체.
 const CAPTION_POSITIONS = [
-  { x: "40", y: "h-th-80", size: 52 },
-  { x: "40", y: "80", size: 48 },
-  { x: "40", y: "h-th-90", size: 57 },
-  { x: "40", y: "h-th-90", size: 53 },
-  { x: "40", y: "(h-th)/2", size: 56 },
+  { x: 40, yMode: "bottom", yOffset: 80, size: 52 },
+  { x: 40, yMode: "top", yOffset: 80, size: 48 },
+  { x: 40, yMode: "bottom", yOffset: 90, size: 57 },
+  { x: 40, yMode: "bottom", yOffset: 90, size: 53 },
+  { x: 40, yMode: "middle", yOffset: 0, size: 56 },
 ];
+
+const CAPTION_RENDER_SCRIPT = path.join(__dirname, "render_caption.py");
+// [2026-09-06 21:20] 최적화 — 문장 하나마다 파이썬 프로세스를 새로 띄우면(영상 하나에 문장이 수십~
+// 백개) 프로세스 생성 오버헤드가 누적돼 느려짐. 대신 한 번의 ffmpeg 호출(본편/청크/숏츠 각각)에
+// 필요한 자막 PNG 요청을 큐에 모아뒀다가, ffmpeg 실행 직전에 파이썬 프로세스 1번으로 전부 그림.
+function queueCaptionPng(requests, text, fontFile, fontSize, colorHexFF, canvasW, canvasH, x, yMode, yOffset, outPath) {
+  const txtPath = outPath.replace(/\.png$/, ".txt");
+  fs.writeFileSync(txtPath, text, "utf8");
+  const colorHex = "#" + colorHexFF.replace(/^0x/i, "");
+  requests.push({
+    text_file: txtPath, font_file: fontFile, font_size: fontSize, color_hex: colorHex,
+    canvas_w: canvasW, canvas_h: canvasH, x, y_mode: yMode, y_offset: yOffset,
+    stroke_width: 8, stroke_color: "black", spacing: 16, out_path: outPath,
+  });
+}
+// 큐에 쌓인 자막 PNG 요청을 파이썬 프로세스 1번으로 전부 그림 — ffmpeg 실행 직전에 호출.
+function flushCaptionPngBatch(requests, tmpDir, jobId, label) {
+  if (!requests.length) return;
+  const manifestPath = path.join(tmpDir, `caption-manifest-${label}-${Date.now()}.json`);
+  fs.writeFileSync(manifestPath, JSON.stringify(requests), "utf8");
+  try {
+    execFileSync("python3", [CAPTION_RENDER_SCRIPT, manifestPath], { stdio: ["ignore", "ignore", "pipe"] });
+  } catch (e) {
+    // exit 2 = 일부만 실패(계속 진행), exit 1 = 전부 실패. 어느 쪽이든 실패한 파일은 overlay 단계에서
+    // ffmpeg가 입력을 못 찾아 렌더링 자체가 실패하므로, 로그만 남기고 위로 던짐(상위 catch가 처리).
+    const stderr = e.stderr ? e.stderr.toString().slice(0, 500) : e.message;
+    jlog(jobId, `[render:${jobId}] ${label} 캡션 PNG 배치 렌더링 실패: ${stderr}`);
+    throw e;
+  }
+}
 
 async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, shortOutputKeys, weights, captionBeats, captionFontKey, captionColor, highlightSegRange) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), `render-${jobId}-`));
@@ -791,23 +818,20 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, s
       }
     };
 
-    const makeImageChain = (inputIdx, imgIdx) => {
+    // [2026-09-06 21:00] inputArgs/extraInputCounter를 받아서, 자막마다 미리 그린 PNG를 새 입력으로
+    // 추가하고 overlay 필터로 얹음(ffmpeg 자체 텍스트 렌더링 버그 우회). extraInputCounter는
+    // { count: N } 형태의 공유 카운터 — 이 ffmpeg 호출 안에서 다음 입력이 몇 번인지 계속 추적함.
+    const makeImageChain = (inputIdx, imgIdx, inputArgs, extraInputCounter, captionRequests) => {
       // fps=25: 사진 루프는 원래 25fps지만 클립은 원본 fps가 제각각이라 통일 — xfade가 fps 불일치에 민감함
-      let chain = `[${inputIdx}:v]fps=25,scale=1280:720:flags=lanczos,setsar=1,eq=contrast=1.06:saturation=1.12:brightness=0.02:gamma=1.02`;
+      const baseLabel = `base${inputIdx}`;
+      let chain = `[${inputIdx}:v]fps=25,scale=1280:720:flags=lanczos,setsar=1,eq=contrast=1.06:saturation=1.12:brightness=0.02:gamma=1.02[${baseLabel}]`;
       const beats = fontAvailable && Array.isArray(captionBeats) ? (captionBeats[imgIdx] || []) : [];
-      // [2026-09-06 14:20] 진짜 원인 발견/수정 — 이미지마다 자막을 미리 구운 뒤 그 화면끼리 크로스페이드로
-      // 섞다 보니, 전환되는 그 짧은 순간(~0.6초)엔 앞 이미지의 자막과 뒤 이미지의 자막이 반투명하게
-      // 겹쳐서 글자가 뒤섞여 보였음(세그먼트 실측 타이밍이 정확해도 발생하는, 완전히 다른 원인이었음).
-      // 이 이미지의 로컬 타임라인에서 "전환 중"인 구간(맨 앞 xfadeDurs[imgIdx-1]초=들어오는 전환,
-      // 맨 뒤 xfadeDurs[imgIdx]초=나가는 전환)엔 자막이 아예 안 보이게 시작/끝 시각을 그 경계 안으로
-      // 밀어넣음 — 겹쳐 보일 시점 자체를 없앰(자막이 아주 짧게 비는 대신 겹침보다 훨씬 나음).
+      // [2026-09-06 14:20] 전환 구간(크로스페이드)엔 자막이 안 보이게 시작/끝 시각을 그 경계 안으로 클램프
       const incomingBlend = imgIdx > 0 ? xfadeDurs[imgIdx - 1] : 0;
       const outgoingBlend = imgIdx < durations.length - 1 ? xfadeDurs[imgIdx] : 0;
       const safeWindowEnd = Math.max(incomingBlend, durations[imgIdx] - outgoingBlend);
+      const overlaySteps = [];
       if (beats.length) {
-        // realTimeline이 있으면(세그먼트 실측/무음 앵커링) 실제 초 단위 시각을 그대로 쓰고, 이미지 자체
-        // 타임라인(-loop 1 입력은 t=0부터) 기준으로 바꾸려고 이미지 시작 시각(imgRealStart)을 빼줌.
-        // 없으면 글자수 비율로 이미지 노출시간(durations[imgIdx])을 나눔(최후 폴백).
         const realTimes = realTimeline ? realTimeline.perImageBeatTimes[imgIdx] : null;
         const imgRealStart = realTimeline ? realTimeline.imageSpans[imgIdx].start : 0;
         const sumWeight = beats.reduce((a, b) => a + (b.weight || 1), 0) || 1;
@@ -819,24 +843,29 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, s
           const beatDur = real ? Math.max(0.3, real.end - real.start) : Math.max(0.3, (beat.weight / sumWeight) * durations[imgIdx]);
           const rawEnd = rawStart + beatDur;
           t = rawEnd;
-          // 전환 구간 밖으로 클램프 — 겹치는 구간을 통째로 뺐을 때 시작이 끝보다 뒤로 가버리면(이 비트가
-          // 완전히 전환 구간 안에만 있던 경우) 표시할 수 없으니 건너뜀
           const start = Math.min(Math.max(rawStart, incomingBlend), safeWindowEnd);
           const end = Math.max(Math.min(rawEnd, safeWindowEnd), incomingBlend);
           if (!text || end - start < 0.15) return;
-          // [2026-09-06 14:40] 진단 로그 — 겹침 현상이 크로스페이드 구간이 아닌 곳에서도 재현돼서,
-          // 실제로 계산된 시작/끝/텍스트를 남겨 진짜 원인을 확인함(문제 재현 후 지울 예정)
-          jlog(jobId, `[render:${jobId}] img${imgIdx} beat${bi} segIndex=${beat.segIndex} [${start.toFixed(2)}~${end.toFixed(2)}] "${text.replace(/\n/g, "\\n")}"`);
-          const capFile = path.join(tmpDir, `cap-${imgIdx}-${bi}.txt`);
           const safeText = sanitizeCaptionText(text, jobId, `img${imgIdx} beat${bi}`);
-          fs.writeFileSync(capFile, safeText, "utf8");
           const st = CAPTION_POSITIONS[(beat.styleIndex || 0) % CAPTION_POSITIONS.length];
-          chain += `,drawtext=fontfile=${resolvedFontPath}:textfile=${capFile}:fontsize=${st.size}:fontcolor=${captionColorFF}:` +
-            `borderw=8:bordercolor=black:box=0:line_spacing=16:x=${st.x}:y=${st.y}:` +
-            `enable='between(t,${start.toFixed(2)},${end.toFixed(2)})'`;
+          const pngPath = path.join(tmpDir, `capimg-${imgIdx}-${bi}.png`);
+          queueCaptionPng(captionRequests, safeText, resolvedFontPath, st.size, captionColorFF, 1280, 720, st.x, st.yMode, st.yOffset, pngPath);
+          const capInputIdx = extraInputCounter.count++;
+          inputArgs.push("-loop", "1", "-t", String(durations[imgIdx].toFixed(2)), "-i", pngPath);
+          overlaySteps.push({ capInputIdx, start, end });
         });
       }
-      return `${chain}[v${inputIdx}]`;
+      let curLabel = baseLabel;
+      overlaySteps.forEach((step, idx) => {
+        const outLabel = idx === overlaySteps.length - 1 ? `v${inputIdx}` : `ov${inputIdx}_${idx}`;
+        chain += `;[${curLabel}][${step.capInputIdx}:v]overlay=x=0:y=0:enable='between(t,${step.start.toFixed(2)},${step.end.toFixed(2)})'[${outLabel}]`;
+        curLabel = outLabel;
+      });
+      if (!overlaySteps.length) {
+        // 자막 없는 이미지 — base 라벨을 그대로 최종 라벨 이름으로 씀(불필요한 필터 추가 안 함)
+        chain = chain.replace(`[${baseLabel}]`, `[v${inputIdx}]`);
+      }
+      return chain;
     };
 
     // 오디오(나레이션 loudnorm 또는 합성 BGM) 입력/필터를 붙이는 공용 빌더 — videoInputCount 뒤 번호부터 오디오 입력.
@@ -877,7 +906,9 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, s
       // 소량: 예전처럼 한 번에 렌더링(중간 재인코딩 없음)
       const inputArgs = [];
       imagePaths.forEach((p, i) => pushMediaInput(inputArgs, i));
-      const filterInputs = imagePaths.map((p, i) => makeImageChain(i, i)).join(";");
+      const extraInputCounter = { count: imagePaths.length }; // 캡션 PNG는 이미지 입력들 뒤 번호부터
+      const captionRequests = [];
+      const filterInputs = imagePaths.map((p, i) => makeImageChain(i, i, inputArgs, extraInputCounter, captionRequests)).join(";");
       let filterComplex;
       if (imagePaths.length <= 1) {
         filterComplex = `${filterInputs};[v0]concat=n=1:v=1:a=0[outv]`;
@@ -895,7 +926,10 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, s
         }
         filterComplex = `${filterInputs};${xfadeParts.join(";")}`;
       }
-      const audioParts = appendAudioParts(inputArgs, filterComplex, imagePaths.length);
+      flushCaptionPngBatch(captionRequests, tmpDir, jobId, "main"); // ffmpeg 실행 전에 자막 PNG 전부 그림
+      // [2026-09-06 21:00] 캡션 PNG를 추가 입력으로 붙였으니, 오디오 입력 번호는 이미지 개수가 아니라
+      // extraInputCounter.count(이미지+캡션PNG 전부)부터 시작해야 함
+      const audioParts = appendAudioParts(inputArgs, filterComplex, extraInputCounter.count);
       setProgress("렌더링 중", 30);
       await runFfmpeg([
         "-y", ...inputArgs,
@@ -921,7 +955,9 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, s
         const group = chunkIdxGroups[k];
         const inputArgs = [];
         group.forEach((g) => pushMediaInput(inputArgs, g));
-        const filterInputs = group.map((g, j) => makeImageChain(j, g)).join(";");
+        const extraInputCounter = { count: group.length }; // 이 청크 안에서 캡션 PNG는 이미지들 뒤 번호부터
+        const captionRequests = [];
+        const filterInputs = group.map((g, j) => makeImageChain(j, g, inputArgs, extraInputCounter, captionRequests)).join(";");
         let filterComplex;
         let mapLabel;
         if (group.length === 1) {
@@ -942,6 +978,7 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, s
           filterComplex = `${filterInputs};${xfadeParts.join(";")}`;
           mapLabel = "[outv]";
         }
+        flushCaptionPngBatch(captionRequests, tmpDir, jobId, `chunk${k}`); // ffmpeg 실행 전에 이 청크의 자막 PNG 전부 그림
         const chunkFile = path.join(tmpDir, `chunk-${k}.mp4`);
         const internalFades = group.slice(0, -1).reduce((a, g) => a + xfadeDurs[g], 0);
         const chunkLen = group.reduce((a, g) => a + durations[g], 0) - internalFades;
@@ -1105,9 +1142,12 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, s
             if (mediaIsClip[g]) sInputs.push("-stream_loop", "-1", "-t", String(sDur[j].toFixed(2)), "-i", imagePaths[g]);
             else sInputs.push("-loop", "1", "-t", String(sDur[j].toFixed(2)), "-i", imagePaths[g]);
           });
+          const extraInputCounter = { count: shortImgIdx.length }; // 캡션 PNG는 이미지 입력들 뒤 번호부터
+          const captionRequests = [];
           const sChains = shortImgIdx.map((g, j) => {
             // 세로 꽉 채움: 비율 유지로 확대 후 중앙 크롭(가로 원본의 좌우가 잘려나감 — 숏츠 표준 연출)
-            let chain = `[${j}:v]fps=25,scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,setsar=1,eq=contrast=1.06:saturation=1.12:brightness=0.02:gamma=1.02`;
+            const baseLabel = `sbase${j}`;
+            let chain = `[${j}:v]fps=25,scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,setsar=1,eq=contrast=1.06:saturation=1.12:brightness=0.02:gamma=1.02[${baseLabel}]`;
             const beats = fontAvailable && Array.isArray(captionBeats) ? (captionBeats[g] || []) : [];
             const realTimes = realTimeline.perImageBeatTimes[g];
             const imgLocalBase = sStarts[j]; // 이 이미지 입력의 t=0이 전체 타임라인에서 어디인지
@@ -1115,29 +1155,36 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, s
             const sIncomingBlend = j > 0 ? sFades[j - 1] : 0;
             const sOutgoingBlend = j < sDur.length - 1 ? sFades[j] : 0;
             const sSafeWindowEnd = Math.max(sIncomingBlend, sDur[j] - sOutgoingBlend);
+            const overlaySteps = [];
             beats.forEach((beat, bi) => {
               const text = (beat.text || "").trim();
               const real = realTimes && realTimes[bi];
               if (!text || !real || real.end <= sT + 0.05 || real.start >= eT - 0.05) return; // 구간 밖 문장
               const st = CAPTION_POSITIONS[(beat.styleIndex || 0) % CAPTION_POSITIONS.length];
-              // [2026-09-06 14:05] 버그 수정 — 본편(가로 1280px) 기준 폰트 크기를 쇼츠(세로 720px)에도
-              // 그대로 썼더니, 한 줄(15자) 폭이 쇼츠 프레임 폭보다 넓어져서 오른쪽이 화면 밖으로
-              // 잘려나갔음(안 보이는 것뿐, 실제로 글자가 사라진 건 아니었음). 쇼츠는 본편 대비 폭
-              // 비율(720/1280)만큼 폰트도 같이 줄여서 프레임 안에 들어오게 함.
+              // [2026-09-06 14:05] 본편(가로 1280px) 기준 폰트 크기를 쇼츠(세로 720px)에 비례 축소
               const shortsFontSize = Math.round(st.size * (720 / 1280));
               const rawBs = Math.max(0, Math.max(real.start, sT) - imgLocalBase);
               const rawBe = Math.max(rawBs + 0.2, Math.min(real.end, eT) - imgLocalBase);
               const bs = Math.min(Math.max(rawBs, sIncomingBlend), sSafeWindowEnd);
               const be = Math.max(Math.min(rawBe, sSafeWindowEnd), sIncomingBlend);
               if (be - bs < 0.15) return;
-              const capFile = path.join(tmpDir, `scap-${ri}-${g}-${bi}.txt`);
               const safeText = sanitizeCaptionText(text, jobId, `short img${g} beat${bi}`);
-              fs.writeFileSync(capFile, safeText, "utf8");
-              chain += `,drawtext=fontfile=${resolvedFontPath}:textfile=${capFile}:fontsize=${shortsFontSize}:fontcolor=${captionColorFF}:` +
-                `borderw=8:bordercolor=black:box=0:line_spacing=16:x=${st.x}:y=${st.y}:` +
-                `enable='between(t,${bs.toFixed(2)},${be.toFixed(2)})'`;
+              const pngPath = path.join(tmpDir, `scapimg-${ri}-${g}-${bi}.png`);
+              // [2026-09-06 21:00] ffmpeg 자체 텍스트 렌더링 버그 우회 — 파이썬(PIL)으로 미리 720x1280
+              // 투명 PNG로 그려서 overlay로 얹음(본편과 동일한 방식)
+              queueCaptionPng(captionRequests, safeText, resolvedFontPath, shortsFontSize, captionColorFF, 720, 1280, st.x, st.yMode, st.yOffset, pngPath);
+              const capInputIdx = extraInputCounter.count++;
+              sInputs.push("-loop", "1", "-t", String(sDur[j].toFixed(2)), "-i", pngPath);
+              overlaySteps.push({ capInputIdx, bs, be });
             });
-            return `${chain}[sv${j}]`;
+            let curLabel = baseLabel;
+            overlaySteps.forEach((step, idx) => {
+              const outLabel = idx === overlaySteps.length - 1 ? `sv${j}` : `sov${j}_${idx}`;
+              chain += `;[${curLabel}][${step.capInputIdx}:v]overlay=x=0:y=0:enable='between(t,${step.bs.toFixed(2)},${step.be.toFixed(2)})'[${outLabel}]`;
+              curLabel = outLabel;
+            });
+            if (!overlaySteps.length) chain = chain.replace(`[${baseLabel}]`, `[sv${j}]`);
+            return chain;
           }).join(";");
           let sFilter;
           let sMap = "[outv]";
@@ -1159,7 +1206,8 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, s
             sFilter = `${sChains};${parts.join(";")}`;
           }
           sInputs.push("-ss", sT.toFixed(2), "-t", (eT - sT).toFixed(2), "-i", audioPath); // 음성도 같은 구간만(wav라 초 단위 정확)
-          sFilter += `;[${shortImgIdx.length}:a]loudnorm=I=-16:TP=-1.5:LRA=11[anorm]`;
+          sFilter += `;[${extraInputCounter.count}:a]loudnorm=I=-16:TP=-1.5:LRA=11[anorm]`;
+          flushCaptionPngBatch(captionRequests, tmpDir, jobId, `short${ri}`); // ffmpeg 실행 전에 이 숏츠의 자막 PNG 전부 그림
           const shortPath = path.join(tmpDir, `short-${ri}.mp4`);
           await runFfmpeg([
             "-y", ...sInputs,
