@@ -8,14 +8,18 @@
 #   sudo cp auto-deploy.sh /usr/local/bin/kiwoom-auto-deploy.sh
 #   sudo chmod +x /usr/local/bin/kiwoom-auto-deploy.sh
 #   (systemd 서비스 등록은 kiwoom-auto-deploy.service 참고)
+#
+# [2026-09-06 17:30] 경로/서비스명 버그 수정 — 예전엔 REPO_DIR/SERVICE가 kiwoom-relay였는데
+# 실제 폴더/서비스 이름은 relay로 바뀐 지 오래라(9/6 리네임) 이 워처 자체가 애초에 동작할 수 없었음
+# (cd 부터 실패). 실제 상태에 맞게 수정.
 
 REPO_DIR="/home/ubuntu/relay"
-SERVICE="kiwoom-relay"
+SERVICE="relay"
 INTERVAL=60   # 확인 주기(초)
 
 cd "$REPO_DIR" || { echo "저장소 경로를 찾을 수 없음: $REPO_DIR"; exit 1; }
 
-echo "[auto-deploy] 감시 시작 (저장소=$REPO_DIR, 주기=${INTERVAL}초)"
+echo "[auto-deploy] 감시 시작 (저장소=$REPO_DIR, 서비스=$SERVICE, 주기=${INTERVAL}초)"
 
 while true; do
   # 원격 정보만 갱신 (작업트리는 아직 안 건드림)
