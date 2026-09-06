@@ -1,8 +1,7 @@
 /**
- * 생성(마지막 작업): 2026-09-06 14:20 (KST) — 진짜 원인 발견/수정: 자막이 겹쳐 보이던 문제는 타이밍
- * 계산 버그가 아니라 이미지 전환(xfade) 구간에서 앞/뒤 이미지의 자막이 반투명하게 겹쳐 보이는
- * 구조적 문제였음(세그먼트 실측이 정확해도 발생). 각 이미지의 전환 구간(들어오는/나가는 크로스페이드)
- * 동안엔 자막이 아예 안 보이게 시작/끝 시각을 클램프 — 본편(makeImageChain)과 쇼츠(sChains) 둘 다 적용
+ * 생성(마지막 작업): 2026-09-06 14:40 (KST) — 전환 구간이 아닌 곳(영상 시작 0.01초 등)에서도 자막이
+ * 겹쳐 보이는 재현 사례가 나와서, 각 비트의 실제 계산된 시작/끝/텍스트를 로그로 남기는 진단 코드
+ * 추가(문제 확인 후 제거 예정)
  * relay - Oracle VM에서 상시 실행되는 중계 서버. 두 역할을 겸함:
  *   1) 키움 Real API 릴레이(주식 스크리너/자동매매용)
  *   2) videos.usb.kr(life.news) 영상 렌더링 — ffmpeg로 이미지 슬라이드쇼+내레이션 합성, 자막 굽기,
@@ -779,6 +778,9 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, s
           const start = Math.min(Math.max(rawStart, incomingBlend), safeWindowEnd);
           const end = Math.max(Math.min(rawEnd, safeWindowEnd), incomingBlend);
           if (!text || end - start < 0.15) return;
+          // [2026-09-06 14:40] 진단 로그 — 겹침 현상이 크로스페이드 구간이 아닌 곳에서도 재현돼서,
+          // 실제로 계산된 시작/끝/텍스트를 남겨 진짜 원인을 확인함(문제 재현 후 지울 예정)
+          console.log(`[render:${jobId}] img${imgIdx} beat${bi} segIndex=${beat.segIndex} [${start.toFixed(2)}~${end.toFixed(2)}] "${text.replace(/\n/g, "\\n")}"`);
           const capFile = path.join(tmpDir, `cap-${imgIdx}-${bi}.txt`);
           fs.writeFileSync(capFile, text, "utf8");
           const st = CAPTION_POSITIONS[(beat.styleIndex || 0) % CAPTION_POSITIONS.length];
