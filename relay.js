@@ -1,7 +1,8 @@
 /**
- * 생성(마지막 작업): 2026-09-06 16:05 (KST) — Noto CJK(.ttc 묶음 파일)로도 자막이 네모(□)로 깨지는
- * 증상이 계속돼서, 한국어 전용 단일 폰트 파일(.otf)로 교체 — ffmpeg drawtext가 여러 언어 묶음
- * 컬렉션 파일(.ttc)을 제대로 못 읽는 것으로 추정
+ * 생성(마지막 작업): 2026-09-06 16:20 (KST) — 폰트를 두 번 바꿔도 자막이 계속 깨지고(□) 그 지점에서
+ * 잘려서, 폰트가 아니라 텍스트 자체에 문제가 있다고 보고 원인 추정 전환: 분리된 자모(NFD) 형태가
+ * 섞여 들어갔을 가능성 — 자막 파일 쓰기 직전에 NFC 정규화 + 제어문자 제거 안전장치 추가,
+ * 실제로 변경이 있었는지(=NFD였는지) 확인하는 진단 로그도 같이 추가
  * relay - Oracle VM에서 상시 실행되는 중계 서버. 두 역할을 겸함:
  *   1) 키움 Real API 릴레이(주식 스크리너/자동매매용)
  *   2) videos.usb.kr(life.news) 영상 렌더링 — ffmpeg로 이미지 슬라이드쇼+내레이션 합성, 자막 굽기,
@@ -791,7 +792,13 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, s
           // 실제로 계산된 시작/끝/텍스트를 남겨 진짜 원인을 확인함(문제 재현 후 지울 예정)
           console.log(`[render:${jobId}] img${imgIdx} beat${bi} segIndex=${beat.segIndex} [${start.toFixed(2)}~${end.toFixed(2)}] "${text.replace(/\n/g, "\\n")}"`);
           const capFile = path.join(tmpDir, `cap-${imgIdx}-${bi}.txt`);
-          fs.writeFileSync(capFile, text, "utf8");
+          // [2026-09-06 16:20] 진짜 원인 추정 — 자막이 폰트를 두 번 바꿔도 계속 깨지고(□) 그 지점에서
+          // 잘리는 걸 보니, 폰트 문제가 아니라 텍스트 자체에 "분리된 자모"(NFD) 형태가 섞여 들어가서
+          // ffmpeg가 그 글자를 못 찾고 걸려 넘어지는 것으로 추정됨. 항상 "합쳐진 완성형"(NFC)으로
+          // 정규화하고, 혹시 모를 제어문자(줄바꿈 제외)도 제거해서 안전하게 만듦.
+          const safeText = text.normalize("NFC").replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "");
+          if (safeText !== text) console.log(`[render:${jobId}] img${imgIdx} beat${bi} 정규화로 텍스트 변경됨(분리된 자모 또는 제어문자 있었음)`);
+          fs.writeFileSync(capFile, safeText, "utf8");
           const st = CAPTION_POSITIONS[(beat.styleIndex || 0) % CAPTION_POSITIONS.length];
           chain += `,drawtext=fontfile=${resolvedFontPath}:textfile=${capFile}:fontsize=${st.size}:fontcolor=${captionColorFF}:` +
             `borderw=8:bordercolor=black:box=0:line_spacing=16:x=${st.x}:y=${st.y}:` +
@@ -1093,7 +1100,8 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, s
               const be = Math.max(Math.min(rawBe, sSafeWindowEnd), sIncomingBlend);
               if (be - bs < 0.15) return;
               const capFile = path.join(tmpDir, `scap-${ri}-${g}-${bi}.txt`);
-              fs.writeFileSync(capFile, text, "utf8");
+              const safeText = text.normalize("NFC").replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "");
+              fs.writeFileSync(capFile, safeText, "utf8");
               chain += `,drawtext=fontfile=${resolvedFontPath}:textfile=${capFile}:fontsize=${shortsFontSize}:fontcolor=${captionColorFF}:` +
                 `borderw=8:bordercolor=black:box=0:line_spacing=16:x=${st.x}:y=${st.y}:` +
                 `enable='between(t,${bs.toFixed(2)},${be.toFixed(2)})'`;
