@@ -1,9 +1,8 @@
 /**
- * 생성(마지막 작업): 2026-09-06 15:00 (KST) — 진짜 원인 발견/수정: 자막이 앞부분만 남고 잘려 보이던
- * 문제 — 로그로 확인해보니 텍스트 자체는 완전했는데, "(w-text_w)/2"·"w-text_w-60"처럼 text_w(자막
- * 실제 폭)에 의존하는 위치 계산이 여러 줄 텍스트에서 ffmpeg가 폭을 부정확하게 재는 문제가 있었음
- * (길수록 더 오른쪽으로 밀려서 더 많이 화면 밖으로 나감 — 관찰된 비례 잘림 패턴과 일치). text_w
- * 의존을 완전히 없애고 전부 왼쪽 고정 여백(x=40)으로 통일
+ * 생성(마지막 작업): 2026-09-06 15:30 (KST) — 진단용 임시 조치: 자막 폰트를 전부 완성형 11,172자를
+ * 담은 시스템 Noto 폰트로 강제 전환 — 지금 쓰던 귀여운/손글씨 폰트들의 불완전한 한글 커버리지가
+ * "자막이 매번 다른 지점에서 잘리는" 현상의 원인인지 확인하기 위함(resolveVideoFontPath 임시 수정,
+ * text_w 위치 계산 수정은 이미 반영했지만 그것만으론 해결 안 됐음)
  * relay - Oracle VM에서 상시 실행되는 중계 서버. 두 역할을 겸함:
  *   1) 키움 Real API 릴레이(주식 스크리너/자동매매용)
  *   2) videos.usb.kr(life.news) 영상 렌더링 — ffmpeg로 이미지 슬라이드쇼+내레이션 합성, 자막 굽기,
@@ -588,8 +587,19 @@ const FALLBACK_FONT_PATH =
   CAPTION_FONT_PATHS.gowun || CAPTION_FONT_PATHS.nanumpen || CAPTION_FONT_PATHS.gowunbatang || CAPTION_FONT_PATHS.songmyung ||
   CAPTION_FONT_PATHS.gaegu || CAPTION_FONT_PATHS.himelody ||
   "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc";
+// [2026-09-06 15:30] 진단용 임시 조치 — 지금 쓰는 귀여운/손글씨 폰트들(구글 폰트)이 완성형 한글을
+// 다 못 담고 있어서(보통 상용 2,350자 정도만), 빠진 글자를 만나면 ffmpeg가 그 지점에서 렌더링을
+// 멈춰버리는 것으로 추정됨(자막이 매번 다른 지점에서 잘리던 현상과 일치). 이게 진짜 원인인지 확인
+// 하기 위해 완성형 11,172자를 전부 담은 시스템 Noto 폰트로 강제 전환(FALLBACK_FONT_PATH는 gowun이
+// 설치돼 있으면 그걸 먼저 골라버려서 검증 의미가 없어 직접 지정) — 확인되면 폰트 목록을 전체
+// 커버리지가 확실한 것들로 교체 예정.
+const FULL_COVERAGE_FONT_PATH = resolveFontPath([
+  "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+  "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+  "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+]) || FALLBACK_FONT_PATH;
 function resolveVideoFontPath(fontKey) {
-  return (fontKey && CAPTION_FONT_PATHS[fontKey]) || FALLBACK_FONT_PATH;
+  return FULL_COVERAGE_FONT_PATH; // TODO: 원인 확인되면 (fontKey && CAPTION_FONT_PATHS[fontKey]) || FALLBACK_FONT_PATH 로 복원
 }
 
 // [2026-09-06 15:00] 진짜 원인 발견/수정 — "(w-text_w)/2"나 "w-text_w-60"처럼 text_w(자막 실제 폭)에
