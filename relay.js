@@ -1,8 +1,7 @@
 /**
- * 생성(마지막 작업): 2026-09-06 16:20 (KST) — 폰트를 두 번 바꿔도 자막이 계속 깨지고(□) 그 지점에서
- * 잘려서, 폰트가 아니라 텍스트 자체에 문제가 있다고 보고 원인 추정 전환: 분리된 자모(NFD) 형태가
- * 섞여 들어갔을 가능성 — 자막 파일 쓰기 직전에 NFC 정규화 + 제어문자 제거 안전장치 추가,
- * 실제로 변경이 있었는지(=NFD였는지) 확인하는 진단 로그도 같이 추가
+ * 생성(마지막 작업): 2026-09-06 16:35 (KST) — 영상 생성 중 relay 로그를 관리자 페이지에서 실시간으로
+ * 볼 수 있게 함 — jobId별 로그 버퍼(jobLogs) 추가, 렌더링 관련 console.log를 jlog()로 전환,
+ * /render/status 응답에 logs 배열 포함
  * relay - Oracle VM에서 상시 실행되는 중계 서버. 두 역할을 겸함:
  *   1) 키움 Real API 릴레이(주식 스크리너/자동매매용)
  *   2) videos.usb.kr(life.news) 영상 렌더링 — ffmpeg로 이미지 슬라이드쇼+내레이션 합성, 자막 굽기,
@@ -53,11 +52,25 @@ const r2Client = (R2_ACCESS_KEY_ID && R2_SECRET_ACCESS_KEY)
 
 // jobId -> { status: "processing"|"done"|"failed", error, r2Key, startedAt }
 const renderJobs = new Map();
+// [2026-09-06 16:35] 영상 생성 중 실시간으로 뭘 하고 있는지 관리자 페이지에서 볼 수 있게, jobId별로
+// 최근 로그 줄을 메모리에 잠깐 보관해둠(/render/status 응답에 같이 실어서 보냄). SSH로 journalctl
+// 안 봐도 되게 하는 목적 — console.log는 그대로 하고 배열에도 같이 쌓기만 함.
+const jobLogs = new Map();
+function jlog(jobId, msg) {
+  console.log(msg);
+  const arr = jobLogs.get(jobId) || [];
+  arr.push(msg);
+  if (arr.length > 80) arr.shift(); // 너무 오래 쌓이지 않게 최근 80줄만 유지
+  jobLogs.set(jobId, arr);
+}
 // 오래된 완료/실패 job은 메모리에서 주기적으로 정리 (30분 지나면 제거)
 setInterval(() => {
   const cutoff = Date.now() - 30 * 60 * 1000;
   for (const [id, job] of renderJobs) {
-    if (job.status !== "processing" && (job.completedAt || job.startedAt) < cutoff) renderJobs.delete(id);
+    if (job.status !== "processing" && (job.completedAt || job.startedAt) < cutoff) {
+      renderJobs.delete(id);
+      jobLogs.delete(id); // 로그 버퍼도 같이 정리(메모리 누수 방지)
+    }
   }
 }, 5 * 60 * 1000);
 
@@ -641,7 +654,7 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, s
         // 진행함. 배열 인덱스를 그대로 유지해야(빼면) 다른 이미지의 자막 세그먼트 매핑이 깨지므로,
         // "빼기"가 아니라 "대체"로 처리.
         failedDownloadCount++;
-        console.log(`[render:${jobId}] 이미지 ${i} 다운로드 실패, 검정 화면으로 대체: ${images[i]} — ${e.message}`);
+        jlog(jobId, `[render:${jobId}] 이미지 ${i} 다운로드 실패, 검정 화면으로 대체: ${images[i]} — ${e.message}`);
         const placeholderPath = path.join(tmpDir, `img-${i}-placeholder.jpg`);
         try {
           await runFfmpegQuiet(["-f", "lavfi", "-i", "color=c=black:s=1280x720", "-frames:v", "1", placeholderPath]);
@@ -653,7 +666,7 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, s
       }
       setProgress("이미지 다운로드 중", 5 + Math.round((i + 1) / images.length * 15)); // 5~20%
     }
-    if (failedDownloadCount) console.log(`[render:${jobId}] 이미지 ${images.length}개 중 ${failedDownloadCount}개를 검정 화면으로 대체함`);
+    if (failedDownloadCount) jlog(jobId, `[render:${jobId}] 이미지 ${images.length}개 중 ${failedDownloadCount}개를 검정 화면으로 대체함`);
     // ---- 음성 확보: 세그먼트(실측 타이밍)가 최우선, 없거나 실패하면 통짜 mp3(추정 타이밍) ----
     let audioPath = null;
     let audioDurationSec = null;
@@ -673,7 +686,7 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, s
         audioDurationSec = prepared.totalDur;
         segStarts = prepared.segStarts;
       } catch (e) {
-        console.log(`[render:${jobId}] 세그먼트 음성 준비 실패(통짜 mp3로 폴백): ${e.message}`);
+        jlog(jobId, `[render:${jobId}] 세그먼트 음성 준비 실패(통짜 mp3로 폴백): ${e.message}`);
         audioPath = null;
         segStarts = null;
       }
@@ -686,7 +699,7 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, s
 
     setProgress("영상 길이 계산 중", 25);
     if (audioPath && !audioDurationSec) {
-      try { audioDurationSec = await getAudioDurationSec(audioPath); } catch (e) { console.log(`[render:${jobId}] 오디오 길이 확인 실패: ${e.message}`); }
+      try { audioDurationSec = await getAudioDurationSec(audioPath); } catch (e) { jlog(jobId, `[render:${jobId}] 오디오 길이 확인 실패: ${e.message}`); }
     }
     // 자막 타이밍 우선순위: ① 세그먼트 실측(정확, 추정 없음) ② 무음 감지 정렬(구버전 요청 하위호환)
     // ③ 글자수 비율 추정(최후 폴백). ①이 있으면 ②는 아예 시도하지 않음.
@@ -699,11 +712,11 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, s
         try {
           realTimeline = await computeRealBeatTimeline(audioPath, audioDurationSec, captionBeats, weights);
         } catch (e) {
-          console.log(`[render:${jobId}] 무음 구간 타이밍 계산 실패, 글자수 비율 추정으로 폴백: ${e.message}`);
+          jlog(jobId, `[render:${jobId}] 무음 구간 타이밍 계산 실패, 글자수 비율 추정으로 폴백: ${e.message}`);
           realTimeline = null;
         }
       }
-      console.log(`[render:${jobId}] 자막 타이밍: ${realTimeline
+      jlog(jobId, `[render:${jobId}] 자막 타이밍: ${realTimeline
         ? (realTimeline.segmentCount
           ? `세그먼트 실측(${realTimeline.segmentCount}개 조각, 경계 전부 측정값)`
           : `무음 구간 앵커링(문장 경계 ${realTimeline.boundaryCount}개 중 ${realTimeline.anchoredCount}개 실측, 나머지 보간)`)
@@ -730,7 +743,7 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, s
     const resolvedFontPath = resolveVideoFontPath(captionFontKey);
     const fontAvailable = !!resolvedFontPath && fs.existsSync(resolvedFontPath);
     if (!fontAvailable) {
-      console.log(`[render:${jobId}] 자막 폰트를 못 찾음(요청 키: ${captionFontKey}, 경로: ${resolvedFontPath}) — 이번 렌더링은 자막 없이 진행`);
+      jlog(jobId, `[render:${jobId}] 자막 폰트를 못 찾음(요청 키: ${captionFontKey}, 경로: ${resolvedFontPath}) — 이번 렌더링은 자막 없이 진행`);
     }
     const captionColorFF = (typeof captionColor === "string" && /^#[0-9a-fA-F]{6}$/.test(captionColor))
       ? captionColor.replace("#", "0x")
@@ -790,14 +803,14 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, s
           if (!text || end - start < 0.15) return;
           // [2026-09-06 14:40] 진단 로그 — 겹침 현상이 크로스페이드 구간이 아닌 곳에서도 재현돼서,
           // 실제로 계산된 시작/끝/텍스트를 남겨 진짜 원인을 확인함(문제 재현 후 지울 예정)
-          console.log(`[render:${jobId}] img${imgIdx} beat${bi} segIndex=${beat.segIndex} [${start.toFixed(2)}~${end.toFixed(2)}] "${text.replace(/\n/g, "\\n")}"`);
+          jlog(jobId, `[render:${jobId}] img${imgIdx} beat${bi} segIndex=${beat.segIndex} [${start.toFixed(2)}~${end.toFixed(2)}] "${text.replace(/\n/g, "\\n")}"`);
           const capFile = path.join(tmpDir, `cap-${imgIdx}-${bi}.txt`);
           // [2026-09-06 16:20] 진짜 원인 추정 — 자막이 폰트를 두 번 바꿔도 계속 깨지고(□) 그 지점에서
           // 잘리는 걸 보니, 폰트 문제가 아니라 텍스트 자체에 "분리된 자모"(NFD) 형태가 섞여 들어가서
           // ffmpeg가 그 글자를 못 찾고 걸려 넘어지는 것으로 추정됨. 항상 "합쳐진 완성형"(NFC)으로
           // 정규화하고, 혹시 모를 제어문자(줄바꿈 제외)도 제거해서 안전하게 만듦.
           const safeText = text.normalize("NFC").replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "");
-          if (safeText !== text) console.log(`[render:${jobId}] img${imgIdx} beat${bi} 정규화로 텍스트 변경됨(분리된 자모 또는 제어문자 있었음)`);
+          if (safeText !== text) jlog(jobId, `[render:${jobId}] img${imgIdx} beat${bi} 정규화로 텍스트 변경됨(분리된 자모 또는 제어문자 있었음)`);
           fs.writeFileSync(capFile, safeText, "utf8");
           const st = CAPTION_POSITIONS[(beat.styleIndex || 0) % CAPTION_POSITIONS.length];
           chain += `,drawtext=fontfile=${resolvedFontPath}:textfile=${capFile}:fontsize=${st.size}:fontcolor=${captionColorFF}:` +
@@ -931,7 +944,7 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, s
         // 음성보다 벌어졌던 것. 음성 세그먼트처럼 여기도 "계산값" 대신 ffprobe로 실제 렌더링된 파일 길이를
         // 재서 그 실측값으로 다음 청크의 위치를 잡음 — 추정을 없애서 청크 경계마다 오차가 리셋되게 함.
         const measuredChunkLen = await getAudioDurationSec(chunkFile).catch((e) => {
-          console.log(`[render:${jobId}] 청크 ${k} 실측 길이 확인 실패, 계획값으로 대체: ${e.message}`);
+          jlog(jobId, `[render:${jobId}] 청크 ${k} 실측 길이 확인 실패, 계획값으로 대체: ${e.message}`);
           return chunkLen; // 실측 실패해도 렌더링 자체는 막지 않고 예전처럼 계획값으로 폴백
         });
         // chunkLen(계획)에는 이 청크의 "꼬리 전환(다음 청크와 겹칠 fade)"까지 포함돼 있으므로, 병합 offset에
@@ -1145,12 +1158,12 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, s
               ContentType: "video/mp4",
             }));
             shortsDone.push(outKey);
-            console.log(`[render:${jobId}] 숏츠(${label}) 저장: ${outKey} (${sT.toFixed(1)}~${eT.toFixed(1)}s, 이미지 ${shortImgIdx.length}장)`);
+            jlog(jobId, `[render:${jobId}] 숏츠(${label}) 저장: ${outKey} (${sT.toFixed(1)}~${eT.toFixed(1)}s, 이미지 ${shortImgIdx.length}장)`);
           } else {
-            console.log(`[render:${jobId}] 숏츠(${label}) 오디오 검증 실패 — 이 숏츠만 건너뜀`);
+            jlog(jobId, `[render:${jobId}] 숏츠(${label}) 오디오 검증 실패 — 이 숏츠만 건너뜀`);
           }
         } catch (e) {
-          console.log(`[render:${jobId}] 숏츠(${label}) 렌더링 실패(본편은 정상 진행): ${e.message}`);
+          jlog(jobId, `[render:${jobId}] 숏츠(${label}) 렌더링 실패(본편은 정상 진행): ${e.message}`);
         }
       }
     }
@@ -1165,10 +1178,10 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, s
     }));
 
     renderJobs.set(jobId, { status: "done", stage: "완료", percent: 100, r2Key: outputKey, shortKeys: shortsDone, shortKey: shortsDone[0] || null, durationSec: Math.round(audioDurationSec || 0), startedAt: renderJobs.get(jobId)?.startedAt || Date.now(), completedAt: Date.now() }); // [2026-09-01] durationSec 추가 — 관리자 목록에 "몇 분짜리"로 표시
-    console.log(`[render:${jobId}] 완료, R2 저장: ${outputKey}${shortsDone.length ? ` + 숏츠 ${shortsDone.length}개` : ''}`);
+    jlog(jobId, `[render:${jobId}] 완료, R2 저장: ${outputKey}${shortsDone.length ? ` + 숏츠 ${shortsDone.length}개` : ''}`);
   } catch (e) {
     renderJobs.set(jobId, { status: "failed", stage: "실패", percent: 0, error: e.message, startedAt: renderJobs.get(jobId)?.startedAt || Date.now(), completedAt: Date.now() });
-    console.log(`[render:${jobId}] 실패: ${e.message}`);
+    jlog(jobId, `[render:${jobId}] 실패: ${e.message}`);
   } finally {
     fs.rm(tmpDir, { recursive: true, force: true }, () => {});
   }
@@ -2473,8 +2486,11 @@ const server = http.createServer((req, res) => {
       res.end(JSON.stringify({ ok: false, error: "job not found" }));
       return;
     }
+    // [2026-09-06 16:35] 실시간 로그도 같이 실어서 보냄 — 관리자 페이지에서 SSH 없이도 진행 상황을
+    // 자세히 볼 수 있게 함(디버깅용 상세 로그 포함).
+    const logs = jobId ? (jobLogs.get(jobId) || []) : [];
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ ok: true, ...job }));
+    res.end(JSON.stringify({ ok: true, ...job, logs }));
     return;
   }
 
