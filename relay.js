@@ -1,7 +1,7 @@
 /**
- * 생성(마지막 작업): 2026-09-06 16:35 (KST) — 영상 생성 중 relay 로그를 관리자 페이지에서 실시간으로
- * 볼 수 있게 함 — jobId별 로그 버퍼(jobLogs) 추가, 렌더링 관련 console.log를 jlog()로 전환,
- * /render/status 응답에 logs 배열 포함
+ * 생성(마지막 작업): 2026-09-06 17:15 (KST) — NFC 정규화로도 안 잡히는 다른 패턴(멀쩡한 단어 끝에
+ * 네모 붙고 그 뒤로 끊김)이 계속돼서, U+FFFD(대체문자)·폭 없는 문자·방향 제어문자·BOM까지 같이
+ * 제거하는 sanitizeCaptionText로 통합 + 실제 어떤 코드포인트가 있었는지 항상 로그로 남김
  * relay - Oracle VM에서 상시 실행되는 중계 서버. 두 역할을 겸함:
  *   1) 키움 Real API 릴레이(주식 스크리너/자동매매용)
  *   2) videos.usb.kr(life.news) 영상 렌더링 — ffmpeg로 이미지 슬라이드쇼+내레이션 합성, 자막 굽기,
@@ -62,6 +62,29 @@ function jlog(jobId, msg) {
   arr.push(msg);
   if (arr.length > 80) arr.shift(); // 너무 오래 쌓이지 않게 최근 80줄만 유지
   jobLogs.set(jobId, arr);
+}
+// [2026-09-06 17:15] 자막이 폰트를 두 번 바꾸고 NFC 정규화를 해도 계속 "멀쩡한 단어 끝에 네모 하나
+// 붙고 그 다음부터 뚝 끊기는" 증상이 반복돼서, 분리된 자모 외에 다른 종류의 문제 문자(인코딩 깨짐으로
+// 생기는 대체문자 U+FFFD, 폭 없는 문자, 방향 제어문자 등)도 같이 제거하도록 확장. 그리고 정확히 어떤
+// 코드포인트가 들어있었는지 항상 로그로 남겨서 다음에도 또 다른 패턴이 나오면 바로 잡을 수 있게 함.
+function sanitizeCaptionText(text, jobId, label) {
+  const codePoints = Array.from(text).map((c) => c.codePointAt(0));
+  const suspicious = codePoints.filter((cp) =>
+    cp === 0xFFFD || // 대체문자(인코딩 깨짐의 전형적 흔적)
+    (cp >= 0x200B && cp <= 0x200F) || // 폭 없는 문자/방향 표시
+    (cp >= 0x202A && cp <= 0x202E) || // 방향 제어문자
+    cp === 0xFEFF || // BOM
+    (cp >= 0x0000 && cp <= 0x001F && cp !== 0x0A) // 제어문자(줄바꿈 제외)
+  );
+  if (suspicious.length) {
+    jlog(jobId, `[render:${jobId}] ${label} 의심스러운 코드포인트 발견: ${suspicious.map((cp) => 'U+' + cp.toString(16).toUpperCase()).join(', ')}`);
+  }
+  const cleaned = text
+    .normalize("NFC")
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "")
+    .replace(/[\uFFFD\u200B-\u200F\u202A-\u202E\uFEFF]/g, "");
+  if (cleaned !== text) jlog(jobId, `[render:${jobId}] ${label} 정규화/정리로 텍스트 변경됨`);
+  return cleaned;
 }
 // 오래된 완료/실패 job은 메모리에서 주기적으로 정리 (30분 지나면 제거)
 setInterval(() => {
@@ -805,12 +828,7 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, s
           // 실제로 계산된 시작/끝/텍스트를 남겨 진짜 원인을 확인함(문제 재현 후 지울 예정)
           jlog(jobId, `[render:${jobId}] img${imgIdx} beat${bi} segIndex=${beat.segIndex} [${start.toFixed(2)}~${end.toFixed(2)}] "${text.replace(/\n/g, "\\n")}"`);
           const capFile = path.join(tmpDir, `cap-${imgIdx}-${bi}.txt`);
-          // [2026-09-06 16:20] 진짜 원인 추정 — 자막이 폰트를 두 번 바꿔도 계속 깨지고(□) 그 지점에서
-          // 잘리는 걸 보니, 폰트 문제가 아니라 텍스트 자체에 "분리된 자모"(NFD) 형태가 섞여 들어가서
-          // ffmpeg가 그 글자를 못 찾고 걸려 넘어지는 것으로 추정됨. 항상 "합쳐진 완성형"(NFC)으로
-          // 정규화하고, 혹시 모를 제어문자(줄바꿈 제외)도 제거해서 안전하게 만듦.
-          const safeText = text.normalize("NFC").replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "");
-          if (safeText !== text) jlog(jobId, `[render:${jobId}] img${imgIdx} beat${bi} 정규화로 텍스트 변경됨(분리된 자모 또는 제어문자 있었음)`);
+          const safeText = sanitizeCaptionText(text, jobId, `img${imgIdx} beat${bi}`);
           fs.writeFileSync(capFile, safeText, "utf8");
           const st = CAPTION_POSITIONS[(beat.styleIndex || 0) % CAPTION_POSITIONS.length];
           chain += `,drawtext=fontfile=${resolvedFontPath}:textfile=${capFile}:fontsize=${st.size}:fontcolor=${captionColorFF}:` +
@@ -1113,7 +1131,7 @@ async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, s
               const be = Math.max(Math.min(rawBe, sSafeWindowEnd), sIncomingBlend);
               if (be - bs < 0.15) return;
               const capFile = path.join(tmpDir, `scap-${ri}-${g}-${bi}.txt`);
-              const safeText = text.normalize("NFC").replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "");
+              const safeText = sanitizeCaptionText(text, jobId, `short img${g} beat${bi}`);
               fs.writeFileSync(capFile, safeText, "utf8");
               chain += `,drawtext=fontfile=${resolvedFontPath}:textfile=${capFile}:fontsize=${shortsFontSize}:fontcolor=${captionColorFF}:` +
                 `borderw=8:bordercolor=black:box=0:line_spacing=16:x=${st.x}:y=${st.y}:` +

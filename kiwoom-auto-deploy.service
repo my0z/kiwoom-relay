@@ -2,7 +2,6 @@
 Description=Kiwoom Relay Auto Deploy Watcher
 After=network-online.target
 Wants=network-online.target
-
 [Service]
 Type=simple
 User=ubuntu
@@ -12,6 +11,5 @@ Restart=always
 RestartSec=10
 StandardOutput=journal
 StandardError=journal
-
 [Install]
 WantedBy=multi-user.target
