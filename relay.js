@@ -1,7 +1,6 @@
 /**
- * 생성(마지막 작업): 2026-09-06 22:15 (KST) — 자막 PNG 렌더링을 execFileSync(동기)에서 spawn 기반
- * 비동기로 전환 — 동기 방식이면 그리는 몇 초 동안 Node 이벤트 루프 전체가 멈춰서 /render/status
- * 폴링 응답도 못 나가고(진행 메시지가 뚝뚝 끊겨 보이던 원인) 키움 실시간 중계까지 같이 멈췄음
+ * 생성(마지막 작업): 2026-09-06 22:40 (KST) — 후보 폰트 8종 fonttools 실측 검사 결과 나눔명조·
+ * 나눔고딕코딩만 한글 100% 커버(나머지 6종은 20%대 탈락) — CAPTION_FONT_PATHS에 2종 추가
  * relay - Oracle VM에서 상시 실행되는 중계 서버. 두 역할을 겸함:
  *   1) 키움 Real API 릴레이(주식 스크리너/자동매매용)
  *   2) videos.usb.kr(life.news) 영상 렌더링 — ffmpeg로 이미지 슬라이드쇼+내레이션 합성, 자막 굽기,
@@ -590,6 +589,16 @@ const CAPTION_FONT_PATHS = {
   nanumbrush: resolveFontPath([
     "/usr/local/share/fonts/NanumBrushScript-Regular.ttf",
     "/usr/share/fonts/truetype/custom/NanumBrushScript-Regular.ttf",
+  ]),
+  // [2026-09-06 22:40] fonttools로 후보 폰트 8종 실측 검사 — 나눔명조/나눔고딕코딩만 100% 통과
+  // (나머지 6종은 전부 20%대라 탈락, worker.js CAPTION_FONT_CHOICES 참고)
+  nanummyeongjo: resolveFontPath([
+    "/usr/local/share/fonts/NanumMyeongjo-Regular.ttf",
+    "/usr/share/fonts/truetype/custom/NanumMyeongjo-Regular.ttf",
+  ]),
+  nanumgothiccoding: resolveFontPath([
+    "/usr/local/share/fonts/NanumGothicCoding-Regular.ttf",
+    "/usr/share/fonts/truetype/custom/NanumGothicCoding-Regular.ttf",
   ]),
 };
 // 요청받은 폰트 키가 이 VM에 실제로 설치돼있지 않으면(아직 다운로드 전 등) 있는 것 중 아무거나로 폴백 —
