@@ -1,8 +1,7 @@
 /**
- * 생성(마지막 작업): 2026-09-06 15:30 (KST) — 진단용 임시 조치: 자막 폰트를 전부 완성형 11,172자를
- * 담은 시스템 Noto 폰트로 강제 전환 — 지금 쓰던 귀여운/손글씨 폰트들의 불완전한 한글 커버리지가
- * "자막이 매번 다른 지점에서 잘리는" 현상의 원인인지 확인하기 위함(resolveVideoFontPath 임시 수정,
- * text_w 위치 계산 수정은 이미 반영했지만 그것만으론 해결 안 됐음)
+ * 생성(마지막 작업): 2026-09-06 16:05 (KST) — Noto CJK(.ttc 묶음 파일)로도 자막이 네모(□)로 깨지는
+ * 증상이 계속돼서, 한국어 전용 단일 폰트 파일(.otf)로 교체 — ffmpeg drawtext가 여러 언어 묶음
+ * 컬렉션 파일(.ttc)을 제대로 못 읽는 것으로 추정
  * relay - Oracle VM에서 상시 실행되는 중계 서버. 두 역할을 겸함:
  *   1) 키움 Real API 릴레이(주식 스크리너/자동매매용)
  *   2) videos.usb.kr(life.news) 영상 렌더링 — ffmpeg로 이미지 슬라이드쇼+내레이션 합성, 자막 굽기,
@@ -587,16 +586,12 @@ const FALLBACK_FONT_PATH =
   CAPTION_FONT_PATHS.gowun || CAPTION_FONT_PATHS.nanumpen || CAPTION_FONT_PATHS.gowunbatang || CAPTION_FONT_PATHS.songmyung ||
   CAPTION_FONT_PATHS.gaegu || CAPTION_FONT_PATHS.himelody ||
   "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc";
-// [2026-09-06 15:30] 진단용 임시 조치 — 지금 쓰는 귀여운/손글씨 폰트들(구글 폰트)이 완성형 한글을
-// 다 못 담고 있어서(보통 상용 2,350자 정도만), 빠진 글자를 만나면 ffmpeg가 그 지점에서 렌더링을
-// 멈춰버리는 것으로 추정됨(자막이 매번 다른 지점에서 잘리던 현상과 일치). 이게 진짜 원인인지 확인
-// 하기 위해 완성형 11,172자를 전부 담은 시스템 Noto 폰트로 강제 전환(FALLBACK_FONT_PATH는 gowun이
-// 설치돼 있으면 그걸 먼저 골라버려서 검증 의미가 없어 직접 지정) — 확인되면 폰트 목록을 전체
-// 커버리지가 확실한 것들로 교체 예정.
+// [2026-09-06 16:05] 진짜 원인 추가 발견 — Noto CJK로 바꿔도 여전히 문제(이번엔 글자가 네모로 안 보임,
+// 폰트에 그 글자가 없는 게 아니라 파일 자체를 못 읽는 증상)여서, .ttc(여러 언어가 묶인 컬렉션 파일)를
+// ffmpeg의 drawtext가 제대로 못 다루는 것으로 추정. 한국어 전용 단일 파일(.otf)을 새로 받아 직접 지정.
 const FULL_COVERAGE_FONT_PATH = resolveFontPath([
-  "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-  "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-  "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+  "/usr/local/share/fonts/NotoSansKR-Regular.otf",
+  "/usr/share/fonts/truetype/noto/NotoSansKR-Regular.otf",
 ]) || FALLBACK_FONT_PATH;
 function resolveVideoFontPath(fontKey) {
   return FULL_COVERAGE_FONT_PATH; // TODO: 원인 확인되면 (fontKey && CAPTION_FONT_PATHS[fontKey]) || FALLBACK_FONT_PATH 로 복원
