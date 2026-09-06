@@ -3,7 +3,7 @@
 # 이후로는 GitHub에 커밋만 하면 1분 안에 VM이 스스로 pull + 재시작함.
 set -e
 
-REPO_DIR="/home/ubuntu/kiwoom-relay"
+REPO_DIR="/home/ubuntu/relay"
 
 echo "== 0. 네트워크 성능 튜닝(BBR) =="
 # relay <-> 키움/Worker 간 TCP 처리량/지연 개선. 이미 적용돼 있으면 중복 추가 안 되게 grep으로 확인.
@@ -23,7 +23,7 @@ sudo chmod +x /usr/local/bin/kiwoom-auto-deploy.sh
 echo "== 2. ubuntu 계정이 비밀번호 없이 relay를 재시작할 수 있게 허용 =="
 # 워처가 백그라운드 서비스로 도는데 sudo 비밀번호를 물으면 멈춰버리므로,
 # 딱 이 서비스의 restart/is-active 명령에 한해서만 비밀번호를 면제함(전체 sudo 권한 아님).
-echo 'ubuntu ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart kiwoom-relay, /usr/bin/systemctl is-active kiwoom-relay' | sudo tee /etc/sudoers.d/kiwoom-auto-deploy > /dev/null
+echo 'ubuntu ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart relay, /usr/bin/systemctl is-active relay' | sudo tee /etc/sudoers.d/kiwoom-auto-deploy > /dev/null
 sudo chmod 440 /etc/sudoers.d/kiwoom-auto-deploy
 sudo visudo -c -f /etc/sudoers.d/kiwoom-auto-deploy
 

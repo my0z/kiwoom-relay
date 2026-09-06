@@ -9,8 +9,8 @@
 #   sudo chmod +x /usr/local/bin/kiwoom-auto-deploy.sh
 #   (systemd 서비스 등록은 kiwoom-auto-deploy.service 참고)
 
-REPO_DIR="/home/ubuntu/kiwoom-relay"
-SERVICE="kiwoom-relay"
+REPO_DIR="/home/ubuntu/relay"
+SERVICE="relay"
 INTERVAL=60   # 확인 주기(초)
 
 cd "$REPO_DIR" || { echo "저장소 경로를 찾을 수 없음: $REPO_DIR"; exit 1; }

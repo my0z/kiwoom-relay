@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=ubuntu
-WorkingDirectory=/home/ubuntu/kiwoom-relay
+WorkingDirectory=/home/ubuntu/relay
 ExecStart=/usr/local/bin/kiwoom-auto-deploy.sh
 Restart=always
 RestartSec=10
