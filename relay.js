@@ -1,7 +1,8 @@
 /**
- * 생성(마지막 작업): 2026-09-06 21:20 (KST) — 자막 PNG 렌더링 최적화: 문장 하나마다 파이썬 프로세스를
- * 새로 띄우던 것을, ffmpeg 호출 1번(본편/청크/숏츠 각각)당 파이썬 프로세스 1번으로 묶음 — 자막
- * 요청을 큐에 모았다가 JSON 매니페스트로 한 번에 넘기고, 폰트 로딩도 캐싱해서 재사용(render_caption.py)
+ * 생성(마지막 작업): 2026-09-06 22:00 (KST) — 진짜 원인 발견/수정: PIL 우회 적용 후에도 자막이
+ * 네모(□)로 깨지던 게 남아있었던 이유 — fonttools로 실측 검사해보니 songmyung/gaegu/cutefont/
+ * yeonsung/gugi/sunflower 6개 폰트가 완성형 한글 11,172자 중 2,350자(21%)만 담고 있었음(자주
+ * 쓰는 "울" 등도 없음). CAPTION_FONT_PATHS에서 6개 제거, 100% 커버리지인 9개만 남김
  * relay - Oracle VM에서 상시 실행되는 중계 서버. 두 역할을 겸함:
  *   1) 키움 Real API 릴레이(주식 스크리너/자동매매용)
  *   2) videos.usb.kr(life.news) 영상 렌더링 — ffmpeg로 이미지 슬라이드쇼+내레이션 합성, 자막 굽기,
@@ -551,8 +552,9 @@ function resolveFontPath(candidates) {
   }
   return candidates.find((p) => fs.existsSync(p)) || null;
 }
-// [2026-08-30 20:46] 두꺼운 폰트(도현/검은고딕) 제거 + 예쁜 폰트 4종 추가 — worker.js CAPTION_FONT_CHOICES와 key 일치.
-// 신규 폰트 TTF는 VM에 설치 필요(설치 안 돼 있으면 FALLBACK_FONT_PATH로 자동 폴백이라 렌더링은 안 죽음).
+// [2026-09-06 22:00] 진짜 원인 발견/수정 — fonttools로 실측 검사한 결과 songmyung/gaegu/cutefont/
+// yeonsung/gugi/sunflower 6개가 완성형 한글 11,172자 중 2,350자(21%)만 담고 있었음(자주 쓰는
+// "울" 같은 흔한 글자도 빠져있어서 자막이 네모로 깨지던 진짜 원인). 커버리지 100%인 폰트만 남김.
 const CAPTION_FONT_PATHS = {
   gowun: resolveFontPath([
     "/usr/local/share/fonts/GowunDodum-Regular.ttf",
@@ -566,19 +568,10 @@ const CAPTION_FONT_PATHS = {
     "/usr/local/share/fonts/GowunBatang-Regular.ttf",
     "/usr/share/fonts/truetype/custom/GowunBatang-Regular.ttf",
   ]),
-  songmyung: resolveFontPath([
-    "/usr/local/share/fonts/SongMyung-Regular.ttf",
-    "/usr/share/fonts/truetype/custom/SongMyung-Regular.ttf",
-  ]),
-  gaegu: resolveFontPath([
-    "/usr/local/share/fonts/Gaegu-Regular.ttf",
-    "/usr/share/fonts/truetype/custom/Gaegu-Regular.ttf",
-  ]),
   himelody: resolveFontPath([
     "/usr/local/share/fonts/HiMelody-Regular.ttf",
     "/usr/share/fonts/truetype/custom/HiMelody-Regular.ttf",
   ]),
-  // [2026-08-30 22:02] 아기자기한 폰트 4종 추가(사용자 요청) — worker.js CAPTION_FONT_CHOICES와 키 일치, TTF는 VM 설치 필요
   poorstory: resolveFontPath([
     "/usr/local/share/fonts/PoorStory-Regular.ttf",
     "/usr/share/fonts/truetype/custom/PoorStory-Regular.ttf",
@@ -591,38 +584,21 @@ const CAPTION_FONT_PATHS = {
     "/usr/local/share/fonts/SingleDay-Regular.ttf",
     "/usr/share/fonts/truetype/custom/SingleDay-Regular.ttf",
   ]),
-  cutefont: resolveFontPath([
-    "/usr/local/share/fonts/CuteFont-Regular.ttf",
-    "/usr/share/fonts/truetype/custom/CuteFont-Regular.ttf",
-  ]),
-  // [2026-08-30 23:31] 예쁜 폰트 5종 추가(사용자 요청, 두꺼운 폰트 제외) — worker.js CAPTION_FONT_CHOICES와 키 일치, TTF는 VM 설치 필요
   stylish: resolveFontPath([
     "/usr/local/share/fonts/Stylish-Regular.ttf",
     "/usr/share/fonts/truetype/custom/Stylish-Regular.ttf",
-  ]),
-  yeonsung: resolveFontPath([
-    "/usr/local/share/fonts/YeonSung-Regular.ttf",
-    "/usr/share/fonts/truetype/custom/YeonSung-Regular.ttf",
-  ]),
-  gugi: resolveFontPath([
-    "/usr/local/share/fonts/Gugi-Regular.ttf",
-    "/usr/share/fonts/truetype/custom/Gugi-Regular.ttf",
   ]),
   nanumbrush: resolveFontPath([
     "/usr/local/share/fonts/NanumBrushScript-Regular.ttf",
     "/usr/share/fonts/truetype/custom/NanumBrushScript-Regular.ttf",
   ]),
-  sunflower: resolveFontPath([
-    "/usr/local/share/fonts/Sunflower-Light.ttf", // Sunflower는 Regular 없이 Light/Medium/Bold — 얇은 Light 사용
-    "/usr/share/fonts/truetype/custom/Sunflower-Light.ttf",
-  ]),
 };
 // 요청받은 폰트 키가 이 VM에 실제로 설치돼있지 않으면(아직 다운로드 전 등) 있는 것 중 아무거나로 폴백 —
 // 폰트 없다고 자막 자체를 통째로 스킵하던 예전 방식보다 훨씬 덜 아쉬움.
 const FALLBACK_FONT_PATH =
-  CAPTION_FONT_PATHS.gowun || CAPTION_FONT_PATHS.nanumpen || CAPTION_FONT_PATHS.gowunbatang || CAPTION_FONT_PATHS.songmyung ||
-  CAPTION_FONT_PATHS.gaegu || CAPTION_FONT_PATHS.himelody ||
-  "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc";
+  CAPTION_FONT_PATHS.gowun || CAPTION_FONT_PATHS.nanumpen || CAPTION_FONT_PATHS.gowunbatang ||
+  CAPTION_FONT_PATHS.himelody || CAPTION_FONT_PATHS.poorstory ||
+  "/usr/local/share/fonts/NotoSansKR-Regular.otf";
 // [2026-09-06 16:05~21:00] Noto CJK(.ttc)로 바꿔도 문제가 계속돼서 원인을 폰트로 의심했었지만,
 // 최종적으로 ffmpeg 자체의 한글 렌더링 버그로 확정됨(파이썬/PIL로 우회함 — 아래 queueCaptionPng
 // 참고). 이제 PIL이 그리므로 폰트 자체의 문제가 아니었던 게 확인돼서, 원래 쓰던 다양한 폰트
