@@ -9,7 +9,7 @@
 #   sudo chmod +x /usr/local/bin/kiwoom-auto-deploy.sh
 #   (systemd 서비스 등록은 kiwoom-auto-deploy.service 참고)
 
-REPO_DIR="/home/ubuntu/kiwoom-relay"
+REPO_DIR="/home/ubuntu/relay"
 SERVICE="kiwoom-relay"
 INTERVAL=60   # 확인 주기(초)
 
