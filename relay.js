@@ -1,7 +1,8 @@
 /**
- * 생성(마지막 작업): 2026-09-06 12:10 (KST) — 이미지 하나가 404 등으로 다운로드 실패하면 영상 전체가
- * 실패 처리되던 문제 수정 — 실패한 자리는 검정 화면으로 대체하고 나머지 이미지/자막 타이밍은
- * 그대로 유지한 채 렌더링 계속 진행
+ * 생성(마지막 작업): 2026-09-06 12:20 (KST) — 진짜 원인 발견/수정: genJob 동시실행 방지 락의 좁은
+ * 경합 창 때문에 아주 드물게 segIndex가 segCount보다 1~2 커지는 경우가 있었음 — 예전엔 이럴 때
+ * 세그먼트 실측 전체를 포기했는데, 이제 살짝(1~2) 벗어난 것만 마지막 세그먼트로 보정해서 계속
+ * 실측 모드를 쓰게 함(크게 벗어나면 여전히 폴백)
  * relay - Oracle VM에서 상시 실행되는 중계 서버. 두 역할을 겸함:
  *   1) 키움 Real API 릴레이(주식 스크리너/자동매매용)
  *   2) videos.usb.kr(life.news) 영상 렌더링 — ffmpeg로 이미지 슬라이드쇼+내레이션 합성, 자막 굽기,
@@ -458,12 +459,27 @@ function computeSegmentBeatTimeline(captionBeatsPerImage, segStarts, audioDurati
       flat.push({ imgIndex, beatIndex, weight: Math.max(Number(beat.weight) || 0, 0.0001), segIndex: beat.segIndex });
     });
   });
-  // 모든 비트에 유효한 세그먼트 번호가 있어야 함(옛 Worker가 보낸 요청엔 없음 → 폴백)
-  const badSeg = flat.find((b) => !Number.isInteger(b.segIndex) || b.segIndex < 0 || b.segIndex >= segCount);
-  if (badSeg) {
-    console.log(`[computeSegmentBeatTimeline] 비트에 segIndex 이상(${badSeg.segIndex}, segCount=${segCount}) — 옛 워커 응답이거나 범위 밖`);
-    return null;
+  // [2026-09-06 12:20] 진짜 원인 발견 — genJob 동시실행 방지 락에 아주 좁게(수십ms) 남아있는 경합
+  // 창 때문에 아주 드물게 음성 세그먼트 개수와 문장 개수가 하나 어긋나는 경우가 있음(segIndex가
+  // segCount보다 1 커짐). 이 정도 미세한 범위 초과는 전체를 포기하는 대신 마지막 세그먼트로 보정해서
+  // 계속 세그먼트 실측 모드를 쓰게 함 — 그 비트 하나만 타이밍이 살짝 부정확해질 뿐, 나머지 전체는
+  // 정확한 실측을 유지함. 형식 자체가 잘못된 값(음수, 정수 아님, 훨씬 크게 벗어남)은 여전히 폴백.
+  let clampedCount = 0;
+  for (const b of flat) {
+    if (!Number.isInteger(b.segIndex) || b.segIndex < 0) {
+      console.log(`[computeSegmentBeatTimeline] 비트에 segIndex 형식 이상(${b.segIndex}) — 옛 워커 응답이거나 심각한 오류, 폴백`);
+      return null;
+    }
+    if (b.segIndex >= segCount) {
+      if (b.segIndex - segCount > 2) { // 살짝(1~2)이 아니라 크게 벗어나면 다른 문제일 수 있어 폴백
+        console.log(`[computeSegmentBeatTimeline] 비트 segIndex(${b.segIndex})가 segCount(${segCount})보다 많이 벗어남 — 폴백`);
+        return null;
+      }
+      b.segIndex = segCount - 1;
+      clampedCount++;
+    }
   }
+  if (clampedCount) console.log(`[computeSegmentBeatTimeline] segIndex 범위 초과 비트 ${clampedCount}개를 마지막 세그먼트로 보정(경합으로 인한 미세 불일치로 추정)`);
   // 세그먼트별 비트 묶음 — 비어있는 세그먼트가 있으면 타임라인에 구멍이 생기므로 폴백(정상 흐름에선 없음)
   const bySeg = Array.from({length: segCount}, () => []);
   for (const b of flat) bySeg[b.segIndex].push(b);
