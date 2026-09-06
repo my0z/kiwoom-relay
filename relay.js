@@ -1,6 +1,6 @@
 /**
- * 생성(마지막 작업): 2026-09-06 22:40 (KST) — 후보 폰트 8종 fonttools 실측 검사 결과 나눔명조·
- * 나눔고딕코딩만 한글 100% 커버(나머지 6종은 20%대 탈락) — CAPTION_FONT_PATHS에 2종 추가
+ * 생성(마지막 작업): 2026-09-06 23:00 (KST) — 2차 후보 폰트 3종(Gothic A1, IBM Plex Sans KR, Nanum
+ * Gothic) fonttools 검사 전부 100% 통과 — CAPTION_FONT_PATHS에 추가(총 11개 폰트, 전부 한글 완전 지원)
  * relay - Oracle VM에서 상시 실행되는 중계 서버. 두 역할을 겸함:
  *   1) 키움 Real API 릴레이(주식 스크리너/자동매매용)
  *   2) videos.usb.kr(life.news) 영상 렌더링 — ffmpeg로 이미지 슬라이드쇼+내레이션 합성, 자막 굽기,
@@ -599,6 +599,19 @@ const CAPTION_FONT_PATHS = {
   nanumgothiccoding: resolveFontPath([
     "/usr/local/share/fonts/NanumGothicCoding-Regular.ttf",
     "/usr/share/fonts/truetype/custom/NanumGothicCoding-Regular.ttf",
+  ]),
+  // [2026-09-06 23:00] 2차 후보 검사 — GothicA1/IBMPlexSansKR/NanumGothic 3종 모두 100% 통과
+  gothica1: resolveFontPath([
+    "/usr/local/share/fonts/GothicA1-Regular.ttf",
+    "/usr/share/fonts/truetype/custom/GothicA1-Regular.ttf",
+  ]),
+  ibmplexsanskr: resolveFontPath([
+    "/usr/local/share/fonts/IBMPlexSansKR-Regular.ttf",
+    "/usr/share/fonts/truetype/custom/IBMPlexSansKR-Regular.ttf",
+  ]),
+  nanumgothic: resolveFontPath([
+    "/usr/local/share/fonts/NanumGothic-Regular.ttf",
+    "/usr/share/fonts/truetype/custom/NanumGothic-Regular.ttf",
   ]),
 };
 // 요청받은 폰트 키가 이 VM에 실제로 설치돼있지 않으면(아직 다운로드 전 등) 있는 것 중 아무거나로 폴백 —
