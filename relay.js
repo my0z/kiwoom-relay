@@ -1023,6 +1023,14 @@ function parseKiwoomChartOHLCRelay(json) {
 async function refreshMiniCandlesForWatchlist() {
   if (!ADMIN_KEY) return;
   if (!isMarketHoursKST()) return; // 장시간 외엔 갱신 불필요(어차피 안 바뀜)
+  // 09:01(장 시작) 직후 3분은 건너뜀 - 이 함수가 그날 첫 실행 때 관심종목 최대 10개를 순차 조회
+  // 하느라 최대 55초가 걸리는데(2026-09-08 fix로 55초에 걸쳐 분산했지만 여전히 상당한 시간), 이
+  // 시간대가 Cloudflare->relay 헬스체크 실패(522, 09:02~09:03 KST에 사흘 연속 반복 확인됨)와
+  // 겹치는 것으로 추정됨. 장 시작 직후 relay 응답성을 우선 확보하기 위해 이 무거운 작업만 잠깐
+  // 미룸 - 차트가 3분 늦게 채워지는 정도라 실질적 손해는 거의 없음.
+  const kstNow = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Seoul" }));
+  const kstMinutes = kstNow.getHours() * 60 + kstNow.getMinutes();
+  if (kstMinutes >= 9 * 60 + 1 && kstMinutes < 9 * 60 + 4) return;
   try {
     const entries = await getWatchlistEntriesCached();
     if (!entries.length) return;
