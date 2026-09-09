@@ -1,1276 +1,12 @@
-/**
- * 생성(마지막 작업): 2026-09-06 23:00 (KST) — 2차 후보 폰트 3종(Gothic A1, IBM Plex Sans KR, Nanum
- * Gothic) fonttools 검사 전부 100% 통과 — CAPTION_FONT_PATHS에 추가(총 11개 폰트, 전부 한글 완전 지원)
- * relay - Oracle VM에서 상시 실행되는 중계 서버. 두 역할을 겸함:
- *   1) 키움 Real API 릴레이(주식 스크리너/자동매매용)
- *   2) videos.usb.kr(life.news) 영상 렌더링 — ffmpeg로 이미지 슬라이드쇼+내레이션 합성, 자막 굽기,
- *      xfade 전환, 숏츠(9:16) 컷, R2 업로드까지 처리. Worker가 /render로 작업을 맡기고 /render/status로 폴링.
- * 포트 8787 하나로 두 역할 다 처리(같은 Node 프로세스).
- */
 const http = require("http");
 const https = require("https");
 const WebSocket = require("ws");
 const fs = require("fs");
 const path = require("path");
-const os = require("os");
-const crypto = require("crypto");
-const { spawn } = require("child_process");
-const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
 
 const PORT = process.env.PORT || 8787;
 const RELAY_SECRET = process.env.RELAY_SECRET;
 const KIWOOM_REAL_HOST = "api.kiwoom.com";
-
-// ---------- 영상 렌더링 (life.news용, ffmpeg 무료 대체) — 작업: 2026-08-30 20:46 ----------
-// Shotstack/Rendobar 같은 외부 유료 렌더링 서비스 대신, 이미 상시 가동 중인 이 VM에서
-// ffmpeg로 이미지+음성을 mp4로 합성 -> R2에 직접 업로드. R2 버킷은 Worker와 동일한 걸 써서
-// Worker는 그냥 자기 R2 바인딩으로 읽기만 하면 됨(중계 다운로드 불필요).
-// 렌더링 큐: 한 번에 하나씩만 처리(VM 메모리가 빠듯해서 동시 여러 개 돌리면 다 같이 느려짐/멈춤).
-// 자막: 이미지별 "비트"(줄 단위) 배열을 drawtext로 시간대별로 그림, 사진 전환은 xfade 크로스페이드
-// (전환마다 밀리지 않도록 이미지별로 그때그때 보정), 컬러그레이딩(eq)·업스케일(lanczos)도 여기서 적용.
-// 음성 있으면 loudnorm으로 볼륨 정규화, 없으면 사인파 3개로 만든 자체 배경음악(저작권 문제 없음)을 대신 깖.
-const R2_ACCOUNT_ID = process.env.R2_ACCOUNT_ID || "709dcc6af36c8ee7b6d3d99e7a9fe422";
-
-// ffmpeg/ffprobe는 항상 낮은 CPU 우선순위(nice 15)로 실행 — 같은 VM에서 도는 키움 트레이딩 릴레이가
-// 장중에도 항상 CPU를 먼저 가져가게 함. 렌더링은 몇 초~몇 분 느려져도 되지만 시세 응답은 밀리면 안 됨.
-function spawnMedia(cmd, args) {
-  return spawn("nice", ["-n", "15", cmd, ...args]);
-}
-const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID;
-const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY;
-const R2_BUCKET = process.env.R2_BUCKET || "usbkr-videos";
-const RENDER_IMAGE_DURATION_SEC = 4;
-
-const r2Client = (R2_ACCESS_KEY_ID && R2_SECRET_ACCESS_KEY)
-  ? new S3Client({
-      region: "auto",
-      endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
-      credentials: { accessKeyId: R2_ACCESS_KEY_ID, secretAccessKey: R2_SECRET_ACCESS_KEY },
-    })
-  : null;
-
-// jobId -> { status: "processing"|"done"|"failed", error, r2Key, startedAt }
-const renderJobs = new Map();
-// [2026-09-06 16:35] 영상 생성 중 실시간으로 뭘 하고 있는지 관리자 페이지에서 볼 수 있게, jobId별로
-// 최근 로그 줄을 메모리에 잠깐 보관해둠(/render/status 응답에 같이 실어서 보냄). SSH로 journalctl
-// 안 봐도 되게 하는 목적 — console.log는 그대로 하고 배열에도 같이 쌓기만 함.
-const jobLogs = new Map();
-function jlog(jobId, msg) {
-  console.log(msg);
-  const arr = jobLogs.get(jobId) || [];
-  arr.push(msg);
-  if (arr.length > 80) arr.shift(); // 너무 오래 쌓이지 않게 최근 80줄만 유지
-  jobLogs.set(jobId, arr);
-}
-// [2026-09-06 17:15] 자막이 폰트를 두 번 바꾸고 NFC 정규화를 해도 계속 "멀쩡한 단어 끝에 네모 하나
-// 붙고 그 다음부터 뚝 끊기는" 증상이 반복돼서, 분리된 자모 외에 다른 종류의 문제 문자(인코딩 깨짐으로
-// 생기는 대체문자 U+FFFD, 폭 없는 문자, 방향 제어문자 등)도 같이 제거하도록 확장. 그리고 정확히 어떤
-// 코드포인트가 들어있었는지 항상 로그로 남겨서 다음에도 또 다른 패턴이 나오면 바로 잡을 수 있게 함.
-function sanitizeCaptionText(text, jobId, label) {
-  const codePoints = Array.from(text).map((c) => c.codePointAt(0));
-  const suspicious = codePoints.filter((cp) =>
-    cp === 0xFFFD || // 대체문자(인코딩 깨짐의 전형적 흔적)
-    (cp >= 0x200B && cp <= 0x200F) || // 폭 없는 문자/방향 표시
-    (cp >= 0x202A && cp <= 0x202E) || // 방향 제어문자
-    cp === 0xFEFF || // BOM
-    (cp >= 0x0000 && cp <= 0x001F && cp !== 0x0A) // 제어문자(줄바꿈 제외)
-  );
-  if (suspicious.length) {
-    jlog(jobId, `[render:${jobId}] ${label} 의심스러운 코드포인트 발견: ${suspicious.map((cp) => 'U+' + cp.toString(16).toUpperCase()).join(', ')}`);
-  }
-  const cleaned = text
-    .normalize("NFC")
-    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "")
-    .replace(/[\uFFFD\u200B-\u200F\u202A-\u202E\uFEFF]/g, "");
-  if (cleaned !== text) jlog(jobId, `[render:${jobId}] ${label} 정규화/정리로 텍스트 변경됨`);
-  return cleaned;
-}
-// 오래된 완료/실패 job은 메모리에서 주기적으로 정리 (30분 지나면 제거)
-setInterval(() => {
-  const cutoff = Date.now() - 30 * 60 * 1000;
-  for (const [id, job] of renderJobs) {
-    if (job.status !== "processing" && (job.completedAt || job.startedAt) < cutoff) {
-      renderJobs.delete(id);
-      jobLogs.delete(id); // 로그 버퍼도 같이 정리(메모리 누수 방지)
-    }
-  }
-}, 5 * 60 * 1000);
-
-// VM 메모리가 빠듯해서(kiwoomapi 실시간 릴레이랑 같이 씀) ffmpeg 렌더링을 동시에 여러 개 돌리면
-// 서로 자원을 다투다가 다 같이 느려지거나 멈춘 것처럼 보임 — 한 번에 하나씩만 순서대로 처리하는 큐.
-let renderQueue = Promise.resolve();
-function enqueueRender(task) {
-  renderQueue = renderQueue.then(task, task); // 앞 작업이 실패해도 큐는 계속 이어짐
-  return renderQueue;
-}
-
-function downloadToFile(url, destPath) {
-  return new Promise((resolve, reject) => {
-    const file = fs.createWriteStream(destPath);
-    https.get(url, (res) => {
-      if (res.statusCode !== 200) {
-        file.close();
-        fs.unlink(destPath, () => {});
-        reject(new Error(`다운로드 실패 HTTP ${res.statusCode}: ${url}`));
-        return;
-      }
-      res.pipe(file);
-      file.on("finish", () => file.close(resolve));
-    }).on("error", (err) => {
-      file.close();
-      fs.unlink(destPath, () => {});
-      reject(err);
-    });
-  });
-}
-
-// onProgress(percent): ffmpeg 진행 상황을 stderr의 "time=" 라인에서 파싱해서 콜백으로 알림
-function runFfmpeg(args, totalDurationSec, onProgress) {
-  return new Promise((resolve, reject) => {
-    const proc = spawnMedia("ffmpeg", args);
-    let stderr = "";
-    proc.stderr.on("data", (d) => {
-      const chunk = d.toString();
-      stderr += chunk;
-      if (onProgress && totalDurationSec > 0) {
-        const m = chunk.match(/time=(\d+):(\d+):(\d+\.\d+)/);
-        if (m) {
-          const elapsed = parseInt(m[1], 10) * 3600 + parseInt(m[2], 10) * 60 + parseFloat(m[3]);
-          const percent = Math.min(99, Math.round((elapsed / totalDurationSec) * 100));
-          onProgress(percent);
-        }
-      }
-    });
-    proc.on("error", (err) => reject(new Error(`ffmpeg 실행 실패: ${err.message}`)));
-    proc.on("close", (code, signal) => {
-      if (code === 0) resolve();
-      else reject(new Error(describeFfmpegFailure(code, signal, stderr)));
-    });
-  });
-}
-
-// 오디오 파일의 실제 길이(초)를 ffprobe로 확인 — 이걸 알아야 이미지별 노출시간을 자막 비율대로 정확히 나눌 수 있음
-function getAudioDurationSec(audioPath) {
-  return new Promise((resolve, reject) => {
-    const proc = spawnMedia("ffprobe", ["-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0", audioPath]);
-    let stdout = "";
-    let stderr = "";
-    proc.stdout.on("data", (d) => { stdout += d.toString(); });
-    proc.stderr.on("data", (d) => { stderr += d.toString(); });
-    proc.on("error", (err) => reject(new Error(`ffprobe 실행 실패: ${err.message}`)));
-    proc.on("close", (code) => {
-      const sec = parseFloat(stdout.trim());
-      if (code === 0 && Number.isFinite(sec) && sec > 0) resolve(sec);
-      else reject(new Error(`ffprobe 길이 확인 실패: ${stderr.slice(-300)}`));
-    });
-  });
-}
-
-// 완성된 output.mp4에 실제로 재생 가능한 오디오 트랙이 들어갔는지 검증 — 나레이션이 있었는데(audioPath)
-// 다운로드가 미묘하게 깨졌거나 필터 그래프 문제로 최종 파일엔 오디오가 빠지는 경우를 잡아내기 위함.
-// 그냥 오디오 스트림 존재 여부만 보지 않고, duration이 0.5초 넘게 실제로 있는지까지 확인(빈 트랙 방지).
-function verifyOutputHasAudio(filePath) {
-  return new Promise((resolve) => {
-    const proc = spawnMedia("ffprobe", [
-      "-v", "error",
-      "-select_streams", "a",
-      "-show_entries", "stream=codec_type,duration",
-      "-of", "csv=p=0",
-      filePath,
-    ]);
-    let stdout = "";
-    proc.stdout.on("data", (d) => { stdout += d.toString(); });
-    proc.on("error", () => resolve(false));
-    proc.on("close", () => {
-      const line = stdout.trim().split("\n")[0] || "";
-      const [codecType, durationRaw] = line.split(",");
-      const duration = parseFloat(durationRaw);
-      resolve(codecType === "audio" && Number.isFinite(duration) && duration > 0.5);
-    });
-  });
-}
-
-// 이미지별 노출시간(초) 배열 계산 — weights(자막 글자수 비율)가 있으면 오디오 실길이에 비례 배분,
-// 없거나 개수가 안 맞으면 기존처럼 고정 길이(RENDER_IMAGE_DURATION_SEC)로 폴백.
-// precomputedDuration: 호출부에서 이미 ffprobe로 재둔 오디오 길이가 있으면 넘겨서 중복 ffprobe 호출을 피함.
-async function computeImageDurations(imageCount, audioPath, weights, precomputedDuration) {
-  // 음성이 없어도 자막 분량(weights)에 비례해서 노출시간을 나눠줌 — 안 그러면 이미지당 고정 시간 안에
-  // 문장이 몇 개든 욱여넣게 돼서 자막이 순식간에 지나가버림.
-  const hasWeights = Array.isArray(weights) && weights.length === imageCount;
-  const sumWeights = hasWeights ? (weights.reduce((a, b) => a + b, 0) || 1) : 1;
-  const MIN_SEC = 1.5; // 너무 짧은 컷은 어색하니 최소치는 보장
-
-  if (!audioPath) {
-    const totalSec = imageCount * RENDER_IMAGE_DURATION_SEC; // 음성 없을 때 전체 길이 기준(이미지당 평균 4초어치)
-    if (!hasWeights) return Array(imageCount).fill(RENDER_IMAGE_DURATION_SEC);
-    return weights.map((w) => Math.max(MIN_SEC, (w / sumWeights) * totalSec));
-  }
-
-  let audioDuration = Number.isFinite(precomputedDuration) && precomputedDuration > 0 ? precomputedDuration : null;
-  if (!audioDuration) {
-    try {
-      audioDuration = await getAudioDurationSec(audioPath);
-    } catch (e) {
-      console.log(`오디오 길이 확인 실패, 고정 길이로 폴백: ${e.message}`);
-      const totalSec = imageCount * RENDER_IMAGE_DURATION_SEC;
-      if (!hasWeights) return Array(imageCount).fill(RENDER_IMAGE_DURATION_SEC);
-      return weights.map((w) => Math.max(MIN_SEC, (w / sumWeights) * totalSec));
-    }
-  }
-  if (!hasWeights) {
-    return Array(imageCount).fill(audioDuration / imageCount);
-  }
-  return weights.map((w) => Math.max(MIN_SEC, (w / sumWeights) * audioDuration));
-}
-
-// 문장 사이 무음(쉬는) 구간을 실제 음성 파일에서 찾음 — 글자수 비율 추정 대신 진짜 쉬는 지점을 알아내서
-// 자막 타이밍을 정확히 맞추기 위함. ffmpeg의 silencedetect 필터가 stderr로
-// "silence_start: 12.34" / "silence_end: 12.87 | silence_duration: 0.53" 형식으로 찍어줌.
-function detectSilenceGaps(audioPath, noiseDb = -30, minDurSec = 0.12) {
-  return new Promise((resolve) => {
-    const proc = spawnMedia("ffmpeg", [
-      "-i", audioPath,
-      "-af", `silencedetect=noise=${noiseDb}dB:d=${minDurSec}`,
-      "-f", "null", "-",
-    ]);
-    let stderr = "";
-    proc.stderr.on("data", (d) => { stderr += d.toString(); });
-    proc.on("error", () => resolve([]));
-    proc.on("close", () => {
-      const starts = [...stderr.matchAll(/silence_start:\s*(-?[\d.]+)/g)].map((m) => parseFloat(m[1]));
-      const ends = [...stderr.matchAll(/silence_end:\s*(-?[\d.]+)/g)].map((m) => parseFloat(m[1]));
-      const gaps = [];
-      for (let i = 0; i < Math.min(starts.length, ends.length); i++) {
-        if (Number.isFinite(starts[i]) && Number.isFinite(ends[i]) && ends[i] > starts[i]) {
-          gaps.push({ start: starts[i], end: ends[i] });
-        }
-      }
-      resolve(gaps);
-    });
-  });
-}
-
-// captionBeats(이미지별 자막 비트 배열)를 한 줄로 펼쳐서, 오디오 전체를 하나의 타임라인으로 보고 각 비트의
-// 실제 시작/끝 시각(초, 오디오 처음부터 기준)을 계산함.
-//
-// 동작 원리(경량 강제정렬): ① 글자수 비율로 각 문장 경계의 "예상 위치"를 먼저 계산 ② 실제 음성에서 찾은
-// 무음 구간들 중 예상 위치 근처(허용오차 안)에 있는 것을 그 경계의 실제 시각으로 앵커링 ③ 앵커가 잡힐
-// 때마다 이후 예상 위치들을 실제 진행 속도에 맞춰 다시 스케일링(추정 오차가 누적되기 전에 계속 교정됨)
-// ④ 무음이 안 잡힌 경계는 이웃 앵커 사이에서 비율 보간.
-//
-// 예전 구현은 "감지된 무음 개수 == 문장 경계 개수"가 정확히 일치할 때만 적용하고 아니면 통째로 포기했는데,
-// 실제 TTS는 쉼표에서도 쉬고(가짜 무음) 문장 사이를 붙여 읽기도 해서(무음 누락) 개수가 정확히 맞는 경우가
-// 드묾 — 사실상 거의 항상 폴백돼서 개선이 적용되지 않았음. 지금 방식은 개수가 안 맞아도 맞는 무음만 골라
-// 쓰므로 대부분의 영상에서 실제 앵커링이 동작함. 앵커를 하나도 못 찾은 경우에만 null(기존 추정 방식 폴백).
-async function computeRealBeatTimeline(audioPath, audioDuration, captionBeatsPerImage, imageWeights) {
-  if (!audioPath || !Number.isFinite(audioDuration) || audioDuration <= 0) return null;
-  if (!Array.isArray(captionBeatsPerImage) || !captionBeatsPerImage.length) return null;
-  // 이미지마다 비트가 최소 1개는 있어야 이미지별 노출시간을 실제 타임라인에서 얻을 수 있음 — 하나라도 비면 폴백.
-  if (captionBeatsPerImage.some((beats) => !Array.isArray(beats) || !beats.length)) return null;
-
-  // 이미지별 오디오 배분 비율 — Worker가 보낸 weights(글자수 기반, 합=1)를 쓰고, 없으면 균등 분배로 대체.
-  const n = captionBeatsPerImage.length;
-  const hasW = Array.isArray(imageWeights) && imageWeights.length === n && imageWeights.every((w) => Number.isFinite(w) && w > 0);
-  const rawW = hasW ? imageWeights : Array(n).fill(1 / n);
-  const sumW = rawW.reduce((a, b) => a + b, 0) || 1;
-  const wNorm = rawW.map((w) => w / sumW);
-
-  // 재생 순서 그대로 펼치면서, 글자수 비율 기반 "예상" 시작/끝 시각을 함께 계산.
-  // isSentenceEnd 플래그가 없는 옛 버전 Worker가 보낸 비트여도 동작하도록, 줄 텍스트가 문장부호로
-  // 끝나는지로 문장 경계를 추론하는 폴백을 둠(문장 마지막 줄에는 마침표/물음표 등이 남아있음).
-  const flat = []; // { imgIndex, beatIndex, weight, isSentenceEnd, estStart, estEnd }
-  let cursor = 0;
-  captionBeatsPerImage.forEach((beats, imgIndex) => {
-    const imgDur = wNorm[imgIndex] * audioDuration;
-    const beatSum = beats.reduce((a, b) => a + (Math.max(Number(b.weight) || 0, 0.0001)), 0) || 1;
-    beats.forEach((beat, beatIndex) => {
-      const w = Math.max(Number(beat.weight) || 0, 0.0001);
-      const dur = (w / beatSum) * imgDur;
-      const text = (beat.text || "").trim();
-      const isEnd = beat.isSentenceEnd !== undefined ? !!beat.isSentenceEnd : /[.!?。！？…]["'」』)]?$/.test(text);
-      flat.push({ imgIndex, beatIndex, weight: w, isSentenceEnd: isEnd, estStart: cursor, estEnd: cursor + dur });
-      cursor += dur;
-    });
-  });
-  if (flat.length) flat[flat.length - 1].isSentenceEnd = true; // 마지막 비트는 무조건 마지막 문장의 끝
-
-  // 문장 경계 목록: "문장이 끝나는 비트" 뒤가 경계(마지막 문장 뒤는 파일 끝이라 경계 아님)
-  const boundaries = []; // { flatIdx, est } — est: 경계의 예상 시각(= 그 문장 마지막 비트의 예상 끝)
-  for (let i = 0; i < flat.length - 1; i++) {
-    if (flat[i].isSentenceEnd) boundaries.push({ flatIdx: i, est: flat[i].estEnd, real: null });
-  }
-  if (!boundaries.length) return null; // 문장이 1개뿐이면 추정이랑 차이가 없음 — 그냥 폴백
-
-  let gaps;
-  try {
-    gaps = await detectSilenceGaps(audioPath);
-  } catch (e) {
-    return null;
-  }
-  // 파일 시작/끝 여백의 무음은 문장 사이 쉼이 아니므로 제외. 너무 짧은 무음(쉼표 수준)은 후보에서 빼되,
-  // 문장 사이 쉼이 원래 짧은 TTS도 있어서 0.15초까지는 후보로 인정(스코어에서 긴 쉼을 우대해 구분).
-  const EDGE_MARGIN = 0.25;
-  const candidates = gaps
-    .map((g) => ({ start: g.start, end: g.end, dur: g.end - g.start }))
-    .filter((g) => g.dur >= 0.15 && g.start > EDGE_MARGIN && g.end < audioDuration - EDGE_MARGIN)
-    .sort((a, b) => a.start - b.start);
-  if (!candidates.length) return null;
-
-  // 예상 위치 근처의 무음을 순서대로(단조증가) 앵커링. 앵커가 잡히면 남은 구간의 예상 위치를
-  // "실제 남은 시간 / 예상 남은 시간" 비율로 재스케일 — TTS가 추정보다 빨리/느리게 읽어도 계속 따라감.
-  let lastAnchorTime = 0;
-  let lastAnchorEst = 0;
-  let gapPtr = 0;
-  let anchoredCount = 0;
-  for (const b of boundaries) {
-    const remainReal = audioDuration - lastAnchorTime;
-    const remainEst = Math.max(0.001, audioDuration - lastAnchorEst);
-    const estAdj = lastAnchorTime + (b.est - lastAnchorEst) * (remainReal / remainEst);
-    // 허용오차: 마지막 앵커에서 멀수록 추정 오차가 커지므로 거리에 비례해 넓힘. TTS 말속도가 문장에 따라
-    // 추정보다 30~40%씩 다를 수 있어서 넉넉히 잡되(최소 1.2초), 쉼표급 짧은 무음(0.28초 미만)은 진짜
-    // 문장 쉼일 가능성이 낮으니 절반 오차 안에 있을 때만 인정 — 미끼에 낚이는 걸 막음.
-    const tol = Math.max(1.2, 0.35 * (estAdj - lastAnchorTime));
-    let best = null;
-    for (let gi = gapPtr; gi < candidates.length; gi++) {
-      const g = candidates[gi];
-      if (g.end <= lastAnchorTime + 0.15) { continue; }
-      if (g.end > estAdj + tol) break; // 후보는 시각순 정렬돼 있으니 더 볼 필요 없음
-      const gapTol = g.dur >= 0.28 ? tol : tol * 0.5;
-      if (Math.abs(g.end - estAdj) > gapTol) continue;
-      // 예상 위치에 가까울수록 + 무음이 길수록(진짜 문장 쉼일수록) 좋은 후보
-      const score = Math.abs(g.end - estAdj) - Math.min(g.dur, 0.6) * 0.5;
-      if (!best || score < best.score) best = { gi, g, score };
-    }
-    if (best) {
-      b.real = best.g.end; // 다음 문장 음성이 실제로 시작하는 순간에 자막이 바뀜(무음 동안은 이전 자막 유지)
-      gapPtr = best.gi + 1; // 단조증가 보장 — 이미 쓴 무음(과 그 이전 것)은 재사용 안 함
-      lastAnchorTime = b.real;
-      lastAnchorEst = b.est;
-      anchoredCount++;
-    }
-  }
-  if (!anchoredCount) return null; // 하나도 못 맞췄으면 무음 감지를 신뢰할 수 없음 — 폴백
-
-  // 앵커 못 잡은 경계는 이웃 앵커(없으면 파일 시작 0 / 끝 audioDuration) 사이에서 예상 비율로 보간
-  const points = [{ est: 0, real: 0 }, ...boundaries.filter((b) => b.real !== null).map((b) => ({ est: b.est, real: b.real })), { est: audioDuration, real: audioDuration }];
-  const mapEstToReal = (est) => {
-    for (let i = 1; i < points.length; i++) {
-      if (est <= points[i].est || i === points.length - 1) {
-        const a = points[i - 1];
-        const b = points[i];
-        const span = Math.max(0.001, b.est - a.est);
-        return a.real + ((est - a.est) / span) * (b.real - a.real);
-      }
-    }
-    return est;
-  };
-  boundaries.forEach((b) => { if (b.real === null) b.real = mapEstToReal(b.est); });
-
-  // 문장 단위로 실제 구간을 배정하고, 문장 안의 각 줄(비트)은 글자수 비율로 그 작은 구간만 나눔 —
-  // 남은 추정 오차는 문장 하나 길이 안으로만 국한되고 영상 전체에 누적되지 않음.
-  const segStarts = [0, ...boundaries.map((b) => b.real)];
-  const segEnds = [...boundaries.map((b) => b.real), audioDuration];
-  const perImageBeatTimes = captionBeatsPerImage.map((beats) => new Array(beats.length));
-  let sentenceStartFlatIdx = 0;
-  let segIdx = 0;
-  for (let i = 0; i < flat.length; i++) {
-    if (!flat[i].isSentenceEnd) continue;
-    const sentenceBeats = flat.slice(sentenceStartFlatIdx, i + 1);
-    const segStart = segStarts[segIdx];
-    const segEnd = segEnds[segIdx];
-    const segDur = Math.max(0.05, segEnd - segStart);
-    const sw = sentenceBeats.reduce((a, b) => a + b.weight, 0) || 1;
-    let t = segStart;
-    sentenceBeats.forEach((b) => {
-      const dur = (b.weight / sw) * segDur;
-      perImageBeatTimes[b.imgIndex][b.beatIndex] = { start: t, end: t + dur };
-      t += dur;
-    });
-    sentenceStartFlatIdx = i + 1;
-    segIdx++;
-  }
-
-  const imageSpans = perImageBeatTimes.map((times) => ({ start: times[0].start, end: times[times.length - 1].end }));
-  return { perImageBeatTimes, imageSpans, anchoredCount, boundaryCount: boundaries.length };
-}
-
-// ---------- 세그먼트 음성 기반 "실측" 자막 타이밍 — 작업: 2026-08-30 19:59 ----------
-// Worker가 나레이션을 문장 몇 개씩 묶은 세그먼트 단위로 따로 합성해 보내주면(audioSegments),
-// 여기서 각 조각의 실제 길이를 잰 뒤 이어붙임 — 세그먼트 경계의 시각이 "측정값"이라 자막이 어긋날 수가 없음.
-// (전체를 한 번에 합성한 파일에서 무음을 감지해 맞추는 방식은 사람 같은 TTS의 숨소리 때문에 불안정했음.)
-
-// [2026-08-30 19:58] ffmpeg stderr에서 배너(버전/컴파일 옵션/라이브러리 나열)를 걷어냄 — 에러 메시지가
-// 배너에 밀려 잘리면 "실패했는데 이유가 안 보이는" 상황이 됨(실제로 겪음). 진짜 에러 줄만 남김.
-// [2026-09-01] "ffmpeg 종료코드 null"처럼 code가 null인 건 정상 종료가 아니라 신호(signal)로 강제
-// 종료됐다는 뜻인데(예: OOM killer의 SIGKILL), 예전엔 이 signal을 아예 안 잡아서 원인 파악이 불가능했음.
-// 여기서 signal과 그 시점의 메모리 여유를 같이 남겨서 다음에 실패하면 바로 OOM인지 판단 가능하게 함.
-function describeFfmpegFailure(code, signal, stderr) {
-  const freeMb = Math.round(os.freemem() / 1024 / 1024);
-  const totalMb = Math.round(os.totalmem() / 1024 / 1024);
-  const memNote = `메모리 여유 ${freeMb}MB/${totalMb}MB`;
-  if (signal) {
-    const oomHint = signal === 'SIGKILL' ? ' — SIGKILL은 OOM killer(메모리 부족으로 커널이 강제 종료)일 가능성이 높음' : '';
-    return `ffmpeg가 신호로 강제 종료됨(signal=${signal}, ${memNote})${oomHint}\n마지막 출력: ${cleanFfmpegStderr(stderr).slice(-800)}`;
-  }
-  return `ffmpeg 종료코드 ${code} (${memNote}): ${cleanFfmpegStderr(stderr).slice(-800)}`;
-}
-
-function cleanFfmpegStderr(stderr) {
-  return (stderr || "")
-    .split("\n")
-    .filter((line) => {
-      const t = line.trim();
-      return t && !t.startsWith("ffmpeg version") && !t.startsWith("built with") &&
-        !t.startsWith("configuration:") && !/^lib(av|sw|post)\w*\s/.test(t);
-    })
-    .join("\n");
-}
-
-function runFfmpegQuiet(args) {
-  return new Promise((resolve, reject) => {
-    const proc = spawnMedia("ffmpeg", ["-y", ...args]);
-    let stderr = "";
-    proc.stderr.on("data", (d) => { stderr += d.toString(); });
-    proc.on("error", (err) => reject(new Error(`ffmpeg 실행 실패: ${err.message}`)));
-    proc.on("close", (code, signal) => {
-      if (code === 0) resolve();
-      else reject(new Error(describeFfmpegFailure(code, signal, stderr)));
-    });
-  });
-}
-
-// 다운로드된 세그먼트 mp3들을 → (24kHz 모노 wav + 세그먼트 사이 0.35초 쉼 패딩) → 하나로 이어붙임.
-// 반환: { audioPath(narration.wav), segStarts[k](세그먼트 k의 시작 시각, 실측), totalDur }
-// 패딩 "후" 파일을 ffprobe로 재기 때문에 segStarts는 이어붙인 결과와 정확히 일치함(wav=PCM이라 오차 없음).
-const SEGMENT_PAUSE_SEC = 0.35; // 문장 사이 자연스러운 쉼 — 따로 합성된 조각을 그냥 붙이면 너무 급하게 들림
-async function prepareSegmentedNarration(tmpDir, segmentPaths) {
-  const wavPaths = [];
-  const segDurs = [];
-  for (let k = 0; k < segmentPaths.length; k++) {
-    const wav = path.join(tmpDir, `seg-${k}.wav`);
-    const padArgs = k < segmentPaths.length - 1 ? ["-af", `apad=pad_dur=${SEGMENT_PAUSE_SEC}`] : [];
-    await runFfmpegQuiet(["-i", segmentPaths[k], ...padArgs, "-ar", "24000", "-ac", "1", wav]);
-    wavPaths.push(wav);
-    segDurs.push(await getAudioDurationSec(wav));
-  }
-  const listFile = path.join(tmpDir, "seg-list.txt");
-  fs.writeFileSync(listFile, wavPaths.map((p) => `file '${p}'`).join("\n"), "utf8");
-  const audioPath = path.join(tmpDir, "narration.wav");
-  await runFfmpegQuiet(["-f", "concat", "-safe", "0", "-i", listFile, "-c", "copy", audioPath]);
-  const segStarts = [];
-  let cum = 0;
-  for (const d of segDurs) { segStarts.push(cum); cum += d; }
-  return { audioPath, segStarts, totalDur: cum };
-}
-
-// 세그먼트 실측 시각(segStarts) 기반으로 모든 비트의 시작/끝을 계산 — computeRealBeatTimeline과 같은
-// 반환 형태. 각 비트는 worker가 실어준 segIndex(그 문장이 합성된 세그먼트 번호)로 자기 세그먼트의
-// 실측 구간 [segStarts[k], segStarts[k+1])에 배정되고, 그 안에서만 글자수 비례로 나뉨 — 세그먼트가
-// 짧아서(90~220자) 남은 추정 오차는 티가 안 나고, 경계는 측정값이라 누적 자체가 불가능.
-function computeSegmentBeatTimeline(captionBeatsPerImage, segStarts, audioDuration) {
-  if (!Array.isArray(captionBeatsPerImage) || !captionBeatsPerImage.length) {
-    console.log(`[computeSegmentBeatTimeline] captionBeatsPerImage 없음/빈 배열`);
-    return null;
-  }
-  if (captionBeatsPerImage.some((beats) => !Array.isArray(beats) || !beats.length)) {
-    const emptyCount = captionBeatsPerImage.filter((beats) => !Array.isArray(beats) || !beats.length).length;
-    console.log(`[computeSegmentBeatTimeline] 이미지 ${captionBeatsPerImage.length}개 중 ${emptyCount}개가 자막 빈 배열 — worker.js splitTextIntoNChunks 수정이 아직 반영 안 됐을 수 있음`);
-    return null;
-  }
-  // [2026-09-06 03:15] 진짜 버그 수정 — 예전엔 segStarts 길이를 "이미지 개수+1"과 비교했는데, 이미지는
-  // 20장 고정인 반면 문장(세그먼트)은 60~100개가 넘어가는 게 정상이라(splitTextIntoNChunks가 여러
-  // 문장을 한 이미지에 몰아줌) 이 비교가 사실상 항상 실패해서 세그먼트 실측 타이밍이 계속 무시되고
-  // 추정/폴백 모드로만 돌고 있었음(쇼츠가 세그먼트 실측 모드에서만 생성되는데 그래서 쇼츠가 계속 안
-  // 만들어졌던 원인). segStarts는 "세그먼트 개수+1"이어야 하는 게 맞고, 그건 segIndex 범위 검증에서
-  // 이미 확인하므로 여기서는 최소한의 배열 형태만 확인.
-  if (!Array.isArray(segStarts) || segStarts.length < 2) {
-    console.log(`[computeSegmentBeatTimeline] segStarts 형식 이상: ${segStarts?.length || 'null'}`);
-    return null;
-  }
-  const segCount = segStarts.length - 1;
-  const flat = [];
-  captionBeatsPerImage.forEach((beats, imgIndex) => {
-    beats.forEach((beat, beatIndex) => {
-      flat.push({ imgIndex, beatIndex, weight: Math.max(Number(beat.weight) || 0, 0.0001), segIndex: beat.segIndex });
-    });
-  });
-  // [2026-09-06 12:20] 진짜 원인 발견 — genJob 동시실행 방지 락에 아주 좁게(수십ms) 남아있는 경합
-  // 창 때문에 아주 드물게 음성 세그먼트 개수와 문장 개수가 하나 어긋나는 경우가 있음(segIndex가
-  // segCount보다 1 커짐). 이 정도 미세한 범위 초과는 전체를 포기하는 대신 마지막 세그먼트로 보정해서
-  // 계속 세그먼트 실측 모드를 쓰게 함 — 그 비트 하나만 타이밍이 살짝 부정확해질 뿐, 나머지 전체는
-  // 정확한 실측을 유지함. 형식 자체가 잘못된 값(음수, 정수 아님, 훨씬 크게 벗어남)은 여전히 폴백.
-  let clampedCount = 0;
-  for (const b of flat) {
-    if (!Number.isInteger(b.segIndex) || b.segIndex < 0) {
-      console.log(`[computeSegmentBeatTimeline] 비트에 segIndex 형식 이상(${b.segIndex}) — 옛 워커 응답이거나 심각한 오류, 폴백`);
-      return null;
-    }
-    if (b.segIndex >= segCount) {
-      if (b.segIndex - segCount > 2) { // 살짝(1~2)이 아니라 크게 벗어나면 다른 문제일 수 있어 폴백
-        console.log(`[computeSegmentBeatTimeline] 비트 segIndex(${b.segIndex})가 segCount(${segCount})보다 많이 벗어남 — 폴백`);
-        return null;
-      }
-      b.segIndex = segCount - 1;
-      clampedCount++;
-    }
-  }
-  if (clampedCount) console.log(`[computeSegmentBeatTimeline] segIndex 범위 초과 비트 ${clampedCount}개를 마지막 세그먼트로 보정(경합으로 인한 미세 불일치로 추정)`);
-  // 세그먼트별 비트 묶음 — 비어있는 세그먼트가 있으면 타임라인에 구멍이 생기므로 폴백(정상 흐름에선 없음)
-  const bySeg = Array.from({length: segCount}, () => []);
-  for (const b of flat) bySeg[b.segIndex].push(b);
-  if (bySeg.some((arr) => !arr.length)) {
-    const emptySegCount = bySeg.filter((arr) => !arr.length).length;
-    console.log(`[computeSegmentBeatTimeline] 세그먼트 ${segCount}개 중 ${emptySegCount}개에 배정된 비트 없음`);
-    return null;
-  }
-
-  const perImageBeatTimes = captionBeatsPerImage.map((beats) => new Array(beats.length));
-  for (let k = 0; k < bySeg.length; k++) {
-    const segStart = segStarts[k];
-    const segEnd = segStarts[k + 1];
-    const segDur = Math.max(0.05, segEnd - segStart);
-    const sumW = bySeg[k].reduce((a, b) => a + b.weight, 0) || 1;
-    let t = segStart;
-    for (const b of bySeg[k]) {
-      const dur = (b.weight / sumW) * segDur;
-      perImageBeatTimes[b.imgIndex][b.beatIndex] = { start: t, end: t + dur };
-      t += dur;
-    }
-  }
-  const imageSpans = perImageBeatTimes.map((times) => ({ start: times[0].start, end: times[times.length - 1].end }));
-  return { perImageBeatTimes, imageSpans, segmentCount: segStarts.length };
-}
-
-// 자막용 폰트 4종을 각각 개별로 찾아둠(예전엔 하나만 골라서 전체에 썼는데, 이제 영상마다 Worker가
-// 정해준 폰트 키 하나로 고정해서 씀 — worker.js의 CAPTION_FONT_CHOICES와 key가 일치해야 함).
-// CAPTION_FONT_PATH 환경변수를 지정하면 모든 키가 그 폰트 하나로 강제됨(예전 동작 유지용 이스케이프 해치).
-function resolveFontPath(candidates) {
-  if (process.env.CAPTION_FONT_PATH && fs.existsSync(process.env.CAPTION_FONT_PATH)) {
-    return process.env.CAPTION_FONT_PATH;
-  }
-  return candidates.find((p) => fs.existsSync(p)) || null;
-}
-// [2026-09-06 22:00] 진짜 원인 발견/수정 — fonttools로 실측 검사한 결과 songmyung/gaegu/cutefont/
-// yeonsung/gugi/sunflower 6개가 완성형 한글 11,172자 중 2,350자(21%)만 담고 있었음(자주 쓰는
-// "울" 같은 흔한 글자도 빠져있어서 자막이 네모로 깨지던 진짜 원인). 커버리지 100%인 폰트만 남김.
-const CAPTION_FONT_PATHS = {
-  gowun: resolveFontPath([
-    "/usr/local/share/fonts/GowunDodum-Regular.ttf",
-    "/usr/share/fonts/truetype/custom/GowunDodum-Regular.ttf",
-  ]),
-  nanumpen: resolveFontPath([
-    "/usr/local/share/fonts/NanumPenScript-Regular.ttf",
-    "/usr/share/fonts/truetype/custom/NanumPenScript-Regular.ttf",
-  ]),
-  gowunbatang: resolveFontPath([
-    "/usr/local/share/fonts/GowunBatang-Regular.ttf",
-    "/usr/share/fonts/truetype/custom/GowunBatang-Regular.ttf",
-  ]),
-  himelody: resolveFontPath([
-    "/usr/local/share/fonts/HiMelody-Regular.ttf",
-    "/usr/share/fonts/truetype/custom/HiMelody-Regular.ttf",
-  ]),
-  poorstory: resolveFontPath([
-    "/usr/local/share/fonts/PoorStory-Regular.ttf",
-    "/usr/share/fonts/truetype/custom/PoorStory-Regular.ttf",
-  ]),
-  gamjaflower: resolveFontPath([
-    "/usr/local/share/fonts/GamjaFlower-Regular.ttf",
-    "/usr/share/fonts/truetype/custom/GamjaFlower-Regular.ttf",
-  ]),
-  singleday: resolveFontPath([
-    "/usr/local/share/fonts/SingleDay-Regular.ttf",
-    "/usr/share/fonts/truetype/custom/SingleDay-Regular.ttf",
-  ]),
-  stylish: resolveFontPath([
-    "/usr/local/share/fonts/Stylish-Regular.ttf",
-    "/usr/share/fonts/truetype/custom/Stylish-Regular.ttf",
-  ]),
-  nanumbrush: resolveFontPath([
-    "/usr/local/share/fonts/NanumBrushScript-Regular.ttf",
-    "/usr/share/fonts/truetype/custom/NanumBrushScript-Regular.ttf",
-  ]),
-  // [2026-09-06 22:40] fonttools로 후보 폰트 8종 실측 검사 — 나눔명조/나눔고딕코딩만 100% 통과
-  // (나머지 6종은 전부 20%대라 탈락, worker.js CAPTION_FONT_CHOICES 참고)
-  nanummyeongjo: resolveFontPath([
-    "/usr/local/share/fonts/NanumMyeongjo-Regular.ttf",
-    "/usr/share/fonts/truetype/custom/NanumMyeongjo-Regular.ttf",
-  ]),
-  nanumgothiccoding: resolveFontPath([
-    "/usr/local/share/fonts/NanumGothicCoding-Regular.ttf",
-    "/usr/share/fonts/truetype/custom/NanumGothicCoding-Regular.ttf",
-  ]),
-  // [2026-09-06 23:00] 2차 후보 검사 — GothicA1/IBMPlexSansKR/NanumGothic 3종 모두 100% 통과
-  gothica1: resolveFontPath([
-    "/usr/local/share/fonts/GothicA1-Regular.ttf",
-    "/usr/share/fonts/truetype/custom/GothicA1-Regular.ttf",
-  ]),
-  ibmplexsanskr: resolveFontPath([
-    "/usr/local/share/fonts/IBMPlexSansKR-Regular.ttf",
-    "/usr/share/fonts/truetype/custom/IBMPlexSansKR-Regular.ttf",
-  ]),
-  nanumgothic: resolveFontPath([
-    "/usr/local/share/fonts/NanumGothic-Regular.ttf",
-    "/usr/share/fonts/truetype/custom/NanumGothic-Regular.ttf",
-  ]),
-};
-// 요청받은 폰트 키가 이 VM에 실제로 설치돼있지 않으면(아직 다운로드 전 등) 있는 것 중 아무거나로 폴백 —
-// 폰트 없다고 자막 자체를 통째로 스킵하던 예전 방식보다 훨씬 덜 아쉬움.
-const FALLBACK_FONT_PATH =
-  CAPTION_FONT_PATHS.gowun || CAPTION_FONT_PATHS.nanumpen || CAPTION_FONT_PATHS.gowunbatang ||
-  CAPTION_FONT_PATHS.himelody || CAPTION_FONT_PATHS.poorstory ||
-  "/usr/local/share/fonts/NotoSansKR-Regular.otf";
-// [2026-09-06 16:05~21:00] Noto CJK(.ttc)로 바꿔도 문제가 계속돼서 원인을 폰트로 의심했었지만,
-// 최종적으로 ffmpeg 자체의 한글 렌더링 버그로 확정됨(파이썬/PIL로 우회함 — 아래 queueCaptionPng
-// 참고). 이제 PIL이 그리므로 폰트 자체의 문제가 아니었던 게 확인돼서, 원래 쓰던 다양한 폰트
-// 선택 방식으로 복원함.
-function resolveVideoFontPath(fontKey) {
-  return (fontKey && CAPTION_FONT_PATHS[fontKey]) || FALLBACK_FONT_PATH;
-}
-
-// [2026-09-06 21:00] 진짜 원인 확정 — 순수 ffmpeg 단독 테스트(drawtext, libass 자막 둘 다)에서 한글이
-// 항상 첫 글자만 그려지고 뒤가 통째로 사라지는 걸 확인함. 폰트 교체·ffmpeg 재설치·freetype/harfbuzz
-// 재설치로도 안 고쳐졌고, 같은 폰트를 파이썬(PIL)으로 그리면 완벽하게 다 나옴 — ffmpeg 자체의 한글
-// 텍스트 렌더링(drawtext/libass) 버그로 확정. 그래서 ffmpeg가 직접 글자를 그리게 하는 방식을 버리고,
-// 자막은 파이썬(PIL)으로 미리 투명 PNG로 그려서 ffmpeg는 그 이미지를 영상 위에 얹기(overlay)만 하도록
-// 전면 변경. CAPTION_POSITIONS도 ffmpeg 표현식(text_w/th 등) 대신 파이썬이 쓸 순수 픽셀 값으로 교체.
-const CAPTION_POSITIONS = [
-  { x: 40, yMode: "bottom", yOffset: 80, size: 52 },
-  { x: 40, yMode: "top", yOffset: 80, size: 48 },
-  { x: 40, yMode: "bottom", yOffset: 90, size: 57 },
-  { x: 40, yMode: "bottom", yOffset: 90, size: 53 },
-  { x: 40, yMode: "middle", yOffset: 0, size: 56 },
-];
-
-const CAPTION_RENDER_SCRIPT = path.join(__dirname, "render_caption.py");
-// [2026-09-06 21:20] 최적화 — 문장 하나마다 파이썬 프로세스를 새로 띄우면(영상 하나에 문장이 수십~
-// 백개) 프로세스 생성 오버헤드가 누적돼 느려짐. 대신 한 번의 ffmpeg 호출(본편/청크/숏츠 각각)에
-// 필요한 자막 PNG 요청을 큐에 모아뒀다가, ffmpeg 실행 직전에 파이썬 프로세스 1번으로 전부 그림.
-function queueCaptionPng(requests, text, fontFile, fontSize, colorHexFF, canvasW, canvasH, x, yMode, yOffset, outPath) {
-  const txtPath = outPath.replace(/\.png$/, ".txt");
-  fs.writeFileSync(txtPath, text, "utf8");
-  const colorHex = "#" + colorHexFF.replace(/^0x/i, "");
-  requests.push({
-    text_file: txtPath, font_file: fontFile, font_size: fontSize, color_hex: colorHex,
-    canvas_w: canvasW, canvas_h: canvasH, x, y_mode: yMode, y_offset: yOffset,
-    stroke_width: 8, stroke_color: "black", spacing: 16, out_path: outPath,
-  });
-}
-// 큐에 쌓인 자막 PNG 요청을 파이썬 프로세스 1번으로 전부 그림 — ffmpeg 실행 직전에 호출.
-// [2026-09-06 22:15] 진짜 원인 발견/수정 — execFileSync(동기)를 쓰면 자막을 그리는 그 몇 초 동안
-// Node 이벤트 루프 전체가 멈춰서, /render/status 폴링 응답도 못 나가고(진행 메시지가 뚝뚝 끊겨
-// 보이던 원인) 키움 실시간 중계까지 같이 멈췄음. spawn 기반 비동기 방식으로 바꿔서 그 동안에도
-// 서버가 다른 요청에 계속 응답할 수 있게 함.
-function flushCaptionPngBatch(requests, tmpDir, jobId, label) {
-  if (!requests.length) return Promise.resolve();
-  const manifestPath = path.join(tmpDir, `caption-manifest-${label}-${Date.now()}.json`);
-  fs.writeFileSync(manifestPath, JSON.stringify(requests), "utf8");
-  return new Promise((resolve, reject) => {
-    const proc = spawn("python3", [CAPTION_RENDER_SCRIPT, manifestPath]);
-    let stderr = "";
-    proc.stderr.on("data", (d) => { stderr += d.toString(); });
-    proc.on("error", (e) => {
-      jlog(jobId, `[render:${jobId}] ${label} 캡션 PNG 배치 렌더링 실행 실패: ${e.message}`);
-      reject(e);
-    });
-    proc.on("close", (code) => {
-      // exit 0 = 전부 성공, 2 = 일부만 실패(계속 진행 가능), 1 = 전부 실패
-      if (code === 0 || code === 2) {
-        if (code === 2) jlog(jobId, `[render:${jobId}] ${label} 캡션 PNG 일부 실패(계속 진행): ${stderr.slice(0, 500)}`);
-        resolve();
-      } else {
-        jlog(jobId, `[render:${jobId}] ${label} 캡션 PNG 배치 렌더링 실패: ${stderr.slice(0, 500)}`);
-        reject(new Error(`caption render exit ${code}: ${stderr.slice(0, 300)}`));
-      }
-    });
-  });
-}
-
-async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, shortOutputKeys, weights, captionBeats, captionFontKey, captionColor, highlightSegRange) {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), `render-${jobId}-`));
-  const setProgress = (stage, percent) => {
-    const prev = renderJobs.get(jobId) || {};
-    renderJobs.set(jobId, { ...prev, status: "processing", stage, percent, startedAt: prev.startedAt || Date.now() });
-  };
-  try {
-    if (!r2Client) throw new Error("R2_ACCESS_KEY_ID/R2_SECRET_ACCESS_KEY 환경변수 없음");
-    if (!images.length) throw new Error("이미지가 없음");
-
-    setProgress("이미지 다운로드 중", 5);
-    // [2026-08-30 19:10] 미디어 종류 구분 — .mp4는 실사 클립(장면 일부에 사진 대신 사용), 나머지는 사진.
-    // 확장자만으로 판단(Worker가 키를 그렇게 만들어 보냄). mediaIsClip은 입력 인자/필터 구성에서 씀.
-    const imagePaths = [];
-    const mediaIsClip = [];
-    let failedDownloadCount = 0;
-    for (let i = 0; i < images.length; i++) {
-      const isClip = /\.mp4(\?|$)/i.test(images[i]);
-      const dest = path.join(tmpDir, `img-${i}.${isClip ? "mp4" : "jpg"}`);
-      try {
-        await downloadToFile(images[i], dest);
-        imagePaths.push(dest);
-        mediaIsClip.push(isClip);
-      } catch (e) {
-        // [2026-09-06 12:10] 이미지 하나가 404 등으로 못 받아졌다고 영상 전체를 실패 처리하던 문제 —
-        // 자리(자막 타이밍/이미지 개수 정렬)는 그대로 유지한 채, 그 이미지만 검정 화면으로 대체하고 계속
-        // 진행함. 배열 인덱스를 그대로 유지해야(빼면) 다른 이미지의 자막 세그먼트 매핑이 깨지므로,
-        // "빼기"가 아니라 "대체"로 처리.
-        failedDownloadCount++;
-        jlog(jobId, `[render:${jobId}] 이미지 ${i} 다운로드 실패, 검정 화면으로 대체: ${images[i]} — ${e.message}`);
-        const placeholderPath = path.join(tmpDir, `img-${i}-placeholder.jpg`);
-        try {
-          await runFfmpegQuiet(["-f", "lavfi", "-i", "color=c=black:s=1280x720", "-frames:v", "1", placeholderPath]);
-          imagePaths.push(placeholderPath);
-          mediaIsClip.push(false); // 대체 이미지는 항상 정지화면 취급(클립이었어도)
-        } catch (e2) {
-          throw new Error(`이미지 ${i} 다운로드도 실패하고 대체 화면 생성도 실패: ${e2.message}`);
-        }
-      }
-      setProgress("이미지 다운로드 중", 5 + Math.round((i + 1) / images.length * 15)); // 5~20%
-    }
-    if (failedDownloadCount) jlog(jobId, `[render:${jobId}] 이미지 ${images.length}개 중 ${failedDownloadCount}개를 검정 화면으로 대체함`);
-    // ---- 음성 확보: 세그먼트(실측 타이밍)가 최우선, 없거나 실패하면 통짜 mp3(추정 타이밍) ----
-    let audioPath = null;
-    let audioDurationSec = null;
-    let segStarts = null; // 세그먼트별 시작 시각(실측) — 자막 타이밍의 기준점
-    if (Array.isArray(audioSegmentUrls) && audioSegmentUrls.length) {
-      try {
-        setProgress("음성 세그먼트 다운로드 중", 21);
-        const segPaths = [];
-        for (let k = 0; k < audioSegmentUrls.length; k++) {
-          const dest = path.join(tmpDir, `seg-src-${k}.mp3`);
-          await downloadToFile(audioSegmentUrls[k], dest);
-          segPaths.push(dest);
-        }
-        setProgress("음성 세그먼트 결합 중", 23);
-        const prepared = await prepareSegmentedNarration(tmpDir, segPaths);
-        audioPath = prepared.audioPath;
-        audioDurationSec = prepared.totalDur;
-        segStarts = prepared.segStarts;
-      } catch (e) {
-        jlog(jobId, `[render:${jobId}] 세그먼트 음성 준비 실패(통짜 mp3로 폴백): ${e.message}`);
-        audioPath = null;
-        segStarts = null;
-      }
-    }
-    if (!audioPath && audioUrl) {
-      setProgress("음성 다운로드 중", 22);
-      audioPath = path.join(tmpDir, "narration.mp3");
-      await downloadToFile(audioUrl, audioPath);
-    }
-
-    setProgress("영상 길이 계산 중", 25);
-    if (audioPath && !audioDurationSec) {
-      try { audioDurationSec = await getAudioDurationSec(audioPath); } catch (e) { jlog(jobId, `[render:${jobId}] 오디오 길이 확인 실패: ${e.message}`); }
-    }
-    // 자막 타이밍 우선순위: ① 세그먼트 실측(정확, 추정 없음) ② 무음 감지 정렬(구버전 요청 하위호환)
-    // ③ 글자수 비율 추정(최후 폴백). ①이 있으면 ②는 아예 시도하지 않음.
-    let realTimeline = null;
-    if (audioPath && audioDurationSec && Array.isArray(captionBeats)) {
-      if (segStarts) {
-        realTimeline = computeSegmentBeatTimeline(captionBeats, segStarts, audioDurationSec);
-      }
-      if (!realTimeline) {
-        try {
-          realTimeline = await computeRealBeatTimeline(audioPath, audioDurationSec, captionBeats, weights);
-        } catch (e) {
-          jlog(jobId, `[render:${jobId}] 무음 구간 타이밍 계산 실패, 글자수 비율 추정으로 폴백: ${e.message}`);
-          realTimeline = null;
-        }
-      }
-      jlog(jobId, `[render:${jobId}] 자막 타이밍: ${realTimeline
-        ? (realTimeline.segmentCount
-          ? `세그먼트 실측(${realTimeline.segmentCount}개 조각, 경계 전부 측정값)`
-          : `무음 구간 앵커링(문장 경계 ${realTimeline.boundaryCount}개 중 ${realTimeline.anchoredCount}개 실측, 나머지 보간)`)
-        : '글자수 비율 추정(폴백)'}`);
-    }
-    const durations = realTimeline
-      ? realTimeline.imageSpans.map((span) => Math.max(0.3, span.end - span.start))
-      : await computeImageDurations(imagePaths.length, audioPath, weights, audioDurationSec);
-    // 전환(xfade) 보정: 전환마다 다음 이미지의 시작이 겹침(fade 길이)만큼 당겨지므로, "그 전환의 실제
-    // fade 길이"를 왼쪽 이미지 노출시간에 더해줘야 이후 모든 이미지/자막의 벽시계 타이밍이 계획과 정확히
-    // 일치함. 예전엔 고정 XFADE_DUR을 더한 뒤 실제 fade는 min()으로 줄어들 수 있어서(짧은 컷) 그 차이만큼
-    // 뒤 이미지들이 늦어지는 미세 드리프트가 있었음 — fade를 먼저 확정하고 그 값을 그대로 더해서 해결.
-    const XFADE_DUR = 0.6; // 전환 길이 상한(초)
-    const xfadeDurs = [];
-    if (durations.length > 1) {
-      for (let i = 0; i < durations.length - 1; i++) {
-        xfadeDurs.push(Math.max(0.05, Math.min(XFADE_DUR, durations[i] * 0.4, durations[i + 1] * 0.4)));
-      }
-      for (let i = 0; i < durations.length - 1; i++) durations[i] += xfadeDurs[i];
-    }
-    const totalDurationSec = durations.reduce((a, b) => a + b, 0);
-    // 이 영상 전체에 쓸 폰트/색을 하나로 확정 — Worker가 골라서 넘겨준 값(위치도 이제 비트마다 안 바뀌고
-    // 영상 하나당 하나로 고정 — captionBeats의 styleIndex가 전부 동일한 값으로 옴).
-    const resolvedFontPath = resolveVideoFontPath(captionFontKey);
-    const fontAvailable = !!resolvedFontPath && fs.existsSync(resolvedFontPath);
-    if (!fontAvailable) {
-      jlog(jobId, `[render:${jobId}] 자막 폰트를 못 찾음(요청 키: ${captionFontKey}, 경로: ${resolvedFontPath}) — 이번 렌더링은 자막 없이 진행`);
-    }
-    const captionColorFF = (typeof captionColor === "string" && /^#[0-9a-fA-F]{6}$/.test(captionColor))
-      ? captionColor.replace("#", "0x")
-      : "0xFFFFFF";
-
-    const outputPath = path.join(tmpDir, "output.mp4");
-
-    // 이미지 하나의 필터 체인(스케일+색보정+자막 drawtext)을 만드는 공용 빌더 — 한방/청크 렌더링이 같이 씀.
-    // inputIdx: 이번 ffmpeg 실행 안에서의 입력 번호 / imgIdx: 영상 전체 기준 이미지 번호(자막·시간은 항상 이 기준).
-    // lanczos: 원본 해상도가 1280x720이랑 다를 때(Pixabay/Pexels/FLUX 다 제각각) 기본 리사이즈보다 훨씬 선명함.
-    // eq: 사진 톤을 살짝 또렷하고 생기있게 보정(과하지 않게) — 화질 좋아 보이는 효과의 8할은 이 정도 보정에서 나옴.
-    // 자막은 drawtext로 직접 그림 — 비트가 여러 개면 enable='between(t,..)'로 시간대를 나눠 순서대로 갈아끼움.
-    // text= 대신 textfile=을 써서 콜론/따옴표 등 ffmpeg 필터 특수문자 이스케이프 문제를 원천적으로 피함.
-    // [2026-08-30 19:10] 미디어 입력 인자 — 사진은 -loop 1(정지화면 반복), 클립(mp4)은 -stream_loop -1로
-    // 배정 구간보다 짧으면 반복하고 -t로 구간 길이만큼만 읽음(길면 앞부분만 사용). 클립 자체 오디오는
-    // 어차피 [i:v]만 쓰므로 자동으로 버려지고 나레이션이 입혀짐.
-    const pushMediaInput = (inputArgs, imgIdx) => {
-      if (mediaIsClip[imgIdx]) {
-        inputArgs.push("-stream_loop", "-1", "-t", String(durations[imgIdx].toFixed(2)), "-i", imagePaths[imgIdx]);
-      } else {
-        inputArgs.push("-loop", "1", "-t", String(durations[imgIdx].toFixed(2)), "-i", imagePaths[imgIdx]);
-      }
-    };
-
-    // [2026-09-06 21:00] inputArgs/extraInputCounter를 받아서, 자막마다 미리 그린 PNG를 새 입력으로
-    // 추가하고 overlay 필터로 얹음(ffmpeg 자체 텍스트 렌더링 버그 우회). extraInputCounter는
-    // { count: N } 형태의 공유 카운터 — 이 ffmpeg 호출 안에서 다음 입력이 몇 번인지 계속 추적함.
-    const makeImageChain = (inputIdx, imgIdx, inputArgs, extraInputCounter, captionRequests) => {
-      // fps=25: 사진 루프는 원래 25fps지만 클립은 원본 fps가 제각각이라 통일 — xfade가 fps 불일치에 민감함
-      const baseLabel = `base${inputIdx}`;
-      let chain = `[${inputIdx}:v]fps=25,scale=1280:720:flags=lanczos,setsar=1,eq=contrast=1.06:saturation=1.12:brightness=0.02:gamma=1.02[${baseLabel}]`;
-      const beats = fontAvailable && Array.isArray(captionBeats) ? (captionBeats[imgIdx] || []) : [];
-      // [2026-09-06 14:20] 전환 구간(크로스페이드)엔 자막이 안 보이게 시작/끝 시각을 그 경계 안으로 클램프
-      const incomingBlend = imgIdx > 0 ? xfadeDurs[imgIdx - 1] : 0;
-      const outgoingBlend = imgIdx < durations.length - 1 ? xfadeDurs[imgIdx] : 0;
-      const safeWindowEnd = Math.max(incomingBlend, durations[imgIdx] - outgoingBlend);
-      const overlaySteps = [];
-      if (beats.length) {
-        const realTimes = realTimeline ? realTimeline.perImageBeatTimes[imgIdx] : null;
-        const imgRealStart = realTimeline ? realTimeline.imageSpans[imgIdx].start : 0;
-        const sumWeight = beats.reduce((a, b) => a + (b.weight || 1), 0) || 1;
-        let t = 0;
-        beats.forEach((beat, bi) => {
-          const text = (beat.text || "").trim();
-          const real = realTimes && realTimes[bi];
-          const rawStart = real ? (real.start - imgRealStart) : t;
-          const beatDur = real ? Math.max(0.3, real.end - real.start) : Math.max(0.3, (beat.weight / sumWeight) * durations[imgIdx]);
-          const rawEnd = rawStart + beatDur;
-          t = rawEnd;
-          const start = Math.min(Math.max(rawStart, incomingBlend), safeWindowEnd);
-          const end = Math.max(Math.min(rawEnd, safeWindowEnd), incomingBlend);
-          if (!text || end - start < 0.15) return;
-          const safeText = sanitizeCaptionText(text, jobId, `img${imgIdx} beat${bi}`);
-          const st = CAPTION_POSITIONS[(beat.styleIndex || 0) % CAPTION_POSITIONS.length];
-          const pngPath = path.join(tmpDir, `capimg-${imgIdx}-${bi}.png`);
-          queueCaptionPng(captionRequests, safeText, resolvedFontPath, st.size, captionColorFF, 1280, 720, st.x, st.yMode, st.yOffset, pngPath);
-          const capInputIdx = extraInputCounter.count++;
-          inputArgs.push("-loop", "1", "-t", String(durations[imgIdx].toFixed(2)), "-i", pngPath);
-          overlaySteps.push({ capInputIdx, start, end });
-        });
-      }
-      let curLabel = baseLabel;
-      overlaySteps.forEach((step, idx) => {
-        const outLabel = idx === overlaySteps.length - 1 ? `v${inputIdx}` : `ov${inputIdx}_${idx}`;
-        chain += `;[${curLabel}][${step.capInputIdx}:v]overlay=x=0:y=0:enable='between(t,${step.start.toFixed(2)},${step.end.toFixed(2)})'[${outLabel}]`;
-        curLabel = outLabel;
-      });
-      if (!overlaySteps.length) {
-        // 자막 없는 이미지 — base 라벨을 그대로 최종 라벨 이름으로 씀(불필요한 필터 추가 안 함)
-        chain = chain.replace(`[${baseLabel}]`, `[v${inputIdx}]`);
-      }
-      return chain;
-    };
-
-    // 오디오(나레이션 loudnorm 또는 합성 BGM) 입력/필터를 붙이는 공용 빌더 — videoInputCount 뒤 번호부터 오디오 입력.
-    const appendAudioParts = (inputArgs, filterComplex, videoInputCount) => {
-      let outputArgs;
-      if (audioPath) {
-        inputArgs.push("-i", audioPath);
-        // loudnorm: TTS 음원마다 볼륨이 들쭉날쭉할 수 있어서, 방송 표준 음량(-16 LUFS)으로 정규화
-        filterComplex += `;[${videoInputCount}:a]loudnorm=I=-16:TP=-1.5:LRA=11[anorm]`;
-        outputArgs = ["-map", "[outv]", "-map", "[anorm]", "-c:a", "aac", "-shortest"];
-      } else {
-        // 음성이 없을 때는 무음 대신, 외부 음원 없이 ffmpeg 자체 신호(사인파 3개로 만든 화음 패드)를
-        // 배경음악으로 깔아줌 — 저작권 걱정이 원천적으로 없고 외부 링크에 의존하지 않아 항상 안정적으로 동작함.
-        const bgmFreqs = [130.81, 164.81, 196.0]; // C3-E3-G3, 낮고 잔잔한 장3화음
-        // totalDurationSec은 전환 보정 때문에 실제 최종 영상 길이보다 살짝 크게 잡혀있음 — 페이드아웃이
-        // 영상 끝나기 전에 끝나도록 실제 길이(전환으로 줄어드는 만큼 뺀 값) 기준으로 계산
-        const xfadeLoss = xfadeDurs.reduce((a, b) => a + b, 0);
-        const finalVideoLengthSec = totalDurationSec - xfadeLoss;
-        bgmFreqs.forEach((f) => {
-          inputArgs.push("-f", "lavfi", "-i", `sine=frequency=${f}:duration=${totalDurationSec.toFixed(2)}`);
-        });
-        const bgmMixInputs = bgmFreqs.map((_, i) => `[${videoInputCount + i}:a]`).join("");
-        const fadeOutStart = Math.max(0, finalVideoLengthSec - 2).toFixed(2);
-        // normalize=0: amix 기본 자동정규화(입력 개수만큼 자동으로 줄임)를 끄고 volume으로 직접 조절 —
-        // 안 그러면 자동정규화(1/3) × volume이 이중으로 곱해져서 사실상 안 들릴 정도로 작아짐(원인 발견).
-        filterComplex += `;${bgmMixInputs}amix=inputs=${bgmFreqs.length}:duration=longest:normalize=0,volume=0.25,afade=t=in:d=2,afade=t=out:st=${fadeOutStart}:d=2[bgm]`;
-        outputArgs = ["-map", "[outv]", "-map", "[bgm]", "-c:a", "aac", "-shortest"];
-      }
-      return { filterComplex, outputArgs };
-    };
-
-    // 청크 렌더링: 이미지가 많으면(4분/20장) xfade 필터들이 720p 프레임 버퍼를 동시에 쥐고 있어서
-    // 1GB VM(키움 릴레이와 공유)에 부담됨 → CHUNK_SIZE장씩 부분 영상(자막 포함, 무음)을 먼저 만들고,
-    // 마지막에 부분 영상들끼리 경계 xfade로 병합하며 오디오를 입힘. 각 전환의 fade 길이가 왼쪽 조각의
-    // 길이에 이미 포함돼 있어(위 durations 보정) 벽시계 기준 자막/전환 타이밍이 한방 렌더링과 완전히 같음.
-    const CHUNK_SIZE = 5;
-    if (imagePaths.length <= CHUNK_SIZE) {
-      // 소량: 예전처럼 한 번에 렌더링(중간 재인코딩 없음)
-      const inputArgs = [];
-      imagePaths.forEach((p, i) => pushMediaInput(inputArgs, i));
-      const extraInputCounter = { count: imagePaths.length }; // 캡션 PNG는 이미지 입력들 뒤 번호부터
-      const captionRequests = [];
-      const filterInputs = imagePaths.map((p, i) => makeImageChain(i, i, inputArgs, extraInputCounter, captionRequests)).join(";");
-      let filterComplex;
-      if (imagePaths.length <= 1) {
-        filterComplex = `${filterInputs};[v0]concat=n=1:v=1:a=0[outv]`;
-      } else {
-        let prevLabel = "v0";
-        let cumulative = durations[0];
-        const xfadeParts = [];
-        for (let i = 1; i < imagePaths.length; i++) {
-          const dur = xfadeDurs[i - 1]; // durations[i-1]에 이미 더해져 있어 offset이 정확히 맞음
-          const offset = Math.max(0, cumulative - dur);
-          const outLabel = i === imagePaths.length - 1 ? "outv" : `vx${i}`;
-          xfadeParts.push(`[${prevLabel}][v${i}]xfade=transition=fade:duration=${dur.toFixed(2)}:offset=${offset.toFixed(2)}[${outLabel}]`);
-          prevLabel = outLabel;
-          cumulative += durations[i] - dur;
-        }
-        filterComplex = `${filterInputs};${xfadeParts.join(";")}`;
-      }
-      await flushCaptionPngBatch(captionRequests, tmpDir, jobId, "main"); // ffmpeg 실행 전에 자막 PNG 전부 그림(비동기라 그동안 서버가 안 멈춤)
-      // [2026-09-06 21:00] 캡션 PNG를 추가 입력으로 붙였으니, 오디오 입력 번호는 이미지 개수가 아니라
-      // extraInputCounter.count(이미지+캡션PNG 전부)부터 시작해야 함
-      const audioParts = appendAudioParts(inputArgs, filterComplex, extraInputCounter.count);
-      setProgress("렌더링 중", 30);
-      await runFfmpeg([
-        "-y", ...inputArgs,
-        "-filter_complex", audioParts.filterComplex,
-        ...audioParts.outputArgs,
-        // [2026-09-06 02:30] preset faster(자원 빠듯한 VM에서 속도), tune stillimage(정지이미지+자막
-        // 콘텐츠에 맞춘 화질 튜닝), movflags +faststart(웹/유튜브에서 다운로드 중에도 바로 재생 시작)
-        "-c:v", "libx264", "-preset", "faster", "-tune", "stillimage", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-        outputPath,
-      ], totalDurationSec, (ffmpegPercent) => {
-        // ffmpeg 자체 진행률(0~99)을 전체 진행률의 30~85% 구간에 매핑
-        setProgress("렌더링 중", 30 + Math.round((ffmpegPercent / 100) * 55));
-      });
-    } else {
-      // 1) 청크별 부분 영상 렌더링(무음, 자막 포함) — 경계 전환의 fade 꼬리는 각 청크 마지막 이미지에 포함돼 있음
-      const chunkIdxGroups = [];
-      for (let i = 0; i < imagePaths.length; i += CHUNK_SIZE) {
-        chunkIdxGroups.push(Array.from({ length: Math.min(CHUNK_SIZE, imagePaths.length - i) }, (_, j) => i + j));
-      }
-      const chunkFiles = [];
-      const chunkSpanSums = [];
-      for (let k = 0; k < chunkIdxGroups.length; k++) {
-        const group = chunkIdxGroups[k];
-        const inputArgs = [];
-        group.forEach((g) => pushMediaInput(inputArgs, g));
-        const extraInputCounter = { count: group.length }; // 이 청크 안에서 캡션 PNG는 이미지들 뒤 번호부터
-        const captionRequests = [];
-        const filterInputs = group.map((g, j) => makeImageChain(j, g, inputArgs, extraInputCounter, captionRequests)).join(";");
-        let filterComplex;
-        let mapLabel;
-        if (group.length === 1) {
-          filterComplex = filterInputs;
-          mapLabel = "[v0]";
-        } else {
-          let prevLabel = "v0";
-          let cumulative = durations[group[0]];
-          const xfadeParts = [];
-          for (let j = 1; j < group.length; j++) {
-            const dur = xfadeDurs[group[j - 1]]; // 청크 안 전환만 여기서 소화(경계 전환은 병합 단계에서)
-            const offset = Math.max(0, cumulative - dur);
-            const outLabel = j === group.length - 1 ? "outv" : `vx${j}`;
-            xfadeParts.push(`[${prevLabel}][v${j}]xfade=transition=fade:duration=${dur.toFixed(2)}:offset=${offset.toFixed(2)}[${outLabel}]`);
-            prevLabel = outLabel;
-            cumulative += durations[group[j]] - dur;
-          }
-          filterComplex = `${filterInputs};${xfadeParts.join(";")}`;
-          mapLabel = "[outv]";
-        }
-        await flushCaptionPngBatch(captionRequests, tmpDir, jobId, `chunk${k}`); // ffmpeg 실행 전에 이 청크의 자막 PNG 전부 그림(비동기)
-        const chunkFile = path.join(tmpDir, `chunk-${k}.mp4`);
-        const internalFades = group.slice(0, -1).reduce((a, g) => a + xfadeDurs[g], 0);
-        const chunkLen = group.reduce((a, g) => a + durations[g], 0) - internalFades;
-        // 중간 산출물은 crf 16(고화질) — 최종 병합에서 한 번 더 인코딩되므로 여기서 아끼면 화질이 이중으로 깎임
-        await runFfmpeg([
-          "-y", ...inputArgs,
-          "-filter_complex", filterComplex,
-          "-map", mapLabel,
-          "-c:v", "libx264", "-preset", "veryfast", "-tune", "stillimage", "-crf", "16", "-pix_fmt", "yuv420p",
-          chunkFile,
-        ], chunkLen, (ffmpegPercent) => {
-          setProgress(`부분 렌더링 중 (${k + 1}/${chunkIdxGroups.length})`, 30 + Math.round(((k + ffmpegPercent / 100) / chunkIdxGroups.length) * 40)); // 30~70%
-        });
-        chunkFiles.push(chunkFile);
-        // [2026-08-31] 청크 경계마다 자막이 조금씩 더 밀리던 원인: 여기서 chunkLen(계획값)을 그대로 썼는데,
-        // ffmpeg는 fps=25(0.04초 단위)로 프레임을 딱 맞춰 인코딩하면서 계획값을 살짝 반올림함 — 그 오차가
-        // 청크 하나당 최대 0.04초 정도인데, 청크를 거칠 때마다(약 1분 간격) 계속 쌓여서 뒤로 갈수록 자막이
-        // 음성보다 벌어졌던 것. 음성 세그먼트처럼 여기도 "계산값" 대신 ffprobe로 실제 렌더링된 파일 길이를
-        // 재서 그 실측값으로 다음 청크의 위치를 잡음 — 추정을 없애서 청크 경계마다 오차가 리셋되게 함.
-        const measuredChunkLen = await getAudioDurationSec(chunkFile).catch((e) => {
-          jlog(jobId, `[render:${jobId}] 청크 ${k} 실측 길이 확인 실패, 계획값으로 대체: ${e.message}`);
-          return chunkLen; // 실측 실패해도 렌더링 자체는 막지 않고 예전처럼 계획값으로 폴백
-        });
-        // chunkLen(계획)에는 이 청크의 "꼬리 전환(다음 청크와 겹칠 fade)"까지 포함돼 있으므로, 병합 offset에
-        // 쓸 spanSum은 실측 길이에서 그 꼬리 길이만큼 다시 빼야 함(마지막 청크는 꼬리 전환이 없음).
-        const isLastChunk = k === chunkIdxGroups.length - 1;
-        const tailFade = isLastChunk ? 0 : xfadeDurs[group[group.length - 1]];
-        chunkSpanSums.push(Math.max(0.05, measuredChunkLen - tailFade));
-      }
-
-      // 2) 부분 영상 병합: 경계마다 이미지 전환과 똑같은 xfade + 오디오/BGM — 동시에 여는 스트림이 청크
-      // 개수(20장 기준 4개)뿐이라 메모리 부담이 작음. offset은 순수 노출시간(spans) 누적합 = 실제 경계 시각.
-      const inputArgs = [];
-      chunkFiles.forEach((f) => inputArgs.push("-i", f));
-      let prevLabel = "0:v";
-      let cumulative = chunkSpanSums[0];
-      const xfadeParts = [];
-      for (let k = 1; k < chunkFiles.length; k++) {
-        const boundaryImg = chunkIdxGroups[k - 1][chunkIdxGroups[k - 1].length - 1]; // 앞 청크의 마지막 이미지
-        const dur = xfadeDurs[boundaryImg];
-        const outLabel = k === chunkFiles.length - 1 ? "outv" : `cx${k}`;
-        xfadeParts.push(`[${prevLabel}][${k}:v]xfade=transition=fade:duration=${dur.toFixed(2)}:offset=${cumulative.toFixed(2)}[${outLabel}]`);
-        prevLabel = outLabel;
-        cumulative += chunkSpanSums[k];
-      }
-      const audioParts = appendAudioParts(inputArgs, xfadeParts.join(";"), chunkFiles.length);
-      const finalLen = chunkSpanSums.reduce((a, b) => a + b, 0);
-      setProgress("최종 병합 중", 70);
-      await runFfmpeg([
-        "-y", ...inputArgs,
-        "-filter_complex", audioParts.filterComplex,
-        ...audioParts.outputArgs,
-        "-c:v", "libx264", "-preset", "faster", "-tune", "stillimage", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-        outputPath,
-      ], finalLen, (ffmpegPercent) => {
-        setProgress("최종 병합 중", 70 + Math.round((ffmpegPercent / 100) * 15)); // 70~85%
-      });
-    }
-
-    // 나레이션이 있었는데(audioPath) 최종 mp4에 오디오 트랙이 실제로 없으면(다운로드 미묘한 손상,
-    // 필터그래프 문제 등) R2에 올리지 않고 여기서 바로 실패 처리 — 무음 영상이 조용히 발행되는 걸 막음.
-    // 에러 메시지에 NO_AUDIO_TRACK 마커를 붙여서 Worker(worker.js)가 이 실패를 일반 렌더링 실패와
-    // 구분해서 글 자체를 삭제하도록 함(finalizeRenderFailed 참고).
-    if (audioPath) {
-      setProgress("오디오 트랙 검증 중", 89);
-      const hasAudioTrack = await verifyOutputHasAudio(outputPath);
-      if (!hasAudioTrack) {
-        throw new Error("NO_AUDIO_TRACK: 최종 mp4에 오디오 트랙이 없음(나레이션 있었는데 누락됨)");
-      }
-    }
-
-    // [2026-08-30 22:55] ---------- 숏츠(세로 9:16) 렌더링 ----------
-    // [2026-09-02 21:05] highlightSegRange(Worker가 AI로 고른 하이라이트 문장 구간)가 오면 그 구간
-    // 하나만 사용 — 없으면(구버전 재시도 등) 예전처럼 도입/중간/결론 후보 로직으로 폴백.
-    // 이미 실측된 음성·자막 타이밍·이미지를 재활용해 구간을 세로(720x1280, 중앙 크롭)로 잘라냄.
-    // 구간 경계는 전부 문장(=음성 조각) 경계라 말이 중간에 끊기지 않음. 각 구간 57초 이내(숏츠 60초 상한 안쪽).
-    // 숏츠 실패는 본편 발행을 막지 않음(로그만 남기고 건너뜀). 세그먼트 실측 모드에서만 생성.
-    const shortsDone = []; // 실제로 R2에 올라간 숏츠 키들
-    if (Array.isArray(shortOutputKeys) && shortOutputKeys.length && audioPath && realTimeline && realTimeline.segmentCount) {
-      const SHORT_LIMIT_SEC = 57;
-      const total = audioDurationSec;
-      // 모든 문장(비트) 경계 시각을 정렬해 모음 — 구간 시작/끝은 항상 이 경계 위에서만 고름
-      const bounds = [0];
-      realTimeline.perImageBeatTimes.forEach((times) => times.forEach((t) => bounds.push(t.end)));
-      bounds.sort((a, b) => a - b);
-      const endBoundFor = (sT) => { // sT에서 시작해 57초 안에 끝나는 마지막 문장 경계
-        let e = 0;
-        for (const b of bounds) if (b > sT + 1 && b <= sT + SHORT_LIMIT_SEC && b > e) e = b;
-        return e;
-      };
-      const startBoundNear = (t) => { // t 이전(같음 포함)의 가장 늦은 문장 경계
-        let s = 0;
-        for (const b of bounds) if (b <= t && b > s) s = b;
-        return s;
-      };
-      // [2026-09-02 21:05, 2026-09-04 22:55 수정] highlightSegRange가 유효하면 그 구간 하나만 사용.
-      // 버그였던 지점: end를 아예 안 보고 start부터 무조건 57초까지 늘렸음 — AI가 하이라이트로
-      // 고른 범위보다 훨씬 더 뒤(관련 없는 내용)까지 쇼츠에 딸려 들어갈 수 있었음. 이제 end로 정해진
-      // "의도한 끝"이 57초 안이면 그대로 쓰고, 넘으면 그때만 57초 상한 안에서 가장 가까운 경계로 줄임.
-      const highlightValid = highlightSegRange
-        && Number.isInteger(highlightSegRange.start)
-        && Number.isInteger(highlightSegRange.end)
-        && Array.isArray(segStarts)
-        && highlightSegRange.start >= 0
-        && highlightSegRange.end >= highlightSegRange.start
-        && highlightSegRange.start < segStarts.length - 1;
-      let highlightRegion = null;
-      if (highlightValid) {
-        const hSt = segStarts[highlightSegRange.start];
-        const endIdx = Math.min(highlightSegRange.end + 1, segStarts.length - 1);
-        const intendedEnd = segStarts[endIdx];
-        const hEt = intendedEnd <= hSt + SHORT_LIMIT_SEC ? intendedEnd : endBoundFor(hSt);
-        highlightRegion = { label: "하이라이트", sT: hSt, eT: hEt };
-      }
-      const candidates = highlightRegion
-        ? [highlightRegion]
-        : [
-            { label: "도입", sT: 0, eT: endBoundFor(0) },
-            (() => { const sT = startBoundNear(total * 0.4); return { label: "중간", sT, eT: endBoundFor(sT) }; })(),
-            (() => { const sT = startBoundNear(Math.max(0, total - SHORT_LIMIT_SEC) + 0.01) || startBoundNear(total * 0.75); return { label: "결론", sT, eT: total }; })(),
-          ];
-      // 너무 짧거나(15초 미만) 이미 채택된 구간과 크게 겹치면 건너뜀(짧은 본편에서 구간이 뭉치는 경우)
-      const regions = [];
-      for (const c of candidates) {
-        if (!c || c.eT - c.sT < 15 || c.eT - c.sT > SHORT_LIMIT_SEC + 1) continue;
-        const overlaps = regions.some((r) => Math.min(r.eT, c.eT) - Math.max(r.sT, c.sT) > (c.eT - c.sT) * 0.5);
-        if (!overlaps) regions.push(c);
-      }
-      // [2026-09-02 21:38] 폴백도 처음(0초)부터가 아니라, 있으면 AI가 고른 하이라이트 시작점을 그대로
-      // 씀 — highlightSegRange가 필터(15초 미만 등)에 걸려 후보에서 빠졌어도 시작점 자체는 여전히 유효함.
-      if (!regions.length) {
-        const fallbackStart = highlightRegion ? highlightRegion.sT : 0;
-        const fallbackEnd = endBoundFor(fallbackStart) || Math.min(total, fallbackStart + SHORT_LIMIT_SEC);
-        if (fallbackEnd > fallbackStart + 1) regions.push({ label: "기본(인스타사이즈)", sT: fallbackStart, eT: fallbackEnd });
-      }
-      for (let ri = 0; ri < regions.length && ri < shortOutputKeys.length; ri++) {
-        const { label, sT, eT } = regions[ri];
-        const outKey = shortOutputKeys[ri];
-        try {
-          setProgress(`숏츠 렌더링 중 (${ri + 1}/${regions.length})`, 86 + ri);
-          // 이 구간에 걸치는 이미지들 — 구간 밖으로 삐져나온 앞뒤는 잘라냄
-          const shortImgIdx = [];
-          const sSpans = [];
-          const sStarts = []; // 각 이미지의 구간 내 실제 시작(비트 로컬 시각 계산용)
-          realTimeline.imageSpans.forEach((span, i) => {
-            const rs = Math.max(span.start, sT);
-            const re = Math.min(span.end, eT);
-            if (re - rs > 0.15) {
-              shortImgIdx.push(i);
-              sSpans.push(Math.max(0.3, re - rs));
-              sStarts.push(rs);
-            }
-          });
-          if (!shortImgIdx.length) continue;
-          const sDur = sSpans.slice();
-          const sFades = [];
-          for (let j = 0; j < sDur.length - 1; j++) sFades.push(Math.max(0.05, Math.min(XFADE_DUR, sDur[j] * 0.4, sDur[j + 1] * 0.4)));
-          for (let j = 0; j < sDur.length - 1; j++) sDur[j] += sFades[j];
-          const sInputs = [];
-          shortImgIdx.forEach((g, j) => {
-            if (mediaIsClip[g]) sInputs.push("-stream_loop", "-1", "-t", String(sDur[j].toFixed(2)), "-i", imagePaths[g]);
-            else sInputs.push("-loop", "1", "-t", String(sDur[j].toFixed(2)), "-i", imagePaths[g]);
-          });
-          const extraInputCounter = { count: shortImgIdx.length }; // 캡션 PNG는 이미지 입력들 뒤 번호부터
-          const captionRequests = [];
-          const sChains = shortImgIdx.map((g, j) => {
-            // 세로 꽉 채움: 비율 유지로 확대 후 중앙 크롭(가로 원본의 좌우가 잘려나감 — 숏츠 표준 연출)
-            const baseLabel = `sbase${j}`;
-            let chain = `[${j}:v]fps=25,scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,setsar=1,eq=contrast=1.06:saturation=1.12:brightness=0.02:gamma=1.02[${baseLabel}]`;
-            const beats = fontAvailable && Array.isArray(captionBeats) ? (captionBeats[g] || []) : [];
-            const realTimes = realTimeline.perImageBeatTimes[g];
-            const imgLocalBase = sStarts[j]; // 이 이미지 입력의 t=0이 전체 타임라인에서 어디인지
-            // [2026-09-06 14:20] 본편과 동일한 이유로 전환 구간엔 자막이 안 보이게 클램프
-            const sIncomingBlend = j > 0 ? sFades[j - 1] : 0;
-            const sOutgoingBlend = j < sDur.length - 1 ? sFades[j] : 0;
-            const sSafeWindowEnd = Math.max(sIncomingBlend, sDur[j] - sOutgoingBlend);
-            const overlaySteps = [];
-            beats.forEach((beat, bi) => {
-              const text = (beat.text || "").trim();
-              const real = realTimes && realTimes[bi];
-              if (!text || !real || real.end <= sT + 0.05 || real.start >= eT - 0.05) return; // 구간 밖 문장
-              const st = CAPTION_POSITIONS[(beat.styleIndex || 0) % CAPTION_POSITIONS.length];
-              // [2026-09-06 14:05] 본편(가로 1280px) 기준 폰트 크기를 쇼츠(세로 720px)에 비례 축소
-              const shortsFontSize = Math.round(st.size * (720 / 1280));
-              const rawBs = Math.max(0, Math.max(real.start, sT) - imgLocalBase);
-              const rawBe = Math.max(rawBs + 0.2, Math.min(real.end, eT) - imgLocalBase);
-              const bs = Math.min(Math.max(rawBs, sIncomingBlend), sSafeWindowEnd);
-              const be = Math.max(Math.min(rawBe, sSafeWindowEnd), sIncomingBlend);
-              if (be - bs < 0.15) return;
-              const safeText = sanitizeCaptionText(text, jobId, `short img${g} beat${bi}`);
-              const pngPath = path.join(tmpDir, `scapimg-${ri}-${g}-${bi}.png`);
-              // [2026-09-06 21:00] ffmpeg 자체 텍스트 렌더링 버그 우회 — 파이썬(PIL)으로 미리 720x1280
-              // 투명 PNG로 그려서 overlay로 얹음(본편과 동일한 방식)
-              queueCaptionPng(captionRequests, safeText, resolvedFontPath, shortsFontSize, captionColorFF, 720, 1280, st.x, st.yMode, st.yOffset, pngPath);
-              const capInputIdx = extraInputCounter.count++;
-              sInputs.push("-loop", "1", "-t", String(sDur[j].toFixed(2)), "-i", pngPath);
-              overlaySteps.push({ capInputIdx, bs, be });
-            });
-            let curLabel = baseLabel;
-            overlaySteps.forEach((step, idx) => {
-              const outLabel = idx === overlaySteps.length - 1 ? `sv${j}` : `sov${j}_${idx}`;
-              chain += `;[${curLabel}][${step.capInputIdx}:v]overlay=x=0:y=0:enable='between(t,${step.bs.toFixed(2)},${step.be.toFixed(2)})'[${outLabel}]`;
-              curLabel = outLabel;
-            });
-            if (!overlaySteps.length) chain = chain.replace(`[${baseLabel}]`, `[sv${j}]`);
-            return chain;
-          }).join(";");
-          let sFilter;
-          let sMap = "[outv]";
-          if (shortImgIdx.length === 1) {
-            sFilter = sChains;
-            sMap = "[sv0]";
-          } else {
-            let prevLabel = "sv0";
-            let cumulative = sDur[0];
-            const parts = [];
-            for (let j = 1; j < shortImgIdx.length; j++) {
-              const dur = sFades[j - 1];
-              const offset = Math.max(0, cumulative - dur);
-              const outLabel = j === shortImgIdx.length - 1 ? "outv" : `sx${j}`;
-              parts.push(`[${prevLabel}][sv${j}]xfade=transition=fade:duration=${dur.toFixed(2)}:offset=${offset.toFixed(2)}[${outLabel}]`);
-              prevLabel = outLabel;
-              cumulative += sDur[j] - dur;
-            }
-            sFilter = `${sChains};${parts.join(";")}`;
-          }
-          sInputs.push("-ss", sT.toFixed(2), "-t", (eT - sT).toFixed(2), "-i", audioPath); // 음성도 같은 구간만(wav라 초 단위 정확)
-          sFilter += `;[${extraInputCounter.count}:a]loudnorm=I=-16:TP=-1.5:LRA=11[anorm]`;
-          await flushCaptionPngBatch(captionRequests, tmpDir, jobId, `short${ri}`); // ffmpeg 실행 전에 이 숏츠의 자막 PNG 전부 그림(비동기)
-          const shortPath = path.join(tmpDir, `short-${ri}.mp4`);
-          await runFfmpeg([
-            "-y", ...sInputs,
-            "-filter_complex", sFilter,
-            "-map", sMap, "-map", "[anorm]", "-c:a", "aac", "-shortest",
-            "-c:v", "libx264", "-preset", "veryfast", "-tune", "stillimage", "-pix_fmt", "yuv420p", "-movflags", "+faststart", // [2026-08-30 23:00] 숏츠는 파일이 작아 veryfast로 시간 절약, [2026-09-06 02:30] stillimage 튜닝+faststart 추가
-            shortPath,
-          ], eT - sT, (p) => setProgress(`숏츠 렌더링 중 (${ri + 1}/${regions.length})`, 86 + ri + Math.round(p / 100)));
-          if (await verifyOutputHasAudio(shortPath)) {
-            await r2Client.send(new PutObjectCommand({
-              Bucket: R2_BUCKET,
-              Key: outKey,
-              Body: fs.readFileSync(shortPath),
-              ContentType: "video/mp4",
-            }));
-            shortsDone.push(outKey);
-            jlog(jobId, `[render:${jobId}] 숏츠(${label}) 저장: ${outKey} (${sT.toFixed(1)}~${eT.toFixed(1)}s, 이미지 ${shortImgIdx.length}장)`);
-          } else {
-            jlog(jobId, `[render:${jobId}] 숏츠(${label}) 오디오 검증 실패 — 이 숏츠만 건너뜀`);
-          }
-        } catch (e) {
-          jlog(jobId, `[render:${jobId}] 숏츠(${label}) 렌더링 실패(본편은 정상 진행): ${e.message}`);
-        }
-      }
-    }
-
-    setProgress("업로드 중", 90);
-    const videoBuffer = fs.readFileSync(outputPath);
-    await r2Client.send(new PutObjectCommand({
-      Bucket: R2_BUCKET,
-      Key: outputKey,
-      Body: videoBuffer,
-      ContentType: "video/mp4",
-    }));
-
-    renderJobs.set(jobId, { status: "done", stage: "완료", percent: 100, r2Key: outputKey, shortKeys: shortsDone, shortKey: shortsDone[0] || null, durationSec: Math.round(audioDurationSec || 0), startedAt: renderJobs.get(jobId)?.startedAt || Date.now(), completedAt: Date.now() }); // [2026-09-01] durationSec 추가 — 관리자 목록에 "몇 분짜리"로 표시
-    jlog(jobId, `[render:${jobId}] 완료, R2 저장: ${outputKey}${shortsDone.length ? ` + 숏츠 ${shortsDone.length}개` : ''}`);
-  } catch (e) {
-    renderJobs.set(jobId, { status: "failed", stage: "실패", percent: 0, error: e.message, startedAt: renderJobs.get(jobId)?.startedAt || Date.now(), completedAt: Date.now() });
-    jlog(jobId, `[render:${jobId}] 실패: ${e.message}`);
-  } finally {
-    fs.rm(tmpDir, { recursive: true, force: true }, () => {});
-  }
-}
-
-// ---------- Keep-Alive 연결 재사용 ----------
-// 기존엔 https.request 호출마다(키움 TR, Worker 전송, REST 패스스루) 매번 새 TCP+TLS
-// 핸드셰이크를 맺었음. 장중엔 2~3초 간격으로 이런 호출이 반복되므로, 연결을 재사용하는
-// keep-alive Agent를 붙여서 핸드셰이크 비용을 없앰 (지연시간 절감의 핵심 최적화).
-const kiwoomAgent = new https.Agent({ keepAlive: true, maxSockets: 20, keepAliveMsecs: 30000 });
-const workerAgent = new https.Agent({ keepAlive: true, maxSockets: 10, keepAliveMsecs: 30000 });
-const naverAgent = new https.Agent({ keepAlive: true, maxSockets: 5, keepAliveMsecs: 30000 });
 
 // 웹소켓 실시간 시세용 (지수 등). 앱키/시크릿이 없으면 웹소켓 기능만 비활성화되고
 // 기존 REST 중계는 그대로 동작함 (하위호환 - 환경변수 추가 전에도 안 죽음)
@@ -1357,6 +93,7 @@ let wsConnected = false;
 let wsLoggedIn = false;
 let wsReconnectDelay = 5000; // 재연결 대기 (실패 누적 시 늘어남, 최대 60초)
 let wsLastMessageAt = 0;
+let wsLastGroup9MessageAt = 0; // 그룹9(0D 호가잔량) 전용 최근 수신시각 - 전체 트래픽은 정상인데 이것만 죽는 부분장애 감지용
 let wsLoginAt = 0; // 로그인 완료 시각 - 직후 구독 요청이 몰리는 것을 막는 데 씀
 
 function parseSignedNumber(v) {
@@ -1377,7 +114,6 @@ function issueToken() {
         hostname: KIWOOM_REAL_HOST,
         path: "/oauth2/token",
         method: "POST",
-        agent: kiwoomAgent,
         headers: {
           "Content-Type": "application/json;charset=UTF-8",
           "Content-Length": Buffer.byteLength(body),
@@ -1443,7 +179,6 @@ function kiwoomRest(path, apiId, body, token) {
         hostname: KIWOOM_REAL_HOST,
         path: path,
         method: "POST",
-        agent: kiwoomAgent,
         headers: {
           "Content-Type": "application/json;charset=UTF-8",
           authorization: "Bearer " + token,
@@ -1586,14 +321,20 @@ setTimeout(collectAndForwardSnapshots, 5000); // 재시작 직후 2분 공백 �
 
 // ---------- 해외지수(다우/나스닥/S&P500) + 원달러 환율 ----------
 // 키움 국내주식 API 권한으로는 해외지수/환율을 못 받아옴(별도 해외파생 API 권한 필요) - 대신
-// 네이버 모바일증권의 공개 JSON API(인증 불필요, 비공식이지만 안정적으로 널리 쓰임)를 사용.
+// 네이버 공개 JSON API(인증 불필요, 비공식이지만 안정적으로 널리 쓰임)를 사용.
 // 국내 장 시간과 무관하게(미국 장은 밤에 열림) 24시간 갱신 - 장중 게이트 없음.
-function fetchNaverIndex(code) {
+//
+// 2026-09-08 재확인: 예전에 쓰던 m.stock.naver.com/api/index/{code}/basic 이 400 에러로 완전히
+// 죽어있었음 - 네이버가 API를 이전한 것으로 보임. 해외지수/환율이 서로 다른 도메인+응답구조로
+// 바뀌어서 별도 함수로 분리함:
+//   - 해외지수: polling.finance.naver.com/api/realtime/worldstock/index/{code} -> {datas:[{...}]}
+//   - 환율:     api.stock.naver.com/marketindex/exchange/{code}/prices          -> [{...}, ...] (배열 자체가 응답, [0]이 최신)
+function fetchJson(url) {
   return new Promise((resolve, reject) => {
     https
       .get(
-        `https://m.stock.naver.com/api/index/${encodeURIComponent(code)}/basic`,
-        { headers: { "User-Agent": "Mozilla/5.0" }, timeout: 8000, agent: naverAgent },
+        url,
+        { headers: { "User-Agent": "Mozilla/5.0" }, timeout: 8000 },
         (res) => {
           let body = "";
           res.on("data", (c) => (body += c));
@@ -1612,29 +353,41 @@ function fetchNaverIndex(code) {
       });
   });
 }
+// 가격 문자열엔 쉼표가 섞여 있어("52,786.07") 그냥 parseFloat하면 쉼표 앞자리만 읽힘 - 먼저 제거
+function parseNaverNum(v) {
+  return parseFloat(String(v ?? "0").replace(/,/g, "").replace(/[^0-9.-]/g, ""));
+}
 
 const globalIndexCache = { dji: null, ixic: null, spx: null, usdkrw: null, updatedAt: null };
 async function refreshGlobalIndices() {
-  const targets = [
+  const worldstockTargets = [
     ["dji", ".DJI"], // 다우존스
     ["ixic", ".IXIC"], // 나스닥종합
     ["spx", ".SPX"], // S&P500
-    ["usdkrw", "FX_USDKRW"], // 원달러 환율
   ];
-  for (const [key, code] of targets) {
+  for (const [key, code] of worldstockTargets) {
     try {
-      const json = await fetchNaverIndex(code);
-      // 네이버 응답 필드명은 지수/환율 종류에 따라 조금씩 다를 수 있어 여러 후보를 순서대로 확인
-      const price = parseFloat(json.closePrice ?? json.now ?? json.tradePrice ?? json.closePriceStr ?? "0");
-      const rate = parseFloat(
-        String(json.fluctuationsRatio ?? json.changeRate ?? json.fluctuationsRatioStr ?? "0").replace(/[^0-9.-]/g, "")
-      );
-      if (price > 0) {
-        globalIndexCache[key] = { price, rate };
+      const json = await fetchJson(`https://polling.finance.naver.com/api/realtime/worldstock/index/${encodeURIComponent(code)}`);
+      const row = json.datas && json.datas[0];
+      if (row) {
+        const price = parseNaverNum(row.closePriceRaw ?? row.closePrice);
+        const rate = parseNaverNum(row.fluctuationsRatioRaw ?? row.fluctuationsRatio);
+        if (price > 0) globalIndexCache[key] = { price, rate };
       }
     } catch (e) {
       console.log(`해외지수(${code}) 조회 실패: ${e.message}`);
     }
+  }
+  try {
+    const rows = await fetchJson(`https://api.stock.naver.com/marketindex/exchange/FX_USDKRW/prices?page=1&pageSize=1`);
+    const row = Array.isArray(rows) && rows[0];
+    if (row) {
+      const price = parseNaverNum(row.closePrice);
+      const rate = parseNaverNum(row.fluctuationsRatio);
+      if (price > 0) globalIndexCache.usdkrw = { price, rate };
+    }
+  } catch (e) {
+    console.log(`환율(FX_USDKRW) 조회 실패: ${e.message}`);
   }
   globalIndexCache.updatedAt = new Date().toISOString();
 }
@@ -1844,6 +597,7 @@ function handleRealtimeMessage(msg) {
         sellReqThinning = prev.selReq > 0 && selReq / prev.selReq <= 0.5;
       }
       prevOrderFlowCache[code] = { buyReq, selReq };
+      wsLastGroup9MessageAt = Date.now(); // 그룹9(0D) 전용 최근 수신시각 - 아래 부분장애 감지에서 씀
       const existing2 = realtimeCache.stock[code] || {};
       realtimeCache.stock[code] = {
         ...existing2,
@@ -1901,6 +655,13 @@ function handleRealtimeMessage(msg) {
 
 function registerSubscriptions() {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+  // 재연결마다 그룹9(조건검색 실시간포착 호가잔량 0D) 상태를 리셋 - 웹소켓이 새로 열리면 키움 서버
+  // 쪽 REG 상태도 전부 초기화되는데, group9LastCodes(diff 비교용 캐시)는 relay 프로세스 메모리에
+  // 그대로 남아있어서 "이미 등록했으니 다를 게 없다"고 착각하고 재등록을 건너뛰는 문제가 있었음.
+  // 그러면 재연결 이후 다음 자연 편입/이탈 이벤트가 올 때까지 0D 데이터가 전혀 안 들어와서,
+  // isTodayHigh 하드블록 필터(데이터 없으면 통과시키는 설계)가 그 사이 조용히 무력화됨.
+  group9LastCodes = [];
 
   // 요청을 한꺼번에 몰아 보내면 키움이 일부(특히 CNSRREQ)를 처리하지 못하는 현상이 있어,
   // 조건검색을 가장 먼저 보내고 나머지는 간격을 두고 순차 전송함.
@@ -2060,6 +821,9 @@ async function connectWebSocket() {
 
       queueNameFetch(codes.slice(0, 40)); // 초기 목록도 이름을 미리 받아둠(초당1건이라 상위 일부만)
       console.log("조건검색 초기 종목:", codes.length + "종목 (seq=" + msg.seq + ")");
+      // 재연결 직후 이 시점에 바로 그룹9(호가잔량 0D) 재동기화를 걸어서, 다음 자연 편입/이탈
+      // 이벤트를 기다리지 않고 즉시 수급 데이터가 채워지게 함 (위 group9LastCodes 리셋과 짝)
+      scheduleGroup9Resync();
       return;
     }
 
@@ -2100,13 +864,34 @@ setInterval(() => {
   }
 }, 60000);
 
+// 그룹9(호가잔량 0D) 부분장애 감지 - 조건검색에 종목이 있는데도 2분 넘게 0D 데이터가 전혀
+// 안 들어오면(REG가 서버 쪽에서 조용히 씹혔거나 등 웹소켓 자체는 멀쩡한 부분장애) 강제로
+// 재동기화. 전체 웹소켓을 끊는 것보다 가벼워서 우선 시도하고, 그래도 안 되면 위 3분 감지가
+// 결국 잡아냄. isTodayHigh 하드블록 필터가 이 데이터에 의존하므로 방치하면 안전장치가
+// 조용히 무력화된 채로 계속 돌게 됨.
+setInterval(() => {
+  if (!wsConnected || !isTradingActiveKST()) return;
+  if (!realtimeCache.condition.codes.length) return; // 조건에 걸린 종목 자체가 없으면 0D가 안 오는 게 정상
+  const silentFor = wsLastGroup9MessageAt ? Date.now() - wsLastGroup9MessageAt : Infinity;
+  if (silentFor > 2 * 60 * 1000) {
+    console.log("그룹9(호가잔량) 2분간 무응답 - 강제 재동기화");
+    group9LastCodes = []; // diff 캐시를 리셋해서 다음 resync가 반드시 REG를 다시 보내게 함
+    scheduleGroup9Resync();
+  }
+}, 60000);
+
 connectWebSocket();
 
 // ---------- 관심종목 손절/익절 자동체크 (10초 주기) ----------
-// Worker의 2분 cron(checkWatchlistRiskLevels)보다 훨씬 빠르게 -1.5%/+1.5% 트리거.
+// Worker의 2분 cron(checkWatchlistRiskLevels)보다 훨씬 빠르게 -1.5%/+4% 트리거.
 // relay는 이미 웹소켓으로 실시간가를 들고 있으므로 키움 TR 호출 없이 즉시 계산 가능.
+// 2026-08-21 이론(무작위워크 장벽비율)으로 -1.5%->-2.5% 확대했었으나, 2026-08-27
+// simulate-exits(30일, 표본227) 재검증에서 뒤집힘: TP값과 무관하게 손절폭이 좁을수록(-1%~-1.5%)
+// 순손익이 전 구간에서 일관되게 더 좋았음(예: TP3.5/SL-2.5 넷 -144,790원 vs TP4/SL-1.5 넷
+// +324,181원). 이 시스템은 모멘텀 추격매매라 진입 직후 역행 자체가 "판단이 틀렸다"는 강한 신호이고,
+// 손절을 넓혀서 버티게 하면 오히려 손실만 키운다는 뜻 - 이론적 장벽비율보다 실측을 신뢰해서 되돌림.
 const AUTO_REMOVE_PNL_PCT = -1.5; // 손절
-const AUTO_TAKE_PROFIT_PNL_PCT = 3.5; // 익절
+const AUTO_TAKE_PROFIT_PNL_PCT = 4; // 익절 (3.5%->4%, 같은 재검증에서 TP4가 대체로 우위)
 
 // 15:50 이후 자동매매(익절/손절) 중지 - Worker도 동일 기준으로 403 처리하지만
 // relay 쪽에서 먼저 걸러서 불필요한 요청/로그 방지.
@@ -2126,7 +911,6 @@ function workerRequest(path, method, body) {
         hostname: url.hostname,
         path: url.pathname + url.search,
         method,
-        agent: workerAgent,
         headers: Object.assign(
           { "X-Admin-Key": ADMIN_KEY },
           data ? { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data) } : {}
@@ -2243,6 +1027,10 @@ async function refreshMiniCandlesForWatchlist() {
     const entries = await getWatchlistEntriesCached();
     if (!entries.length) return;
     const token = await issueTokenCached();
+    // 60초 주기 앞쪽에 몰아서(10종목×1.1초=11초) TR을 쏘면, 그 11초 동안 다른 기능(정원초과 청산
+    // 폴백 조회 등)이 키움 TR 순서를 기다리게 돼 지연 원인이 됨. 55초 구간에 고르게 펼쳐서 경합을
+    // 줄임 - 종목수가 적어도 키움 제한(초당1건=1.1초)보다 빠르게는 절대 안 나가게 함.
+    const spacingMs = Math.max(1100, Math.floor(55000 / entries.length));
     for (const item of entries) {
       try {
         const raw = await kiwoomRest("/api/dostk/chart", "ka10080", { stk_cd: item.code, tic_scope: "1", upd_stkpc_tp: "1" }, token);
@@ -2255,7 +1043,7 @@ async function refreshMiniCandlesForWatchlist() {
       } catch (e) {
         // 개별 종목 실패는 건너뜀 - 다음 갱신 주기에 재시도
       }
-      await new Promise((r) => setTimeout(r, 1100)); // 키움 TR 초당1건 제한
+      await new Promise((r) => setTimeout(r, spacingMs)); // 60초 전체에 고르게 펼침 (위 spacingMs 계산 참고)
     }
   } catch (e) {
     console.log("미니차트 캐시 갱신 실패: " + e.message);
@@ -2355,22 +1143,43 @@ setInterval(() => {
   }
 }, 30000);
 
+const TRAIL_ACTIVATE_PCT = 2.0; // 이 손익률에 한 번이라도 도달하면 트레일링 스톱 활성화
+const TRAIL_DISTANCE_PCT = 1.5; // 활성화 후 고점 대비 이만큼 밀리면 조기 청산
+const positionPeaks = new Map(); // code -> 그 포지션이 지금까지 도달한 최고 손익률 (relay가 상주 프로세스라 메모리로 충분 - 재시작되면 초기화되지만 큰 문제 없음, 다음 상승에서 다시 쌓임)
+
 async function checkWatchlistStopLoss() {
   if (!ADMIN_KEY) return; // 키 미설정이면 조용히 스킵 (fail closed)
   if (!isTradingActiveKST()) return; // 15:50 이후 자동매매 중지
   try {
     const items = await getWatchlistEntriesCached();
     if (!items.length) return;
+    const stillHeldCodes = new Set(items.map((it) => it.code));
+    for (const code of positionPeaks.keys()) {
+      if (!stillHeldCodes.has(code)) positionPeaks.delete(code); // 이미 청산된 종목은 추적 그만(메모리 누수 방지)
+    }
     for (const item of items) {
       const q = realtimeCache.stock[item.code];
       if (!q || !q.price) continue; // 아직 실시간가 미수신 - 다음 틱에 재시도
       const pnlPct = ((q.price - item.entry_price) / item.entry_price) * 100;
-      if (pnlPct <= AUTO_REMOVE_PNL_PCT || pnlPct >= AUTO_TAKE_PROFIT_PNL_PCT) {
-        const reason = pnlPct >= AUTO_TAKE_PROFIT_PNL_PCT ? "익절" : "손절";
+
+      const prevPeak = positionPeaks.get(item.code) || 0;
+      const peak = Math.max(prevPeak, pnlPct);
+      if (peak !== prevPeak) positionPeaks.set(item.code, peak);
+      // 고정 +3.5% 익절선은 승률 35% 안팎 전략에서 드문 대승(오른쪽 꼬리)이 전체 기대값을
+      // 만들어야 하는데 그 꼬리를 정확히 잘라내는 문제가 있었음(외부 분석: +3.9%, +4.6%로
+      // 오버슈트하며 청산된 사례 확인). +2% 한 번이라도 도달하면 활성화되고, 그 뒤로 고점 대비
+      // -1.5% 밀리면(최소 +0.5%는 확정 확보한 채로) 조기 확정 - 계속 오르면 익절선(+3.5%)까지 안
+      // 잘리고 그대로 따라감.
+      const trailingHit = peak >= TRAIL_ACTIVATE_PCT && pnlPct <= peak - TRAIL_DISTANCE_PCT;
+
+      if (pnlPct <= AUTO_REMOVE_PNL_PCT || pnlPct >= AUTO_TAKE_PROFIT_PNL_PCT || trailingHit) {
+        const reason = pnlPct >= 0 ? "익절" : "손절"; // trailingHit도 peak>=2%였으므로 pnlPct는 항상 +0.5% 이상 - 부호로 정확히 판정됨
         try {
           await workerRequest("/api/watchlist/auto-remove", "POST", { code: item.code, pnlPct, name: stockNameCache[item.code] });
           entriesCache.items = entriesCache.items.filter((x) => x.code !== item.code); // 즉시 캐시에서도 제거(중복삭제 요청 방지)
-          console.log(`${reason} 자동삭제: ${item.code} (${pnlPct.toFixed(2)}%)`);
+          positionPeaks.delete(item.code);
+          const tag = trailingHit ? reason + "(트레일링)" : reason;
+          console.log(`${tag} 자동삭제: ${item.code} (${pnlPct.toFixed(2)}%, 고점 ${peak.toFixed(2)}%)`);
         } catch (e) {
           console.log(`${reason} 자동삭제 요청 실패: ${item.code} - ${e.message}`);
         }
@@ -2402,9 +1211,13 @@ async function runFinalSweep() {
       const q = realtimeCache.stock[item.code];
       if (!q || !q.price) continue;
       const pnlPct = ((q.price - item.entry_price) / item.entry_price) * 100;
-      if (pnlPct >= AUTO_TAKE_PROFIT_PNL_PCT || pnlPct <= AUTO_REMOVE_PNL_PCT) {
-        items.push({ code: item.code, pnlPct });
-      }
+      // 예전엔 이미 +3.5%/-1.5% 조건을 넘긴 것만 정리하고, 그 사이(예: +1.5%)에 있는 포지션은
+      // 그대로 밤새 들고 가게 뒀음. 다음날 개장 갭(장중 변동성과 무관하게 밤사이 뉴스·수급으로
+      // 시가 자체가 크게 튀는 현상)에 그대로 노출돼서, 09:01 개장 직후 -10%/-6%/-5% 같은 대형
+      // 손절이 무더기로 발생하는 원인이 됐음(-1.5% 손절 기준을 갭 하나로 몇 배씩 뚫어버림).
+      // 이 시스템 자체가 장중 데이트레이딩(±1.5%/+3.5% 타이트한 리스크) 전제라 밤을 넘기는 순간
+      // 그 전제가 깨지므로, 조건 충족 여부와 무관하게 남은 전량을 무조건 청산함.
+      items.push({ code: item.code, pnlPct });
     }
     const result = await workerRequest("/api/watchlist/final-sweep", "POST", { items });
     if (result.ok) {
@@ -2450,124 +1263,6 @@ const server = http.createServer((req, res) => {
   if (req.headers["x-relay-secret"] !== RELAY_SECRET) {
     res.writeHead(401, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: false, error: "relay secret mismatch" }));
-    return;
-  }
-
-  // 영상 렌더링 시작 - 이미지+음성 URL 받아서 백그라운드로 ffmpeg 렌더링, 즉시 202 응답
-  if (req.url === "/render" && req.method === "POST") {
-    const chunks = [];
-    req.on("data", (c) => chunks.push(c));
-    req.on("end", () => {
-      let body;
-      try {
-        body = JSON.parse(Buffer.concat(chunks).toString() || "{}");
-      } catch (e) {
-        res.writeHead(400, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: false, error: "invalid json" }));
-        return;
-      }
-      const images = Array.isArray(body.images) ? body.images : [];
-      const audioUrl = body.audioUrl || null;
-      // 세그먼트별 음성 원본 목록 — 있으면 각각의 실제 길이를 재서 이어붙이고 자막 타이밍을 실측으로 맞춤
-      const audioSegments = Array.isArray(body.audioSegments) ? body.audioSegments.filter((u) => typeof u === "string") : null;
-      const outputKey = body.outputKey;
-      // [2026-08-30 22:55] 숏츠 출력 키: 배열(최대 3개, 도입/중간/결론) — 옛 워커가 단일 문자열로 보내도 배열로 수용
-      const shortOutputKeys = Array.isArray(body.shortOutputKeys)
-        ? body.shortOutputKeys.filter((k) => typeof k === "string").slice(0, 3)
-        : (typeof body.shortOutputKey === "string" ? [body.shortOutputKey] : null);
-      const weights = Array.isArray(body.weights) ? body.weights.filter((w) => typeof w === "number") : null;
-      const captionBeats = Array.isArray(body.captionBeats) ? body.captionBeats : null;
-      // 이 영상 전체에 고정으로 쓸 자막 폰트 키/색 — Worker가 영상당 하나씩 랜덤으로 뽑아서 넘겨줌.
-      const captionFontKey = typeof body.captionFontKey === "string" ? body.captionFontKey : null;
-      const captionColor = typeof body.captionColor === "string" ? body.captionColor : null;
-      // [2026-09-02 21:05] highlightSegRange: Worker가 AI로 고른 쇼츠 하이라이트 문장 구간 {start,end}
-      const highlightSegRange = (body.highlightSegRange && Number.isInteger(body.highlightSegRange.start) && Number.isInteger(body.highlightSegRange.end))
-        ? { start: body.highlightSegRange.start, end: body.highlightSegRange.end }
-        : null;
-      if (!images.length || !outputKey) {
-        res.writeHead(400, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: false, error: "images/outputKey 필요" }));
-        return;
-      }
-      const jobId = crypto.randomUUID();
-      renderJobs.set(jobId, { status: "processing", stage: "대기열 대기 중", percent: 0, startedAt: Date.now() });
-      // 큐에 넣고 기다리지 않고 바로 응답 — 앞에 진행 중인 렌더링이 있으면 그거 끝나야 시작됨(VM 자원 보호)
-      enqueueRender(() => runRender(jobId, images, audioUrl, audioSegments, outputKey, shortOutputKeys, weights, captionBeats, captionFontKey, captionColor, highlightSegRange));
-      res.writeHead(202, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ok: true, jobId }));
-    });
-    return;
-  }
-
-  // [2026-08-31 00:07] Health check — Worker가 주기적으로 폴링해서 relay 상태 확인 (자동 재시작 판단용)
-  if (req.url === "/health") {
-    const processingJobs = Array.from(renderJobs.values()).filter((j) => j.status === "processing");
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({
-      ok: true,
-      uptime: Math.round(process.uptime()),
-      timestamp: new Date().toISOString(),
-      status: processingJobs.length > 0 ? "rendering" : "idle",
-      processingJobCount: processingJobs.length,
-      totalJobsInMemory: renderJobs.size,
-    }));
-    return;
-  }
-
-  // [2026-08-31 00:33] Memory cleanup — 렌더링 전에 호출해서 오래된 작업 제거 + 가비지 컬렉션 강제 실행
-  if (req.url === "/cleanup" && req.method === "POST") {
-    const beforeJobCount = renderJobs.size;
-    const cutoff = Date.now() - 30 * 60 * 1000; // 30분 이상 된 완료/실패 작업만
-    let removedCount = 0;
-    for (const [id, job] of renderJobs) {
-      // 완료/실패된 작업 중 30분 이상 지난 것만 정리 (processing은 절대 안 건드림)
-      if (job.status !== "processing" && (job.completedAt || job.startedAt) < cutoff) {
-        renderJobs.delete(id);
-        removedCount++;
-      }
-    }
-    // Node.js 가비지 컬렉션 강제 실행 (--expose-gc 플래그가 필요)
-    if (global.gc) {
-      try {
-        global.gc();
-      } catch (e) {
-        // gc() 실패는 무시 (플래그 미설정 또는 에러)
-      }
-    }
-    const memUsage = process.memoryUsage();
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({
-      ok: true,
-      cleaned: {
-        jobsRemoved: removedCount,
-        jobsRemainingInMemory: renderJobs.size,
-        beforeCount: beforeJobCount,
-      },
-      memory: {
-        heapUsedMb: Math.round(memUsage.heapUsed / 1024 / 1024),
-        heapTotalMb: Math.round(memUsage.heapTotal / 1024 / 1024),
-        rssMemMb: Math.round(memUsage.rss / 1024 / 1024),
-      },
-      timestamp: new Date().toISOString(),
-    }));
-    return;
-  }
-
-  // 영상 렌더링 상태 조회
-  if (req.url.startsWith("/render/status")) {
-    const q = new URL(req.url, "http://localhost").searchParams;
-    const jobId = q.get("jobId");
-    const job = jobId ? renderJobs.get(jobId) : null;
-    if (!job) {
-      res.writeHead(404, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ok: false, error: "job not found" }));
-      return;
-    }
-    // [2026-09-06 16:35] 실시간 로그도 같이 실어서 보냄 — 관리자 페이지에서 SSH 없이도 진행 상황을
-    // 자세히 볼 수 있게 함(디버깅용 상세 로그 포함).
-    const logs = jobId ? (jobLogs.get(jobId) || []) : [];
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ ok: true, ...job, logs }));
     return;
   }
 
@@ -2767,6 +1462,50 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // SNS 급등 조짐 판단용 - 네이버 종목토론방 게시글수 조회. 종목코드 6자리(영문 포함)만 받고
+  // 그 값을 finance.naver.com의 고정 URL 패턴에 끼워넣는 것 외에는 임의 URL을 받지 않음(오픈
+  // 프록시 방지). Cloudflare Worker에서 직접 네이버 페이지를 스크래핑하면 차단된 전례가 있어서
+  // (worker.js 상단 주석 참고) relay를 거쳐 우회함. 페이지 구조가 바뀔 수 있으므로 여러 패턴으로
+  // 방어적으로 파싱하고, 못 찾으면 null을 반환해 호출측이 조용히 건너뛰게 함.
+  if (req.url.startsWith("/proxy/naver-board")) {
+    const u = new URL(req.url, "http://localhost");
+    const code = u.searchParams.get("code");
+    if (!code || !/^[0-9A-Za-z]{6}$/.test(code)) {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: false, error: "code 형식 오류" }));
+      return;
+    }
+    https.get(
+      `https://finance.naver.com/item/board.naver?code=${code}`,
+      { headers: { "User-Agent": "Mozilla/5.0", Referer: "https://finance.naver.com/" }, timeout: 5000 },
+      (pageRes) => {
+        let body = "";
+        pageRes.on("data", (chunk) => { body += chunk; });
+        pageRes.on("end", () => {
+          // 페이지 구조가 자주 바뀌므로 여러 패턴을 순서대로 시도함:
+          // 1) "총 N건" 류의 텍스트
+          // 2) 페이지네이션의 최대 page= 번호 * 페이지당 20건(네이버 게시판 관례값)으로 근사
+          let totalPosts = null;
+          const totalMatch = body.match(/총\s*([\d,]+)\s*건/);
+          if (totalMatch) {
+            totalPosts = parseInt(totalMatch[1].replace(/,/g, ""), 10);
+          } else {
+            const pageNums = [...body.matchAll(/[?&]page=(\d+)/g)].map((m) => parseInt(m[1], 10));
+            if (pageNums.length) totalPosts = Math.max(...pageNums) * 20; // 근사치 - 상대적 증감 판단용이라 정밀할 필요 없음
+          }
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ ok: totalPosts !== null, totalPosts }));
+        });
+      }
+    ).on("error", (e) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: false, error: e.message }));
+    }).on("timeout", function () {
+      this.destroy();
+    });
+    return;
+  }
+
   // 관심종목 현재가 즉시조회 - realtimeCache.stock에 값이 없는 종목(웹소켓 구독 전, 장마감 후
   // 재시작 등)을 Worker가 요청하면 그 자리에서 키움 개별시세(ka10007)를 조회해서 바로 채워줌.
   // 조회 결과는 realtimeCache.stock에도 반영해서 다음 요청부턴 캐시로 즉시 응답됨.
@@ -2847,10 +1586,6 @@ const server = http.createServer((req, res) => {
         sseClientCount: sseClients.size,
         memoryRssMb: Math.round(mem.rss / 1024 / 1024),
         memoryHeapUsedMb: Math.round(mem.heapUsed / 1024 / 1024),
-        keepAliveSockets: {
-          kiwoom: Object.values(kiwoomAgent.sockets).reduce((s, a) => s + a.length, 0),
-          worker: Object.values(workerAgent.sockets).reduce((s, a) => s + a.length, 0),
-        },
       })
     );
     return;
@@ -2875,7 +1610,6 @@ const server = http.createServer((req, res) => {
         hostname: KIWOOM_REAL_HOST,
         path: req.url,
         method: req.method,
-        agent: kiwoomAgent,
         headers: forwardHeaders,
       },
       (upstreamRes) => {
@@ -2896,30 +1630,3 @@ const server = http.createServer((req, res) => {
 server.listen(PORT, () => {
   console.log(`키움 중계서버 실행 중: 포트 ${PORT}`);
 });
-
-// [2026-08-31] Cloudflare Worker의 /admin/cron-tick을 20초마다 호출 — 1분 Cloudflare Cron보다 훨씬
-// 자주 폴링해서 관리자 탭을 안 열어놔도 생성/렌더/유튜브 재시도 단계가 빠르게 진행되게 함.
-// setTimeout으로 자기 자신을 재귀 예약(setInterval 대신) — 이전 호출이 안 끝났는데 다음 게 겹쳐서
-// 같은 작업을 두 번 동시에 건드리는 걸 막기 위함(호출이 20초보다 오래 걸리면 그만큼 다음 호출이 밀림).
-const WORKER_CRON_TICK_URL = 'https://videos.usb.kr/admin/cron-tick';
-const WORKER_CRON_TICK_INTERVAL_MS = 20000;
-async function scheduleWorkerCronTick() {
-  try {
-    const res = await fetch(WORKER_CRON_TICK_URL, {
-      method: 'POST',
-      headers: { 'x-relay-secret': RELAY_SECRET },
-      signal: AbortSignal.timeout(15000),
-    });
-    if (!res.ok) console.log(`[cron-tick] Worker 응답 실패: HTTP ${res.status}`);
-  } catch (e) {
-    console.log(`[cron-tick] 호출 실패: ${e.message}`);
-  } finally {
-    setTimeout(scheduleWorkerCronTick, WORKER_CRON_TICK_INTERVAL_MS);
-  }
-}
-if (RELAY_SECRET) {
-  setTimeout(scheduleWorkerCronTick, WORKER_CRON_TICK_INTERVAL_MS); // 시작 직후 한 텀 쉬고 첫 호출
-  console.log(`[cron-tick] ${WORKER_CRON_TICK_INTERVAL_MS / 1000}초 간격으로 Worker 폴링 시작 예정`);
-} else {
-  console.log('[cron-tick] RELAY_SECRET 없음 — Worker 폴링 루프 비활성화');
-}
