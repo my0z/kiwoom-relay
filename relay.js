@@ -392,6 +392,23 @@ async function refreshGlobalIndices() {
   globalIndexCache.updatedAt = new Date().toISOString();
 }
 setInterval(refreshGlobalIndices, 5000); // 5초마다 - 너무 짧으면(3초 이하) 네이버 차단 위험, 5초가 안전권에서 최대한 당긴 값
+
+// ---------- 이벤트루프 지연 감시 (진단용, 2026-09-10 추가) ----------
+// 09:02~09:03 KST에 relay_unhealthy(522, Cloudflare->relay 헬스체크 타임아웃)가 나흘 연속
+// 반복됐는데, 코드 리뷰(웹소켓 메시지 핸들러, 미니차트 갱신 등)로는 확정적 원인을 못 찾았음.
+// 추측을 더 쌓기보다 실측이 필요해서, 이벤트루프가 실제로 지연되는 순간을 직접 잡아내는 감시
+// 코드를 심어둠 - 다음 재발 시 이 로그로 "그 순간 relay가 실제로 CPU에 묶여있었는지" vs
+// "네트워크 경로 자체의 문제였는지"를 구분할 수 있게 됨.
+let lastLoopCheck = Date.now();
+setInterval(() => {
+  const now = Date.now();
+  const lag = now - lastLoopCheck - 500; // 기대 간격(500ms)보다 얼마나 더 걸렸는지
+  lastLoopCheck = now;
+  if (lag > 200) {
+    console.log(`이벤트루프 지연 감지: ${lag}ms (기대 500ms 대비 초과) - ${new Date().toISOString()}`);
+  }
+}, 500);
+
 setTimeout(refreshGlobalIndices, 3000);
 
 // 국내(웹소켓 실시간)+해외(네이버 폴링) 지수를 한 번에 묶어서 반환 - SSE/realtime-all 등 여러
